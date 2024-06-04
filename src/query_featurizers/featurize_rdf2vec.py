@@ -2,8 +2,9 @@ import json
 
 import numpy as np
 import rdflib.term
+import torch
 
-from lib.datastructures.query import Query
+from src.datastructures.query import Query
 
 
 class FeaturizeQueriesRdf2Vec:
@@ -18,7 +19,7 @@ class FeaturizeQueriesRdf2Vec:
 
         for i in range(len(queries)):
             featurized = self.featurize_query(queries[i], estimates[i])
-            queries[i].set_featurized(featurized)
+            queries[i].set_featurized(torch.Tensor(featurized))
 
         return queries
 
@@ -48,7 +49,7 @@ class FeaturizeQueriesRdf2Vec:
                     raise NotImplementedError("Entities other than Variables, URIRefs, or Literals are not yet "
                                               "supported")
             query_embedding.append(tp_emb)
-        return np.array(query_embedding)
+        return torch.Tensor(query_embedding)
 
     def get_cardinality_estimates_query_set(self, queries):
         estimates = []

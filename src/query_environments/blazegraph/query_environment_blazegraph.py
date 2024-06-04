@@ -1,6 +1,6 @@
 from SPARQLWrapper import JSON
-from lib.datastructures.query import Query
-from lib.query_environment.blazegraph.blazegraph_execute_query_endpoint import BlazeGraphQueryRunner
+from src.datastructures.query import Query
+from src.query_environments.blazegraph.blazegraph_execute_query_endpoint import BlazeGraphQueryRunner
 from typing import Literal
 import pandas as pd
 

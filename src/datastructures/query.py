@@ -2,7 +2,8 @@ from rdflib.plugins.sparql.processor import prepareQuery
 import rdflib
 
 """
-Query class based on rdflib query object
+Query class for BPG queries that saves the raw query string, its deconstruction into triple pattern strings and object,
+any featurization made of the query and query graphs representations.
 """
 
 
@@ -13,8 +14,7 @@ class Query:
         self.string_tp, self.rdflib_tp = self.deconstruct_to_triple_pattern()
         # Featurized queries will be constructed by the query featurizer class
         self.features = None
-        self.query_graph_representation = None
-        pass
+        self.query_graph_representations = None
 
     def deconstruct_to_triple_pattern(self):
         rdflib_triple_patterns: list[rdflib.term] = self.prepared_query.algebra.get('p').get('p').get('triples')

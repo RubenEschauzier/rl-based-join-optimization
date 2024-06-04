@@ -1,22 +1,30 @@
 import json
-
+from typing import Literal
+import torch
 import numpy as np
-import rdflib.term
 from rdflib.term import Variable
-from lib.datastructures.query import Query
+from src.datastructures.query import Query
 
 
 class FeaturizeQueryGraphQuadViews:
     def __init__(self):
         pass
 
-    def run(self, queries: [Query]):
-        
+    def run(self, queries: [Query], format_graph: Literal["adj_matrix", "edge_index"]):
+        for query in queries:
+            s_s, o_o, s_o, o_s = self.featurize_query(query)
+            if format_graph == "edge_index":
+                s_s = self.convert_to_edge_index_format(s_s)
+                o_o = self.convert_to_edge_index_format(o_o)
+                s_o = self.convert_to_edge_index_format(s_o)
+                o_s = self.convert_to_edge_index_format(o_s)
+            query.query_graph_representations = [torch.tensor(s_s), torch.tensor(o_o),
+                                                 torch.tensor(s_o), torch.tensor(o_s)]
         return queries
 
-    def featurize_query(self, query: Query):
+    @staticmethod
+    def featurize_query(query: Query):
         return FeaturizeQueryGraphQuadViews.create_query_graph_views(query)
-        pass
 
     @staticmethod
     def create_query_graph_views(query: Query):
@@ -52,3 +60,15 @@ class FeaturizeQueryGraphQuadViews:
                     obj_subj_view[j][i] = 1
 
         return subj_subj_view, obj_obj_view, subj_obj_view, obj_subj_view
+
+    @staticmethod
+    def convert_to_edge_index_format(adj_matrix):
+        start_of_edge = []
+        end_of_edge = []
+        for i in range(len(adj_matrix)):
+            for j in range(len(adj_matrix[i])):
+                if adj_matrix[i][j] == 1:
+                    start_of_edge.append(i)
+                    end_of_edge.append(j)
+        edge_index = [start_of_edge, end_of_edge]
+        return edge_index
