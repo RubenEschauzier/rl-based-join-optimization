@@ -1,19 +1,24 @@
 from src.datastructures.query import Query
 
 
-class GraphEmbedding:
+class GraphEmbedder:
     def __init__(self, models):
         self.models = models
         pass
 
-    def run(self, queries: [Query]):
-        for query in queries:
-            if not query.features or not query.query_graph_representations:
-                raise ValueError("Passed query without features or graph representation to graph embedder.")
-            if len(query.query_graph_representations) != len(self.models):
-                raise ValueError("Passed more graph representation matrices than embedding models.")
+    def run(self, query: Query):
+        if not query.features or not query.query_graph_representations:
+            raise ValueError("Passed query without features or graph representation to graph embedder.")
+        if len(query.query_graph_representations) != len(self.models):
+            raise ValueError("Passed more graph representation matrices than embedding models.")
 
-        pass
+        embeddings = []
+        for model in self.models:
+            embedding = model.run(query.features, query.query_graph_representations)
+            embeddings.extend(embedding)
+
+        print(embeddings)
+        return embeddings
 
     def embed_query_graph(self, query: Query):
 

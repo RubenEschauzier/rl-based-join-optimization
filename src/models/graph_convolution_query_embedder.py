@@ -36,3 +36,4 @@ class GCNConvQueryEmbeddingModel:
             else:
                 hs = layer(hs)
         return hs
+

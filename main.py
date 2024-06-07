@@ -14,7 +14,7 @@ if __name__ == "__main__":
     n_epoch = 5
     batch_size = 64
     seed = 0
-    run_training(engine_endpoint_blazegraph, query_location, rdf2vec_vector_location, n_epoch, batch_size, seed)
+    run_training(engine_endpoint_blazegraph, query_location, rdf2vec_vector_location, n_epoch, batch_size, 256, seed)
     # test_query = """SELECT ?v0 ?v1 ?v2 ?v4 ?v5 ?v6 WHERE {
     #     ?v0 <http://schema.org/contentRating> ?v1 .
     #     ?v0 <http://schema.org/contentSize> ?v2 .
