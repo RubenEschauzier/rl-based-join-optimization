@@ -1,10 +1,9 @@
-import numpy as np
 import torch
 
 from src.models.model_layers.graph_convolution import GCNConv
 
 
-class GCNConvQueryEmbeddingModel:
+class GCNConvQueryEmbeddingModel():
     def __init__(self):
         self.layers = []
         self.layer_types = []
@@ -37,3 +36,5 @@ class GCNConvQueryEmbeddingModel:
                 hs = layer(hs)
         return hs
 
+    def parameters(self):
+        return [param for layer in self.layers for param in list(layer.parameters())]

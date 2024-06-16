@@ -11,10 +11,11 @@ if __name__ == "__main__":
     engine_endpoint_blazegraph = "http://localhost:9999/blazegraph/namespace/watdiv-default-instantiation/sparql"
     query_location = "data/input/queries"
     rdf2vec_vector_location = "data/rdf2vec_vectors/vectors_depth_1_full_entities.json"
-    n_epoch = 5
-    batch_size = 64
+    n_epoch = 15
+    batch_size = 4
     seed = 0
-    run_training(engine_endpoint_blazegraph, query_location, rdf2vec_vector_location, n_epoch, batch_size, 256, seed)
+    run_training(engine_endpoint_blazegraph, query_location, rdf2vec_vector_location, n_epoch, batch_size, 1e-4, 3,
+                 .99, seed)
     # test_query = """SELECT ?v0 ?v1 ?v2 ?v4 ?v5 ?v6 WHERE {
     #     ?v0 <http://schema.org/contentRating> ?v1 .
     #     ?v0 <http://schema.org/contentSize> ?v2 .

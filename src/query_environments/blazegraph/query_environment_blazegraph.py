@@ -1,8 +1,11 @@
 from SPARQLWrapper import JSON
+import warnings
 from src.datastructures.query import Query
 from src.query_environments.blazegraph.blazegraph_execute_query_endpoint import BlazeGraphQueryRunner
 from typing import Literal
+import numpy as np
 import pandas as pd
+import time
 
 
 class BlazeGraphQueryEnvironment:
@@ -11,9 +14,18 @@ class BlazeGraphQueryEnvironment:
         pass
 
     def run(self, query: Query, join_order, timeout: int, result_format, additional_params: dict):
+        start = time.time()
+
         rewritten_query = self.set_join_order(query, join_order)
-        result = self.query_runner.run_query(rewritten_query, timeout, result_format, additional_params)
-        return result
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                result = self.query_runner.run_query(rewritten_query, timeout, result_format, additional_params)
+        except TimeoutError:
+            return "time-out", timeout
+
+        execution_time = time.time() - start
+        return result, execution_time
 
     def cardinality_triple_pattern(self, triple_pattern: str):
         query = r"SELECT (COUNT( * ) as ?triplecount) WHERE {{ {} }}".format(triple_pattern)
@@ -22,17 +34,39 @@ class BlazeGraphQueryEnvironment:
         return count
 
     @staticmethod
-    def reward(query_result, reward_type: Literal['intermediate results', 'execution_time']):
-        if reward_type == 'intermediate results':
-            explain_result = pd.read_html(query_result)
-            reward_sequence = explain_result[0]['unitsOut']
-            return reward_sequence
+    def reward(query_result, reward_type: Literal['intermediate-results', 'execution_time']):
+        if reward_type == 'intermediate-results':
+            # If the query timed out, return some very bad reward signal TBD
+            if query_result == 'time-out':
+                return 1000000
+            try:
+                explain_result = pd.read_html(query_result)
+            except ValueError as e:
+                return "FAIL"
+
+            if len(explain_result) == 0:
+                raise ValueError("Explain result of size 0")
+            if len(explain_result) == 1:
+                reward_information = explain_result[0][['unitsOut', 'bopSummary', 'joinRatio']]
+            else:
+                reward_information = explain_result[1][['unitsOut', 'bopSummary', 'joinRatio']]
+
+            # The operators with join in them are likely pipeline joins and of interest
+            join_ratio = np.array(reward_information['joinRatio'])
+            is_join = np.array(["Join" in x for x in np.array(reward_information['bopSummary'])])
+
+            # Blazegraph returns NaN for any join after a join ratio = 0, so we fill NaNs with zeros
+            # To prevent taking log of zero we add one to join ratio
+            penalty = np.log(np.nan_to_num(join_ratio[is_join]) + 1)
+
+            return penalty
         elif reward_type == 'execution_time':
             raise NotImplementedError()
 
     """
     Set left-deep join order for blazegraph. Input is order in which triple patterns should be joined together.
     """
+
     @staticmethod
     def set_join_order(query: Query, join_order: list[int]):
         if len(join_order) != len(query.string_tp):
