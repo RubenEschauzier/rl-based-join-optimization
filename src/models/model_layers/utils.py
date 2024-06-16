@@ -70,26 +70,7 @@ def masked_max(vector: torch.Tensor,
 def masked_sample(vector: torch.Tensor,
                   mask: torch.Tensor,
                   sequence_mask: torch.Tensor,
-                  dim: int,
-                  keepdim: bool = False,
                   min_val: float = -1e10) -> (torch.Tensor, torch.Tensor):
-    """
-	To calculate max along certain dimensions on masked values
-	Parameters
-	----------
-	vector : ``torch.Tensor`` The vector to calculate max, assume unmasked parts are already zeros
-	mask : ``torch.Tensor``
-		The mask of the vector. It must be broadcastable with vector.
-	dim : ``int``
-		The dimension to calculate max
-	keepdim : ``bool``
-		Whether to keep dimension
-	min_val : ``float``
-		The minimal value for paddings
-	Returns
-	-------
-	A ``torch.Tensor`` of including the maximum values.
-	"""
     one_minus_mask = (1.0 - mask).bool()
     replaced_vector = vector.masked_fill(one_minus_mask, min_val)
     # Ensure mask is applied absolutely with no residual probability (very likely not needed)
@@ -102,6 +83,7 @@ def masked_sample(vector: torch.Tensor,
     probabilities = probabilities + (no_generation * (1/probabilities.shape[1]))
 
     m = torch.distributions.Categorical(probs=probabilities)
-    mask_sampled = (m.sample() * sequence_mask).unsqueeze(1)
+    sampled = m.sample()
+    mask_sampled = (sampled * sequence_mask).unsqueeze(1)
 
     return probabilities, mask_sampled

@@ -156,19 +156,19 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                     if isinstance(penalty, int):
                         # Set penalty to the high number returned in case of a timeout
                         penalty = [penalty] * len(join_order)
-                        print("TIMEOUT")
-                        print(penalty)
+
                     # Sometimes blazegraph fails, we record these fails to ensure the failing query is not systemic
                     if isinstance(penalty, str) and penalty == "FAIL":
                         # TODO Record fails and their queries to check if it is failing systemic
                         continue
+
                     # For join ratio, lower is better, thus we take the negative of the join ratio to get reward
                     reward = -np.array(penalty)
 
                     # For each decision in join order creation we record discounted rewards and the log probability
                     # of selecting that triple pattern for calculating the policy gradient using REINFORCE
                     for j in range(reward.shape[0]):
-                        # Query k, at timestep in optimization j, chose pointer join_order[j]
+                        # Query k, at join order timestep j, chose pointer join_order[j]
                         log_prob = log_probs_batch[k][j][join_order[j]]
 
                         # Discounted reward do NOT take into account previous rewards
@@ -177,7 +177,6 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                         log_probs.append(log_prob)
                         rewards.append(discounted_reward)
                         rewards_epoch.append(discounted_reward)
-                        # TODO CHECK IF LOG PROB IS CORRECT
 
                     # Record execution time for statistics tracking
                     execution_times_epoch.append(exec_time)

@@ -107,7 +107,7 @@ class PointerNet(nn.Module):
                 # Mask out any sequences that we no longer generate for (as we exceeded size of input sequence)
                 sequence_mask = torch.where(torch.sum(sub_mask, 1) > 0, 1, 0)
                 # Sample from pointer dist for reinforcement learning based training
-                probabilities, masked_argmax = masked_sample(log_pointer_score, sub_mask, sequence_mask, dim=1, keepdim=True)
+                probabilities, masked_argmax = masked_sample(log_pointer_score, sub_mask, sequence_mask)
                 pointer_probabilities.append(probabilities)
 
             if not self.allow_repeats:
@@ -121,9 +121,6 @@ class PointerNet(nn.Module):
             decoder_input = torch.gather(encoder_outputs, dim=1, index=index_tensor).squeeze(1)
 
         pointer_log_scores = torch.stack(pointer_log_scores, 1)
-        pointer_probability_scores = torch.stack(pointer_probabilities, 1)
-        # If we do greedy sampling we want to return probabilities, not log scores (for REINFORCE algo)
-        if greedy:
-            pointer_log_scores = pointer_probability_scores
+
         pointer_argmaxs = torch.cat(pointer_argmaxs, 1)
         return pointer_log_scores, pointer_argmaxs, mask_tensor
