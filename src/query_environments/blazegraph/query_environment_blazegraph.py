@@ -38,7 +38,7 @@ class BlazeGraphQueryEnvironment:
         if reward_type == 'intermediate-results':
             # If the query timed out, return some very bad reward signal TBD
             if query_result == 'time-out':
-                return 1000000
+                return 20
             try:
                 explain_result = pd.read_html(query_result)
             except ValueError as e:

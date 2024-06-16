@@ -85,8 +85,8 @@ def policy(network, features, sequence_lengths):
     return join_orders, log_probs_batch
 
 
-def env_step(env, batch_queries, join_order):
-    env_result, exec_time = env.run(batch_queries, join_order, 60, JSON, {"explain": "True"})
+def env_step(env, batch_queries, join_order, timeout):
+    env_result, exec_time = env.run(batch_queries, join_order, timeout, JSON, {"explain": "True"})
     penalty = env.reward(env_result, "intermediate-results")
     return penalty, exec_time
 
@@ -147,12 +147,17 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                 # For each join order
                 for k, join_order in enumerate(join_orders):
                     # Execute the query and record join ratio + execution time
-                    penalty, exec_time = env_step(env, queries_batch[k], join_order[:un_padded_features[k].shape[0]])
+                    penalty, exec_time = env_step(env,
+                                                  queries_batch[k],
+                                                  join_order[:un_padded_features[k].shape[0]],
+                                                  60)
 
                     # If the query timed out this function returns an integer, so we turn it into penalty sequence
                     if isinstance(penalty, int):
-                        # TODO: Deal with case where timeout occurs (make array of discounted rewards with large penalty
-                        continue
+                        # Set penalty to the high number returned in case of a timeout
+                        penalty = [penalty] * len(join_order)
+                        print("TIMEOUT")
+                        print(penalty)
                     # Sometimes blazegraph fails, we record these fails to ensure the failing query is not systemic
                     if isinstance(penalty, str) and penalty == "FAIL":
                         # TODO Record fails and their queries to check if it is failing systemic
