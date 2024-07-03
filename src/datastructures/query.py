@@ -37,5 +37,8 @@ class Query:
         return string_triple_patterns, rdflib_triple_patterns
         pass
 
-    def set_featurized(self, query_features):
+    def set_features(self, query_features):
         self.features = query_features
+
+    def __str__(self):
+        return "query: {} \n triples: {} \n features: {}".format(self.query_string, self.rdflib_tp, self.features)
