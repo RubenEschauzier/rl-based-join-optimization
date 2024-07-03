@@ -38,3 +38,10 @@ class GCNConvQueryEmbeddingModel():
 
     def parameters(self):
         return [param for layer in self.layers for param in list(layer.parameters())]
+
+    def devices(self):
+        params = self.parameters()
+        return [param.device for param in params]
+
+    def to(self, device):
+        self.layers = [layer.to(device) for layer in self.layers]

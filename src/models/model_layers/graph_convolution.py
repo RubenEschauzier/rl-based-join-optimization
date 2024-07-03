@@ -43,3 +43,9 @@ class GCNConv(MessagePassing):
 
         # Step 4: Normalize node features.
         return norm.view(-1, 1) * x_j
+
+    def devices(self):
+        devices = [ self.bias.device ]
+        devices_linear = [param.device for param in self.lin.parameters()]
+        devices.extend(devices_linear)
+        return devices

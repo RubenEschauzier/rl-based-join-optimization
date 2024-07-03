@@ -6,11 +6,11 @@ import torch.nn as nn
 # Adapted by Ruben Eschauzier
 from src.models.model_layers.attention import Attention
 from src.models.model_layers.encoder import Encoder
-from src.models.model_layers.utils import masked_max, masked_sample
+from src.utils.model_utils.utils import masked_max, masked_sample
 
 
 class PointerNet(nn.Module):
-    def __init__(self, input_dim, embedding_dim, hidden_size, bidirectional=True, batch_first=True,
+    def __init__(self, input_dim, embedding_dim, hidden_size, device='cpu', bidirectional=True, batch_first=True,
                  allow_repeats=False):
         super(PointerNet, self).__init__()
 
@@ -25,6 +25,7 @@ class PointerNet(nn.Module):
         self.batch_first = batch_first
         # Whether the output sequence can repeat pointers
         self.allow_repeats = allow_repeats
+        self.device = device
 
         # We use an embedding layer for more complicate application usages later, e.g., word sequences.
         self.embedding = nn.Linear(in_features=input_dim, out_features=embedding_dim, bias=False)
@@ -73,11 +74,11 @@ class PointerNet(nn.Module):
             batch_size, max_seq_len, max_seq_len)
         each_len_tensor = input_lengths.view(-1, 1, 1).expand(batch_size, max_seq_len, max_seq_len)
 
-        row_mask_tensor = (range_tensor < each_len_tensor)
-        col_mask_tensor = row_mask_tensor.transpose(1, 2)
+        row_mask_tensor = (range_tensor < each_len_tensor).to(self.device)
+        col_mask_tensor = row_mask_tensor.transpose(1, 2).to(self.device)
         mask_tensor = row_mask_tensor * col_mask_tensor
         # Mask for preventing repeats, if we do allow repeats this mask stays as ones tensor
-        non_repeat_mask = torch.ones((input_seq.shape[0], max_seq_len))
+        non_repeat_mask = torch.ones((input_seq.shape[0], max_seq_len)).to(self.device)
 
         pointer_log_scores = []
         pointer_probabilities = []
@@ -87,7 +88,7 @@ class PointerNet(nn.Module):
             # We will simply mask out when calculating attention or max (and loss later)
             # not all input and hiddens, just for simplicity
             sub_mask = mask_tensor[:, i, :].float()
-            sub_mask = sub_mask * non_repeat_mask
+            sub_mask = (sub_mask * non_repeat_mask)
 
             # h, c: (batch_size, hidden_size)
             h_i, c_i = self.decoding_rnn(decoder_input, decoder_hidden)
@@ -111,7 +112,7 @@ class PointerNet(nn.Module):
                 pointer_probabilities.append(probabilities)
 
             if not self.allow_repeats:
-                non_repeat_mask = non_repeat_mask.scatter_(1, masked_argmax, torch.zeros(non_repeat_mask.shape))
+                non_repeat_mask = non_repeat_mask.scatter_(1, masked_argmax, torch.zeros(non_repeat_mask.shape).to(self.device))
 
             pointer_argmaxs.append(masked_argmax)
             # Index tensor denotes the indexes of the elements of input sequence chosen by pointer network
@@ -124,3 +125,11 @@ class PointerNet(nn.Module):
 
         pointer_argmaxs = torch.cat(pointer_argmaxs, 1)
         return pointer_log_scores, pointer_argmaxs, mask_tensor
+
+    def devices(self):
+        devices = []
+        devices.extend(self.attn.devices())
+        devices.extend(self.encoder.devices())
+        devices.extend([param.device for param in self.embedding.parameters()])
+        devices.extend([param.device for param in self.decoding_rnn.parameters()])
+        return devices
