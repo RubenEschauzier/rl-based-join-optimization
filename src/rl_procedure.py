@@ -1,38 +1,33 @@
-from os import listdir
-from os.path import isfile, join
-from time import sleep
+import torch
+import torch.nn as nn
+
+import numpy as np
 
 from SPARQLWrapper import JSON
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
-import torch
-import torch.nn as nn
-import numpy as np
 
-from src.datastructures.query import Query
 from src.models.model_instantiator import ModelFactory
 from src.models.pointer_network import PointerNet
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 from src.query_graph_featurizers.quad_views import FeaturizeQueryGraphQuadViews
+from src.utils.training_utils.utils import initialize_graph_models, run_models, load_watdiv_queries, \
+    get_parameters_model
 
 
-def load_queries(location):
-    raw_queries = []
-    files = [f for f in listdir(location) if isfile(join(location, f))]
-    for file in files:
-        with open(join(location, file), 'r') as f:
-            raw_queries.extend(f.read().strip().split('\n\n'))
+def get_average_execution_time_queries(env, queries, timeout, repeats):
+    average_exec_times = {}
+    average_exec_vector = []
+    for query in queries:
+        total_exec = 0
+        for i in range(repeats):
+            _, time = env.run_default_optimizer(query, timeout, JSON, {"explain": "True"})
+            total_exec += time
+        average_exec_times[query.query_string] = total_exec / repeats
+        average_exec_vector.append(total_exec / repeats)
 
-    queries = [Query(query) for query in raw_queries]
-    return queries
-
-
-def get_parameters_model(all_models):
-    parameters = []
-    for model in all_models:
-        parameters.extend(list(model.parameters()))
-    return parameters
+    return average_exec_times, np.mean(np.array(average_exec_vector))
 
 
 # Not sure how to batch this yet, might not need it due to small model size
@@ -44,17 +39,8 @@ def embed_query_graphs(queries, embedding_models):
     return query_graph_embeddings
 
 
-def run_models(query, embedding_models):
-    embeddings_list = []
-    for graph, model in zip(query.query_graph_representations, embedding_models):
-        embedding = model.run(query.features, graph)
-        embeddings_list.append(embedding)
-
-    return torch.cat(embeddings_list, dim=1)
-
-
 def prepare(env, queries_location, rdf2vec_vector_location):
-    queries = load_queries(queries_location)[0::20]
+    queries = load_watdiv_queries(queries_location)
 
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
     rdf2vec_featurizer = FeaturizeQueriesRdf2Vec(env, vectors)
@@ -65,23 +51,9 @@ def prepare(env, queries_location, rdf2vec_vector_location):
     return queries
 
 
-def initialize_graph_models(factories: [tuple]):
-    """
-    Initializes graph models in order specified in factories. This order should align with the order of generated graphs
-    to run over
-    :param factories: list of tuples of model factories and number of model should be created from this factory
-    :return: list with created models
-    """
-    models = []
-    for (factory, n_instances) in factories:
-        for i in range(n_instances):
-            models.append(factory.build_model_from_config())
-    return models
-
-
 def policy(network, features, sequence_lengths):
     log_probs_batch, sampled_pointer, mask = network.forward(features, sequence_lengths, greedy=False)
-    join_orders = np.array(sampled_pointer)
+    join_orders = np.array(sampled_pointer.cpu())
     return join_orders, log_probs_batch
 
 
@@ -102,35 +74,53 @@ def get_future_rewards(reward_sequence, discounted_rewards, k):
     return reward_sequence + np.sum(discounted_rewards[k:])
 
 
-def run_training(endpoint, queries_location, rdf2vec_vector_location,
+def run_training(queries_location, rdf2vec_vector_location, endpoint_uri,
                  n_epoch, batch_size, lr, n_episodes_query, discount_factor, seed):
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Training on {}".format(device))
-    torch.set_default_device(device)
 
     # Build graph embedding models from config
     model_factory = ModelFactory("experiments/configs/test_config.yaml")
     graph_embedding_models = initialize_graph_models([(model_factory, 4)])
 
     # Pointer network for join order sequence generation
-    ptr_net = PointerNet(8192, 8192, 8192)
+    ptr_net = PointerNet(1024*4, 1024*4, 1024*4, device=device)
 
     # Define optimizer over all model parameters
     all_models = [ptr_net] + graph_embedding_models
     parameters = get_parameters_model(all_models)
+
+    # Move models to cuda
+    ptr_net = ptr_net.to(device)
+    [graph_model.to(device) for graph_model in graph_embedding_models]
+
+    # Define optimizer over parameters
     optimizer = torch.optim.Adam(parameters, lr=lr)
 
     # Initialize the query environment
-    env = BlazeGraphQueryEnvironment(endpoint)
+    # start_envs(endpoint_uris, blazegraph_location)
+    env = BlazeGraphQueryEnvironment(endpoint_uri)
 
     # Prepare features of queries
     queries = prepare(env, queries_location, rdf2vec_vector_location)
 
+    # Move query features to device
+    for query in queries:
+        query.features = query.features.to(device)
+        query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
+
     # Split queries
     train_queries, test_queries = train_test_split(queries, test_size=.2, random_state=seed)
 
+    # Get average execution time to compare against
+    average_exec_default_opt, total_average = get_average_execution_time_queries(env, train_queries, 60, 20)
+    print(average_exec_default_opt)
+    print(total_average)
+
     # Train loop
     for i in range(n_epoch):
+        print("Epoch {}/{} ".format(i + 1, n_epoch))
         rewards_epoch = []
         execution_times_epoch = []
         train_queries = shuffle(train_queries, random_state=seed)
@@ -151,7 +141,6 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                                                   queries_batch[k],
                                                   join_order[:un_padded_features[k].shape[0]],
                                                   60)
-
                     # If the query timed out this function returns an integer, so we turn it into penalty sequence
                     if isinstance(penalty, int):
                         # Set penalty to the high number returned in case of a timeout
@@ -169,7 +158,7 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                     # of selecting that triple pattern for calculating the policy gradient using REINFORCE
                     for j in range(reward.shape[0]):
                         # Query k, at join order timestep j, chose pointer join_order[j]
-                        log_prob = log_probs_batch[k][j][join_order[j]]
+                        log_prob = log_probs_batch[k][j][join_order[j]].to(device)
 
                         # Discounted reward do NOT take into account previous rewards
                         discounted_reward = sum([r * discount_factor ** i for i, r in enumerate(reward[j:])])
@@ -182,8 +171,8 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
                     execution_times_epoch.append(exec_time)
 
             # Prepare data policy gradient
-            log_prob_tensor = torch.stack(log_probs)
-            reward_tensor = torch.from_numpy(np.array(rewards))
+            log_prob_tensor = torch.stack(log_probs).to(device)
+            reward_tensor = torch.from_numpy(np.array(rewards)).to(device)
 
             # Policy gradient term
             performance = (-(log_prob_tensor * reward_tensor)).sum()
@@ -192,8 +181,8 @@ def run_training(endpoint, queries_location, rdf2vec_vector_location,
             optimizer.zero_grad()
             performance.backward()
             optimizer.step()
-        print("Epoch {}/{} (Mean reward: {}, Mean exec time: {}".format(i + 1, n_epoch,
-                                                                        sum(rewards_epoch) / len(rewards_epoch),
-                                                                        sum(execution_times_epoch) /
-                                                                        len(execution_times_epoch)
-                                                                        ))
+        print("Mean reward: {}, Mean exec time: {}".format(sum(rewards_epoch) / len(rewards_epoch),
+                                                           sum(execution_times_epoch) /
+                                                           len(execution_times_epoch)
+                                                           ))
+
