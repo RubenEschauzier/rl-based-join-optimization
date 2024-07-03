@@ -19,7 +19,7 @@ class FeaturizeQueriesRdf2Vec:
 
         for i in range(len(queries)):
             featurized = self.featurize_query(queries[i], estimates[i])
-            queries[i].set_featurized(torch.Tensor(featurized))
+            queries[i].set_features(torch.Tensor(featurized))
 
         return queries
 
