@@ -16,7 +16,7 @@ class ModelFactory:
     def __init__(self, config_file):
         self.config_file = config_file
         self.config = self.load_config()
-        self.SUPPORTED = {"GCNConv": self.load_gcn_conv}
+        self.SUPPORTED = {"GCNConv": self.load_gcn_conv, "MLP": self.load_mlp}
 
     def build_model_from_config(self):
         """
@@ -49,6 +49,9 @@ class ModelFactory:
         gcn_conv_model = GCNConvQueryEmbeddingModel()
         gcn_conv_model.init_model(self.config)
         return gcn_conv_model
+
+    def load_mlp(self):
+        return self.load_sequential()
 
     def load_config(self):
         """

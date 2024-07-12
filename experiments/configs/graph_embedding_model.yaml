@@ -1,0 +1,32 @@
+model:
+  type: GCNConv
+  layers:
+    - type: gcn_conv
+      in_features: 385
+      out_features: 512
+    - type: ReLU
+    - type: Dropout
+      p: .2
+    - type: gcn_conv
+      in_features: 512
+      out_features: 1024
+    - type: ReLU
+    - type: Dropout
+      p: .2
+    - type: Linear
+      in_features: 1024
+      out_features: 2048
+    - type: ReLU
+    - type: Dropout
+      p: .2
+    - type: Linear
+      in_features: 2048
+      out_features: 1024
+    - type: ReLU
+    - type: Dropout
+      p: .2
+weight_location:
+  directory: ""
+  chkp: true
+
+

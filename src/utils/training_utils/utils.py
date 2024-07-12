@@ -50,3 +50,11 @@ def get_parameters_model(all_models):
     for model in all_models:
         parameters.extend(list(model.parameters()))
     return parameters
+
+
+def embed_query_graphs(queries, embedding_models):
+    query_graph_embeddings = []
+    for query in queries:
+        query_emb = run_models(query, embedding_models)
+        query_graph_embeddings.append(query_emb)
+    return query_graph_embeddings

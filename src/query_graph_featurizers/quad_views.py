@@ -1,4 +1,4 @@
-import json
+from tqdm import tqdm
 from typing import Literal
 import torch
 import numpy as np
@@ -11,7 +11,7 @@ class FeaturizeQueryGraphQuadViews:
         pass
 
     def run(self, queries: [Query], format_graph: Literal["adj_matrix", "edge_index"]):
-        for query in queries:
+        for query in tqdm(queries):
             s_s, o_o, s_o, o_s = self.featurize_query(query)
             if format_graph == "edge_index":
                 s_s = self.convert_to_edge_index_format(s_s)

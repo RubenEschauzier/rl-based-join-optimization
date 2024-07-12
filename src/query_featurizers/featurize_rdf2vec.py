@@ -1,6 +1,6 @@
 import json
 
-import numpy as np
+from tqdm import tqdm
 import rdflib.term
 import torch
 
@@ -17,7 +17,7 @@ class FeaturizeQueriesRdf2Vec:
     def run(self, queries: [Query]):
         estimates = self.get_cardinality_estimates_query_set(queries)
 
-        for i in range(len(queries)):
+        for i in tqdm(range(len(queries))):
             featurized = self.featurize_query(queries[i], estimates[i])
             queries[i].set_features(torch.Tensor(featurized))
 
@@ -53,7 +53,7 @@ class FeaturizeQueriesRdf2Vec:
 
     def get_cardinality_estimates_query_set(self, queries):
         estimates = []
-        for query in queries:
+        for query in tqdm(queries):
             estimates.append(self.get_cardinality_estimate(query))
         return estimates
 
