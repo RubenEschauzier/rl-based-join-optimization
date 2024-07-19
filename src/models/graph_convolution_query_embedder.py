@@ -3,11 +3,11 @@ import torch
 from src.models.model_layers.graph_convolution import GCNConv
 
 
-class GCNConvQueryEmbeddingModel():
-    def __init__(self):
+class GCNConvQueryEmbeddingModel(torch.nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.layers = []
         self.layer_types = []
-        pass
 
     def init_model(self, model_architecture_config):
         """
@@ -27,7 +27,7 @@ class GCNConvQueryEmbeddingModel():
             self.layer_types.append(layer_config["type"])
         self.layers = layers
 
-    def run(self, features, graph):
+    def forward(self, features, graph):
         hs = features
         for layer, layer_type in zip(self.layers, self.layer_types):
             if layer_type == 'gcn_conv':

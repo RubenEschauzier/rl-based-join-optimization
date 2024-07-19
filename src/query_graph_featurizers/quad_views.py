@@ -10,8 +10,8 @@ class FeaturizeQueryGraphQuadViews:
     def __init__(self):
         pass
 
-    def run(self, queries: [Query], format_graph: Literal["adj_matrix", "edge_index"]):
-        for query in tqdm(queries):
+    def run(self, queries: [Query], format_graph: Literal["adj_matrix", "edge_index"], disable_progress_bar=False):
+        for query in tqdm(queries, disable=disable_progress_bar):
             s_s, o_o, s_o, o_s = self.featurize_query(query)
             if format_graph == "edge_index":
                 s_s = self.convert_to_edge_index_format(s_s)
@@ -20,6 +20,8 @@ class FeaturizeQueryGraphQuadViews:
                 o_s = self.convert_to_edge_index_format(o_s)
             query.query_graph_representations = [torch.tensor(s_s), torch.tensor(o_o),
                                                  torch.tensor(s_o), torch.tensor(o_s)]
+            if format_graph == "adj_matrix":
+                raise NotImplementedError("Adjacency matrix is not yet supported")
         return queries
 
     @staticmethod

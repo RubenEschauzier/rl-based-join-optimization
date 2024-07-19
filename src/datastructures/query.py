@@ -40,5 +40,21 @@ class Query:
     def set_features(self, query_features):
         self.features = query_features
 
+    def set_query_graph_representations(self, graph_representations):
+        self.query_graph_representations = graph_representations
+
+    def set_features_graph_views_from_dict(self, feature_dict):
+        """
+        Method for setting the features from dictionary, used to load prepared queries from disk instead of constructing
+        them repeatedly using COUNT queries.
+        :param feature_dict: Feature dict with query string as key, [feature tensor, graph view list] as value
+        :return: void
+        :rtype:
+        """
+        features, views = feature_dict[self.query_string]
+        self.set_features(features)
+        self.set_query_graph_representations(views)
+        pass
+
     def __str__(self):
         return "query: {} \n triples: {} \n features: {}".format(self.query_string, self.rdflib_tp, self.features)

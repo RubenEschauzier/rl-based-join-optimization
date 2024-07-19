@@ -14,10 +14,9 @@ class FeaturizeQueriesRdf2Vec:
         self.vector_size = len(list(self.vectors.values())[0])
         pass
 
-    def run(self, queries: [Query]):
-        estimates = self.get_cardinality_estimates_query_set(queries)
-
-        for i in tqdm(range(len(queries))):
+    def run(self, queries: [Query], disable_progress_bar=False):
+        estimates = self.get_cardinality_estimates_query_set(queries, disable_progress_bar=disable_progress_bar)
+        for i in tqdm(range(len(queries)), disable=disable_progress_bar):
             featurized = self.featurize_query(queries[i], estimates[i])
             queries[i].set_features(torch.Tensor(featurized))
 
@@ -51,9 +50,9 @@ class FeaturizeQueriesRdf2Vec:
             query_embedding.append(tp_emb)
         return torch.Tensor(query_embedding)
 
-    def get_cardinality_estimates_query_set(self, queries):
+    def get_cardinality_estimates_query_set(self, queries, disable_progress_bar):
         estimates = []
-        for query in tqdm(queries):
+        for query in tqdm(queries, disable=disable_progress_bar):
             estimates.append(self.get_cardinality_estimate(query))
         return estimates
 

@@ -14,7 +14,7 @@ class GraphEmbedder:
 
         embeddings = []
         for model in self.models:
-            embedding = model.run(query.features, query.query_graph_representations)
+            embedding = model.forward(query.features, query.query_graph_representations)
             embeddings.extend(embedding)
 
         print(embeddings)

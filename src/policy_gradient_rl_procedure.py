@@ -49,7 +49,7 @@ def policy(network, features, sequence_lengths):
 
 
 def env_step(env, batch_queries, join_order, timeout):
-    env_result, exec_time = env.run(batch_queries, join_order, timeout, JSON, {"explain": "True"})
+    env_result, exec_time = env.forward(batch_queries, join_order, timeout, JSON, {"explain": "True"})
     penalty = env.reward(env_result, "intermediate-results")
     return penalty, exec_time
 
