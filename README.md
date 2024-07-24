@@ -1,13 +1,20 @@
 ##TODO:
 
 - [x] Generate prepare small queries ( 20k )
-- [ ] Generate and prepare medium queries ( 100k )
+- [x] Generate and prepare medium queries ( 100k )
 - [x] Generate and prepare all queries ( 400k )
-- [ ] Save model weights, with base graph layer separate from cardinality estimation head
+- [x] Save model weights, with base graph layer separate from cardinality estimation head
+- [ ] IMPORTANT: Investigate weird loss sizes, in TEST there is more losses than predictions / actual
+- [ ] Generate queries with less repeating predicates (more diversity in predicates and shapes) and hopefully less massive result sets
+- [ ] Save different query types separately
+- [ ] Save predictions made by model in epoch (Save as: [Query: {pred, actual, q-error}, ..]), seperated by train, 
+val, and test files. As we have now, save without query 
 - [ ] Create code for experiment visualization, analysis etc. Violin plots, q-error plots with distribution, epoch development etc.
+- [ ] Load model weights
+- [ ] Use single passed around loss function defined in main pretrain function
 - [x] Test performance cardinality estimation on completely unseen benchmark queries
 - [ ] Test impact of number of queries on unseen benchmark queries
-- [ ] Find number of parameters in our model
+- [x] Find number of parameters in our model
 - [ ] Use cardinality estimator for join order optimization
 - [ ] Create system for easy configs for experiment running
 - [ ] Generate LUBM benchmark data and test on that

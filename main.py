@@ -1,5 +1,9 @@
 from src.policy_gradient_rl_procedure import run_training_policy_gradient
 from src.pretrain_procedure import run_pretraining
+import os
+
+# Root dir global for file loading
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def main_policy_rl():
@@ -29,8 +33,8 @@ def main_pretraining():
     load_prepared_queries = True
     load_prepared_queries_location = "data/pretrain_data/prepared_pretrain_queries/queries_prepared_20000_torch_dict"
 
-    n_epoch = 2
-    batch_size = 64
+    n_epoch = 10
+    batch_size = 32
     seed = 0
     lr = 1e-4
 

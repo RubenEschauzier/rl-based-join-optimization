@@ -61,7 +61,6 @@ def prepare_watdiv_test_data(env, test_queries_location, test_cardinalities_loca
         queries[key] = [Query(query) for query in value]
         queries[key] = prepare_pretraining_queries(env, queries[key], rdf2vec_vector_location,
                                                    disable_progress_bar=True)
-        # Not sustainable for large number of data points, will need to move incrementally
         for query in queries[key]:
             query.features = query.features.to(device)
             query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
@@ -106,19 +105,25 @@ def q_error_function(pred, true, eps=1e-7):
 
 
 def validate_model(graph_embedding_models, cardinality_estimation_head,
-                   val_queries, val_cardinalities, batch_size
-                   ):
+                   val_queries, val_cardinalities, batch_size,
+                   device):
     loss_fn = torch.nn.L1Loss(reduction="none")
 
-    n_large_pred = 0
+    validation_run_stats = {}
+
     n_processed = 0
     n_batches = 0
+    predictions = []
     q_errors = []
     losses = []
     # TODO: PROPER BATCHED ITERATION WE'RE MISSING OUT ON ELEMENTS
     for b in range(0, len(val_queries), batch_size):
         queries_batch = val_queries[b:b + batch_size]
         cardinalities_batch = val_cardinalities[b:b + batch_size]
+
+        for query in queries_batch:
+            query.features = query.features.to(device)
+            query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
 
         embedded_features = embed_query_graphs(queries_batch, graph_embedding_models)
         embedded_features_batched = torch.stack([feature.sum(dim=0) for feature in embedded_features])
@@ -128,18 +133,27 @@ def validate_model(graph_embedding_models, cardinality_estimation_head,
         n_processed += len(queries_batch)
         n_batches += 1
 
-        for i in range(pred.shape[0]):
-            if torch.exp(pred[i]) > 1_000_000:
-                n_large_pred += 1
-
-            # Scale back to normal cardinality
-            q_error = q_error_function(torch.exp(pred[i]), torch.exp(cardinalities_batch[i]))
-            q_errors.append(q_error)
-
         loss = loss_fn(pred.squeeze(), cardinalities_batch)
         losses.extend(loss.cpu().detach().numpy())
-    print("Large predictions: {}".format(n_large_pred))
-    return losses, q_errors
+        predictions.extend(pred.cpu().detach().numpy())
+        # Prepare statistics list
+        for i in range(pred.shape[0]):
+            # Scale back to normal cardinality
+            prediction_query = pred[i].cpu().detach().item()
+            cardinality_query = cardinalities_batch[i].cpu().item()
+            q_error_query = q_error_function(torch.exp(pred[i]), torch.exp(cardinalities_batch[i])). \
+                cpu().detach().item()
+            loss_query = loss[i].cpu().detach().item()
+
+            validation_run_stats[queries_batch[i].query_string] = {
+                "prediction": prediction_query,
+                "actual": cardinality_query,
+                "loss": loss_query,
+                "q_error": q_error_query
+            }
+
+            q_errors.append(q_error_query)
+    return losses, q_errors, validation_run_stats
 
 
 def test_model_watdiv(queries, cardinalities,
@@ -147,28 +161,38 @@ def test_model_watdiv(queries, cardinalities,
                       device):
     loss_fn = torch.nn.L1Loss(reduction="none")
 
-    q_errors_template = {}
-    losses_template = {}
+    test_run_stats = {}
 
     for template in queries.keys():
+        # Ensure proper shapes when only one query is in a template
         cardinalities_template = torch.tensor(cardinalities[template], device=device)
         queries_template = queries[template]
+
         embedded_features = embed_query_graphs(queries_template, graph_embedding_models)
         embedded_features_batched = torch.stack([feature.sum(dim=0) for feature in embedded_features])
 
         predictions = cardinality_estimation_head.forward(embedded_features_batched)
         loss = loss_fn(predictions.squeeze(), cardinalities_template.squeeze())
+        print(loss.shape)
+        print(len(loss.shape))
         q_errors = []
-
         for i in range(predictions.shape[0]):
-            q_error = q_error_function(torch.exp(predictions[i].detach().squeeze()),
-                                       torch.exp(cardinalities_template[i].detach().squeeze()))
-            q_errors.append(q_error.item())
+            q_error_query = q_error_function(torch.exp(predictions[i].detach().squeeze()),
+                                             torch.exp(cardinalities_template[i].detach().squeeze())).cpu().item()
+            prediction_query = predictions[i].cpu().detach().item()
+            cardinality_query = cardinalities_template[i].cpu().item()
+            loss_query = loss[i].cpu().detach().item()
 
-        losses_template[template] = loss.cpu().detach().numpy()
-        q_errors_template[template] = q_errors
+            q_errors.append(q_error_query)
 
-    return losses_template, q_errors_template
+            test_run_stats[queries_template[i].query_string] = {
+                "prediction": prediction_query,
+                "actual": cardinality_query,
+                "loss": loss_query,
+                "q_error": q_error_query
+            }
+
+    return test_run_stats
 
 
 def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_location,
@@ -186,9 +210,7 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
 
     # Build cardinality estimator from config
     model_factory_card_est_head = ModelFactory("experiments/model_configs/cardinality_estimation_head.yaml")
-    "cardinality_estimation_head"
     cardinality_estimation_head = model_factory_card_est_head.load_mlp()
-    print("Cardinality estimation head: {}".format(sum(p.numel() for p in cardinality_estimation_head.parameters())))
 
     # Move models to device
     [graph_model.to(device) for graph_model in graph_embedding_models]
@@ -218,15 +240,13 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
         feature_dict = torch.load(load_prepared_queries_location)
 
         num_queries = len(feature_dict.keys())
-        queries = load_raw_queries(queries_location, to_load=num_queries - 19990)
+        queries = load_raw_queries(queries_location, to_load=num_queries-19000)
 
         # Iterate over queries to fill with pickled dictionary containing initialized features
         for query in queries:
             query.set_features_graph_views_from_dict(feature_dict)
-        cardinalities = cardinalities[:num_queries - 19990]
-
+        cardinalities = cardinalities[:num_queries-19000]
     else:
-
         queries = load_and_prepare_queries(env=env,
                                            queries_location=queries_location,
                                            rdf2vec_vector_location=rdf2vec_vector_location,
@@ -234,33 +254,36 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
                                            prepared_queries_location=save_prepared_queries_location
                                            )
 
-    # Move query features to device
-    for query in queries:
-        query.features = query.features.to(device)
-        query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
-
     train_queries, val_queries, train_card, val_card = train_test_split(queries, cardinalities,
                                                                         test_size=.2, random_state=seed)
     train_card = torch.tensor(train_card, device=device)
     val_card = torch.tensor(val_card, device=device)
 
     # Use L1 loss
-    loss_fn = torch.nn.L1Loss()
+    loss_fn = torch.nn.L1Loss(reduction="none")
 
     previous_lr = scheduler.get_last_lr()
 
+    # Per epoch stats tracking
     train_loss_per_epoch = []
     val_loss_per_epoch = []
     val_q_error_per_epoch = []
 
     for i in range(n_epoch):
-        n_batches_processed = 0
-        loss_epoch = 0
+        # Dictionary {query string: {prediction, actual, q_error, loss}}
+        train_epoch_stats = {}
+        loss_epoch = []
+
         train_queries, train_card = shuffle(train_queries, train_card, random_state=seed)
 
         for b in range(0, len(train_queries), batch_size):
             queries_batch = train_queries[b:b + batch_size]
             cardinalities_batch = train_card[b:b + batch_size]
+
+            # Move to gpu per batch to save GPU memory
+            for query in queries_batch:
+                query.features = query.features.to(device)
+                query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
 
             optimizer.zero_grad()
 
@@ -270,62 +293,65 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
             pred = cardinality_estimation_head.forward(embedded_features_batched)
             loss = loss_fn(pred.squeeze(), cardinalities_batch)
 
-            loss_epoch += loss.item()
-            n_batches_processed += 1
-
-            loss.backward()
+            torch.mean(loss).backward()
 
             optimizer.step()
 
-        val_loss, val_q_error = validate_model(
+            # Track statistics
+            for k in range(pred.shape[0]):
+                loss_float = loss[k].cpu().detach().item()
+                loss_epoch.append(loss_float)
+                train_epoch_stats[queries_batch[k].query_string] = {
+                    "prediction": pred[k].cpu().detach().item(),
+                    "actual": cardinalities_batch[k].cpu().detach().item(),
+                    "loss": loss_float,
+                    "q_error": q_error_function(torch.exp(pred[k].detach().squeeze()),
+                                                torch.exp(cardinalities_batch[k].detach().squeeze()))
+                }
+
+        val_loss, val_q_error, val_stats = validate_model(
             graph_embedding_models=graph_embedding_models,
             cardinality_estimation_head=cardinality_estimation_head,
             val_queries=val_queries,
             val_cardinalities=val_card,
-            batch_size=batch_size
+            batch_size=batch_size,
+            device=device
         )
 
-        train_loss_per_epoch.append(loss_epoch / n_batches_processed)
+        train_loss_per_epoch.append(np.mean(loss_epoch))
         val_loss_per_epoch.append(val_loss)
         val_q_error_per_epoch.append(val_q_error)
 
-        q_error_array = np.array([q_error.cpu().detach() for q_error in val_q_error])
+        test_stats = test_model_watdiv(test_queries, test_cardinalities,
+                                       graph_embedding_models,
+                                       cardinality_estimation_head, device)
 
-        loss_template, q_error_template = test_model_watdiv(test_queries, test_cardinalities,
-                                                            graph_embedding_models, cardinality_estimation_head,
-                                                            device)
-        total_test_loss = 0
-        total_test_q_error = 0
-
-        for test_loss in loss_template.values():
-            total_test_loss += np.mean(test_loss)
-
-        for q_error_list in q_error_template.values():
-            total_test_q_error += np.mean(np.abs(q_error_list))
-
-        print("Tested model: Average loss: {}, Average absolute Q-error: {}".format(
-            total_test_loss / len(loss_template.values()),
-            total_test_q_error / len(loss_template.values())
-        ))
+        average_test_loss = np.mean([stat['loss'] for stat in test_stats.values()])
+        average_test_q_error = np.mean([stat['q_error'] for stat in test_stats.values()])
 
         print("Epoch {}/{}: Train loss: {}, Validation loss: {}, q-error: {}, Test loss: {}, q-error: {}".format(
             i + 1,
             n_epoch,
-            loss_epoch / n_batches_processed,
+            train_loss_per_epoch[i],
             sum(val_loss) / len(val_loss),
-            np.sum(np.abs(q_error_array)) / q_error_array.shape[0],
-            total_test_loss / len(loss_template.values()),
-            total_test_q_error / len(loss_template.values()))
-        )
+            np.sum(np.abs(np.array(val_q_error))) / len(val_q_error),
+            average_test_loss,
+            average_test_q_error
+        ))
 
+        if scheduler.get_last_lr() != previous_lr:
+            print("INFO: Lr Updated from {} to {}".format(previous_lr, scheduler.get_last_lr()))
+            previous_lr = scheduler.get_last_lr()
+
+        scheduler.step(sum(val_loss) / len(val_loss))
+
+        # Save checkpoint to directory if it is specified
         if ckp_dir:
             # Prepare checkpoint data
             statistics_dict = {
-                'train_loss': loss_epoch / n_batches_processed,
-                'val_loss': val_loss,
-                'val_q_error': q_error_array,
-                'test_loss': loss_template,
-                'test_q_error': q_error_template
+                'train_stats': train_epoch_stats,
+                'val_stats': val_stats,
+                'test_stats': test_stats,
             }
 
             models_to_save = [cardinality_estimation_head]
@@ -337,9 +363,3 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
                             models_to_save, model_file_names,
                             statistics_dict
                             )
-
-        if scheduler.get_last_lr() != previous_lr:
-            print("INFO: Lr Updated from {} to {}".format(previous_lr, scheduler.get_last_lr()))
-            previous_lr = scheduler.get_last_lr()
-
-        scheduler.step(sum(val_loss))
