@@ -173,24 +173,38 @@ def test_model_watdiv(queries, cardinalities,
 
         predictions = cardinality_estimation_head.forward(embedded_features_batched)
         loss = loss_fn(predictions.squeeze(), cardinalities_template.squeeze())
-        print(loss.shape)
-        print(len(loss.shape))
+
         q_errors = []
-        for i in range(predictions.shape[0]):
-            q_error_query = q_error_function(torch.exp(predictions[i].detach().squeeze()),
-                                             torch.exp(cardinalities_template[i].detach().squeeze())).cpu().item()
-            prediction_query = predictions[i].cpu().detach().item()
-            cardinality_query = cardinalities_template[i].cpu().item()
-            loss_query = loss[i].cpu().detach().item()
-
-            q_errors.append(q_error_query)
-
-            test_run_stats[queries_template[i].query_string] = {
+        # In case loss has no shape, we have single query for a template
+        if len(loss.shape) == 0:
+            q_error_query = q_error_function(torch.exp(predictions.detach().squeeze()),
+                                             torch.exp(cardinalities_template.detach().squeeze())).cpu().item()
+            prediction_query = predictions.cpu().detach().item()
+            cardinality_query = cardinalities_template.cpu().item()
+            loss_query = loss.cpu().detach().item()
+            test_run_stats[queries_template[0].query_string] = {
                 "prediction": prediction_query,
                 "actual": cardinality_query,
                 "loss": loss_query,
                 "q_error": q_error_query
             }
+        # Otherwise we iterate over the predictions for all queries
+        else:
+            for i in range(predictions.shape[0]):
+                q_error_query = q_error_function(torch.exp(predictions[i].detach().squeeze()),
+                                                 torch.exp(cardinalities_template[i].detach().squeeze())).cpu().item()
+                prediction_query = predictions[i].cpu().detach().item()
+                cardinality_query = cardinalities_template[i].cpu().item()
+                loss_query = loss[i].cpu().detach().item()
+
+                q_errors.append(q_error_query)
+
+                test_run_stats[queries_template[i].query_string] = {
+                    "prediction": prediction_query,
+                    "actual": cardinality_query,
+                    "loss": loss_query,
+                    "q_error": q_error_query
+                }
 
     return test_run_stats
 
@@ -306,7 +320,7 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
                     "actual": cardinalities_batch[k].cpu().detach().item(),
                     "loss": loss_float,
                     "q_error": q_error_function(torch.exp(pred[k].detach().squeeze()),
-                                                torch.exp(cardinalities_batch[k].detach().squeeze()))
+                                                torch.exp(cardinalities_batch[k].detach().squeeze())).cpu().item()
                 }
 
         val_loss, val_q_error, val_stats = validate_model(
