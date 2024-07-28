@@ -1,6 +1,14 @@
 # TODO: Implement query generation with an endpoint
 
+import numpy as np
 import requests
+import random
+
+ENDPOINT_LIMIT = 10000
+
+
+def binding_to_triples():
+    pass
 
 
 # Adapted from https://github.com/DE-TUM/rdf-subgraph-sampler/
@@ -16,12 +24,13 @@ def query_triple(endpoint_url,
     select += (" ?o" if o == "?o" else "")
     query_string = "SELECT DISTINCT" + select + " WHERE {" + spo + ". } " + \
                    "ORDER BY ASC(bif:rnd(2000000000)) LIMIT " + str(limit)
-
+    print(query_string)
     r = requests.get(endpoint_url,
                      params={'query': query_string,
                              'format': 'json',
                              'default-graph-uri': default_graph_uri}
                      )
+    print(r.text)
     res = r.json()["results"]["bindings"]
 
     subjects, predicates, objects = [], [], []
@@ -49,7 +58,19 @@ def sample_start_triples(endpoint_url, default_graph, limit, samples, p):
                                         p=p,
                                         limit=limit)
     # Form triples from the result by merging the lists and predicates into tuples
-    return list(map(lambda e: (e[0], p, e[1]), zip(subjects, objects)))
+    triples_from_pred = list(map(lambda e: (e[0], p, e[1]), zip(subjects, objects)))
+    sampled = random.sample(triples_from_pred, k=samples)
+    return sampled
+
+
+def sample_star(endpoint_url, default_graph, seed_triple, subject_star, size):
+    if subject_star:
+        # Sample triples with the given subject
+        _, pred, obj = query_triple(endpoint_url, ENDPOINT_LIMIT, s=seed_triple[0], default_graph_uri=default_graph)
+        star_triples = list(map(lambda e: (seed_triple[0], e[0], e[1]), zip(pred, obj)))
+        print(star_triples)
+        # Filter out seed_triple
+    pass
 
 
 if __name__ == "__main__":
@@ -64,4 +85,9 @@ if __name__ == "__main__":
                                    samples=5,
                                    p="<http://purl.org/stuff/rev#text>"
                                    )
-    print(triples)
+    print("Seed triple: {}".format(triples[0]))
+    sample_star(endpoint_url="http://localhost:8890/sparql",
+                default_graph=['http://localhost:8890/watdiv-default-instantiation'],
+                seed_triple=triples[0],
+                subject_star=True,
+                size=5)

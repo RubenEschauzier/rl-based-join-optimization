@@ -254,12 +254,12 @@ def run_pretraining(queries_location, cardinalities_location, rdf2vec_vector_loc
         feature_dict = torch.load(load_prepared_queries_location)
 
         num_queries = len(feature_dict.keys())
-        queries = load_raw_queries(queries_location, to_load=num_queries-19000)
+        queries = load_raw_queries(queries_location, to_load=num_queries)
 
         # Iterate over queries to fill with pickled dictionary containing initialized features
         for query in queries:
             query.set_features_graph_views_from_dict(feature_dict)
-        cardinalities = cardinalities[:num_queries-19000]
+        cardinalities = cardinalities[:num_queries]
     else:
         queries = load_and_prepare_queries(env=env,
                                            queries_location=queries_location,

@@ -33,7 +33,7 @@ def main_pretraining():
     load_prepared_queries = True
     load_prepared_queries_location = "data/pretrain_data/prepared_pretrain_queries/queries_prepared_20000_torch_dict"
 
-    n_epoch = 10
+    n_epoch = 15
     batch_size = 32
     seed = 0
     lr = 1e-4
