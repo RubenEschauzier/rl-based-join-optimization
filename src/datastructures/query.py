@@ -22,6 +22,7 @@ class Query:
         for triple_pattern in rdflib_triple_patterns:
             string_triple_pattern: str = ""
             for term in triple_pattern:
+                # TODO: Wtf is this this is all the same, am I stupid?
                 if type(term) == rdflib.term.Variable:
                     string_triple_pattern += "{} ".format(term.n3())
                     pass
