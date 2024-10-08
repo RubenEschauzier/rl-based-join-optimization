@@ -1,4 +1,3 @@
-# TODO: Implement query generation with an endpoint
 from time import sleep
 from typing import Literal
 
@@ -7,7 +6,8 @@ import requests
 import random
 from tqdm import tqdm
 
-from src.random_query_generation.generation_utils import create_variable_dictionary, filter_isomorphic_queries
+from src.random_query_generation.generation_utils import create_variable_dictionary, filter_isomorphic_queries, \
+    query_all_terms
 
 ENDPOINT_LIMIT = 10000
 
@@ -144,44 +144,6 @@ def query_triple(endpoint_url,
             objects.append(o)
 
     return subjects, predicates, objects
-
-
-def query_all_terms(endpoint_url, term_type: Literal["?s", "?p", "?o"], default_graph_uri=None):
-    # Create query string for querying the specified term type
-    query_string = \
-        "SELECT " + term_type + " WHERE { " \
-                                "{ " "SELECT  DISTINCT  " + term_type + " WHERE " \
-                                                                        "{ ?s  ?p  ?o } " \
-                                                                        "ORDER BY ASC(" + term_type + ") " \
-                                                                                                      "}" \
-                                                                                                      "} LIMIT " \
-        + str(ENDPOINT_LIMIT)
-    offset = 0
-    terms = []
-    while True:
-        # Make request per endpoint limit rows
-        query = query_string + " OFFSET {}".format(offset)
-        r = requests.get(endpoint_url,
-                         params={'query': query,
-                                 'format': 'json',
-                                 'default-graph-uri': default_graph_uri}
-                         )
-        # Try to decode the query response, catch a fail occurring due to the offset being larger than the number
-        # of rows.
-        try:
-            res = r.json()["results"]["bindings"]
-            # Empty results also means all predicates are found
-            if len(res) == 0:
-                break
-            # Process found terms of type
-            terms.extend(
-                [rdflib.term.URIRef(binding[term_type[1]]['value']) if binding[term_type[1]]['type'] == 'uri'
-                 else rdflib.term.Literal(binding[term_type[1]]['value']) for binding in res])
-
-        except ValueError as err:
-            break
-        offset += ENDPOINT_LIMIT
-    return terms
 
 
 def sample_start_triples(endpoint_url, default_graph_uri, limit, samples,
