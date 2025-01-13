@@ -7,7 +7,7 @@ import random
 from tqdm import tqdm
 
 from src.random_query_generation.generation_utils import create_variable_dictionary, filter_isomorphic_queries, \
-    query_all_terms
+    query_all_terms, query_triple, sample_start_triples
 
 ENDPOINT_LIMIT = 10000
 
@@ -95,74 +95,6 @@ def triples_to_query(star_triples, type_star: Literal['subject', 'object'], lite
         query += "}"
         queries.append(query)
     return queries
-
-
-# Adapted from https://github.com/DE-TUM/rdf-subgraph-sampler/
-def query_triple(endpoint_url,
-                 limit,
-                 s=rdflib.term.Variable("?s"), p=rdflib.term.Variable("?p"), o=rdflib.term.Variable("?o"),
-                 default_graph_uri=None):
-    sleep(.001)
-    # Get the query and select statement based on supplied values for s p o
-    spo = "{} {} {}".format(s.n3(), p.n3(), o.n3())
-    select = ""
-    select += (" ?s" if s.n3() == "?s" else "")
-    select += (" ?p" if p.n3() == "?p" else "")
-    select += (" ?o" if o.n3() == "?o" else "")
-
-    # Adapt query string to use SPARQL 1.1 RAND()
-    query_string = "SELECT DISTINCT " + select + " WHERE {" + spo + " } " + \
-                   "ORDER BY RAND() LIMIT " + str(limit)
-    # SELECT DISTINCT  ?p ?o WHERE {<http://db.uwaterloo.ca/~galuc/wsdbm/Offer555> ?p ?o } ORDER BY RAND() LIMIT 10000
-    # Triple: 5298
-    # SELECT DISTINCT  ?p ?o WHERE {<http://db.uwaterloo.ca/~galuc/wsdbm/Offer5538> ?p ?o } ORDER BY RAND() LIMIT 10000
-    # Triple: 5284
-    r = requests.get(endpoint_url,
-                     params={'query': query_string,
-                             'format': 'json',
-                             'default-graph-uri': default_graph_uri}
-                     )
-    # Sometimes gives error (service unavailable etc) if that is the case we have to retry the query
-    if r.status_code == 503:
-        print(r)
-        print("503 found!!!!")
-    res = r.json()["results"]["bindings"]
-
-    # Get bindings from results, if any of the queried triple terms is not a variable we repeat the term in the
-    # triple pattern
-    subjects = [rdflib.term.URIRef(binding['s']['value']) if s.n3() == "?s" else s for binding in res]
-    predicates = [rdflib.term.URIRef(binding['p']['value']) if p.n3() == "?p" else p for binding in res]
-
-    objects = []
-    for binding in res:
-        if o.n3() == "?o":
-            if binding['o']['type'] == "literal":
-                objects.append(rdflib.term.Literal(binding['o']['value']))
-            else:
-                objects.append(rdflib.term.URIRef(binding['o']['value']))
-        else:
-            objects.append(o)
-
-    return subjects, predicates, objects
-
-
-def sample_start_triples(endpoint_url, default_graph_uri, limit, samples,
-                         s=rdflib.term.Variable("?s"), p=rdflib.term.Variable("?p")):
-    if samples > limit:
-        raise ValueError("Sampling more triples than available through limit")
-    # Randomly sample triples with predicate
-    subjects, predicates, objects = query_triple(endpoint_url,
-                                                 default_graph_uri=default_graph_uri,
-                                                 s=s, p=p,
-                                                 limit=limit)
-    # Form triples from the result by merging the lists and predicates into tuples
-    triples_from_pred = list(map(lambda e: (e[0], e[1], e[2]), zip(subjects, predicates, objects)))
-    # If we find less triples than we want to sample we just return all found triples
-    if len(triples_from_pred) <= samples:
-        return triples_from_pred
-
-    # Return sample of triples
-    return random.sample(triples_from_pred, k=samples)
 
 
 def sample_star(endpoint_url, default_graph_uri, seed_triple, subject_star, size):

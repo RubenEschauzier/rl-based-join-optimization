@@ -27,11 +27,14 @@ class GCNConvQueryEmbeddingModel(torch.nn.Module):
             self.layer_types.append(layer_config["type"])
         self.layers = layers
 
-    def forward(self, features, graph):
+    def forward(self, features, graph, **kwargs):
         hs = features
         for layer, layer_type in zip(self.layers, self.layer_types):
             if layer_type == 'gcn_conv':
                 hs = layer(hs, graph)
+            # Do no apply dropout during validation
+            elif layer_type == 'Dropout' and kwargs['training'] == False:
+                continue
             else:
                 hs = layer(hs)
         return hs

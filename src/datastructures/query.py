@@ -59,3 +59,25 @@ class Query:
 
     def __str__(self):
         return "query: {} \n triples: {} \n features: {}".format(self.query_string, self.rdflib_tp, self.features)
+
+
+class ProcessQuery:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def deconstruct_to_triple_pattern(query_string: str):
+        prepared_query = prepareQuery(query_string)
+        rdflib_triple_patterns: list[rdflib.term] = prepared_query.algebra.get('p').get('p').get('triples')
+        string_triple_patterns: list[str] = []
+        for triple_pattern in rdflib_triple_patterns:
+            string_triple_pattern: str = ""
+            for term in triple_pattern:
+                # TODO: Wtf is this this is all the same, am I stupid?
+                if (type(term) == rdflib.term.Variable or type(term) == rdflib.term.URIRef
+                        or type(term) == rdflib.term.Literal):
+                    string_triple_pattern += "{} ".format(term.n3())
+                else:
+                    print("Term not supported: {}".format(type(term)))
+            string_triple_patterns.append(string_triple_pattern.strip() + " .")
+        return string_triple_patterns, rdflib_triple_patterns

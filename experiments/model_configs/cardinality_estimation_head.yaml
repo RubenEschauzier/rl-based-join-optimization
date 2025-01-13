@@ -11,8 +11,6 @@ model:
       in_features: 512
       out_features: 256
     - type: ReLU
-    - type: Dropout
-      p: .2
     - type: Linear
       in_features: 256
       out_features: 1

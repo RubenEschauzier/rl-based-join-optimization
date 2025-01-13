@@ -22,10 +22,10 @@ def initialize_graph_models(factories: [tuple]):
     return models
 
 
-def run_models(query, embedding_models, pool=False):
+def run_models(query, embedding_models, pool=False, training=True):
     embeddings_list = []
     for graph, model in zip(query.query_graph_representations, embedding_models):
-        embedding = model.forward(query.features, graph)
+        embedding = model.forward(query.features, graph, training=training)
         embeddings_list.append(embedding)
     if pool:
         # Average pool of four graph embeddings
@@ -74,10 +74,10 @@ def get_parameters_model(all_models):
     return parameters
 
 
-def embed_query_graphs(queries, embedding_models):
+def embed_query_graphs(queries, embedding_models, training=True):
     query_graph_embeddings = []
     for query in queries:
-        query_emb = run_models(query, embedding_models)
+        query_emb = run_models(query, embedding_models, training=training)
         query_graph_embeddings.append(query_emb)
     return query_graph_embeddings
 
@@ -91,3 +91,15 @@ def save_checkpoint(ckp_dir, optimizer, models, model_file_names, statistics):
         pickle.dump(statistics, f)
     for model, filename in zip(models, model_file_names):
         torch.save(model.state_dict(), path.join(ckp_dir, filename))
+
+
+def register_debugging_hooks(module):
+    def hook_fn(module, input, output):
+        print(f"Layer: {module}")
+        print(f"Input: {input}")
+        print(f"Output: {output}")
+        print("="*50)
+
+    # Register hook for the layer
+    module.register_forward_hook(hook_fn)
+

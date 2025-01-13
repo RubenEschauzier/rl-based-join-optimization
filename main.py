@@ -1,5 +1,5 @@
 from src.policy_gradient_rl_procedure import run_training_policy_gradient
-from src.pretrain_procedure import run_pretraining
+from src.pretrain_procedure import run_pretraining, main_pretraining
 import os
 
 # Root dir global for file loading
@@ -17,42 +17,42 @@ def main_policy_rl():
                                  4, .99, seed)
 
 
-def main_pretraining():
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv-default-instantiation/sparql"
+def pretraining():
+    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
-    train_query_location = "data/pretrain_data/queries.txt"
-    train_cardinality = "data/pretrain_data/cardinalities.txt"
-    test_watdiv_query_location = "data/pretrain_data/test_queries/watdiv/template_queries"
-    test_watdiv_cardinality_location = "data/pretrain_data/test_queries/watdiv/template_cardinalities"
+    train_query_location = "data/pretrain_data/generated_queries_sub_sampler/star_queries_2_3_5.json"
+    train_cardinality = None
+    # test_watdiv_query_location = "data/pretrain_data/test_queries/watdiv/template_queries"
+    # test_watdiv_cardinality_location = "data/pretrain_data/test_queries/watdiv/template_cardinalities"
 
-    rdf2vec_vector_location = "data/input/rdf2vec_vectors/vectors_depth_1_full_entities.json"
+    # rdf2vec_vector_location = "data/output/entity_embeddings/rdf2vec_vectors_depth_2_quick.json"
+    rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
 
-    ckp_directory = "data/output/cardinality_estimation/cardinality_estimation_20k"
-    save_prepared_queries = False
-    save_prepared_queries_location = "data/pretrain_data/prepared_pretrain_queries/queries_prepared_full_torch_dict"
-    load_prepared_queries = True
-    load_prepared_queries_location = "data/pretrain_data/prepared_pretrain_queries/queries_prepared_20000_torch_dict"
 
-    n_epoch = 15
+    ckp_directory = "data/output/cardinality_estimation/cardinality_estimation_reproduction"
+    # save_prepared_queries_location = ("data/pretrain_data/prepared_pretrain_queries/"
+    #                                   "sub_sampler_queries_prepared_full_torch_dict")
+    # load_prepared_queries_location = ("data/pretrain_data/prepared_pretrain_queries/"
+    #                                   "sub_sampler_queries_prepared_full_torch_dict")
+
+    n_epoch = 50
     batch_size = 32
     seed = 0
     lr = 1e-4
 
-    run_pretraining(queries_location=train_query_location,
-                    cardinalities_location=train_cardinality,
+    main_pretraining(train_queries_location=train_query_location,
+                    train_cardinalities_location=train_cardinality,
                     rdf2vec_vector_location=rdf2vec_vector_location,
-                    test_query_location=test_watdiv_query_location,
-                    test_cardinalities_location=test_watdiv_cardinality_location,
+                    test_query_location=None,
+                    test_cardinalities_location=None,
                     endpoint_uri=endpoint_location,
                     n_epoch=n_epoch,
                     batch_size=batch_size,
                     lr=lr,
                     seed=seed,
                     ckp_dir=ckp_directory,
-                    save_prepared_queries=save_prepared_queries,
-                    save_prepared_queries_location=save_prepared_queries_location,
-                    load_prepared_queries=load_prepared_queries,
-                    load_prepared_queries_location=load_prepared_queries_location
+                    save_prepared_queries_location=None,
+                    load_prepared_queries_location=None
                     )
 
 
@@ -61,4 +61,4 @@ def main_q_learning_rl():
 
 
 if __name__ == "__main__":
-    main_pretraining()
+    pretraining()

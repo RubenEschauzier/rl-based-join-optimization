@@ -1,4 +1,5 @@
 import json
+from time import sleep
 
 from tqdm import tqdm
 import rdflib.term
@@ -37,6 +38,7 @@ class FeaturizeQueriesRdf2Vec:
                     continue
 
                 if type(entity) == rdflib.term.URIRef or type(entity) == rdflib.term.Literal:
+
                     if self.vectors.get(str(entity)):
                         entity_embedding = self.vectors.get(str(entity))
                     else:
@@ -52,6 +54,8 @@ class FeaturizeQueriesRdf2Vec:
 
     def get_cardinality_estimates_query_set(self, queries, disable_progress_bar):
         estimates = []
+        print("Getting cardinality estimates for query triple patterns...")
+        sleep(.5)
         for query in tqdm(queries, disable=disable_progress_bar):
             estimates.append(self.get_cardinality_estimate(query))
         return estimates
@@ -78,17 +82,3 @@ class FeaturizeQueriesRdf2Vec:
         with open(location, 'r') as f:
             data = json.load(f)
         return data
-
-    @staticmethod
-    def convert_text_to_json(text_file_location, output_location):
-        vector_dict = {}
-        with open(text_file_location, 'r') as f:
-            data = f.read().strip().split('\n')
-
-        for entity in data:
-            split = entity.split('[sep]')
-            vector = [float(x) for x in split[1].strip().split(' ')]
-            vector_dict[split[0]] = vector
-
-        with open(output_location, 'w', encoding='utf-8') as f:
-            json.dump(vector_dict, f, ensure_ascii=False, indent=4)

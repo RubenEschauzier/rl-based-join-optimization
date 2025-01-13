@@ -2,17 +2,13 @@ model:
   type: GCNConv
   layers:
     - type: gcn_conv
-      in_features: 385
+      in_features: 301
       out_features: 512
     - type: ReLU
-    - type: Dropout
-      p: .2
     - type: gcn_conv
       in_features: 512
       out_features: 512
     - type: ReLU
-    - type: Dropout
-      p: .2
     - type: Linear
       in_features: 512
       out_features: 1024
