@@ -81,6 +81,8 @@ def embed_query_graphs(queries, embedding_models, training=True):
         query_graph_embeddings.append(query_emb)
     return query_graph_embeddings
 
+def q_error_fn(pred, true, eps=1e-7):
+    return torch.max(true / (pred + eps), pred / (true + eps))
 
 def save_checkpoint(ckp_dir, optimizer, models, model_file_names, statistics):
     if not os.path.isdir(ckp_dir):

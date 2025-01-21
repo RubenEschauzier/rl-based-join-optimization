@@ -1,6 +1,7 @@
 import torch.nn as nn
 import yaml
 
+from src.models.gine_conv import GINEConvModel
 from src.models.graph_convolution_query_embedder import GCNConvQueryEmbeddingModel
 
 
@@ -16,7 +17,7 @@ class ModelFactory:
     def __init__(self, config_file):
         self.config_file = config_file
         self.config = self.load_config()
-        self.SUPPORTED = {"GCNConv": self.load_gcn_conv, "MLP": self.load_mlp}
+        self.SUPPORTED = {"GCNConv": self.load_gcn_conv, "MLP": self.load_mlp, 'GINEConv': self.load_gine_conv}
 
     def build_model_from_config(self):
         """
@@ -49,6 +50,11 @@ class ModelFactory:
         gcn_conv_model = GCNConvQueryEmbeddingModel()
         gcn_conv_model.init_model(self.config)
         return gcn_conv_model
+
+    def load_gine_conv(self):
+        gine_conv = GINEConvModel()
+        gine_conv.init_model(self.config)
+        return gine_conv
 
     def load_mlp(self):
         return self.load_sequential()

@@ -1,3 +1,4 @@
+import functools
 import math
 from os import path
 import logging
@@ -9,17 +10,19 @@ from sklearn.utils import shuffle
 import torch
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from src.datastructures.query import Query
+from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.models.model_instantiator import ModelFactory
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
+from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
-from src.query_graph_featurizers.quad_views import FeaturizeQueryGraphQuadViews
 from src.utils.training_utils.query_loading_utils import load_queries_and_cardinalities, load_and_prepare_queries, \
     prepare_pretraining_queries
 from src.utils.training_utils.utils import initialize_graph_models, get_parameters_model, embed_query_graphs, \
-    load_watdiv_queries_pickle, save_checkpoint, register_debugging_hooks
+    load_watdiv_queries_pickle, save_checkpoint, register_debugging_hooks, q_error_fn
 
 
 def prepare_watdiv_test_data(env, test_queries_location, test_cardinalities_location, rdf2vec_vector_location, device):
@@ -37,22 +40,6 @@ def prepare_watdiv_test_data(env, test_queries_location, test_cardinalities_loca
             query.features = query.features.to(device)
             query.query_graph_representations = [graph.to(device) for graph in query.query_graph_representations]
     return queries, cardinalities
-
-
-def compute_q_errors(predictions, true_cardinalities):
-    total_q_error = 0
-    for pred, actual in zip(predictions.cpu(), true_cardinalities):
-        pred = pred.detach()
-        ratios = np.array([actual / pred, pred / actual])
-        total_q_error += ratios[np.isfinite(ratios)].max()
-    return total_q_error
-
-
-def q_error_function(pred, true, eps=1e-7):
-    # print("Pred: {}, True: {}, Q-error: {}".
-    #       format(pred.item(), true, torch.max(true / (pred + eps), pred / (true + eps)).item())
-    #       )
-    return torch.max(true / (pred + eps), pred / (true + eps))
 
 
 def validate_model(graph_embedding_models, cardinality_estimation_head,
@@ -93,7 +80,7 @@ def validate_model(graph_embedding_models, cardinality_estimation_head,
             # Scale back to normal cardinality
             prediction_query = pred[i].cpu().detach().item()
             cardinality_query = cardinalities_batch[i].cpu().item()
-            q_error_query = q_error_function(torch.exp(pred[i]), torch.exp(cardinalities_batch[i])). \
+            q_error_query = q_error_fn(torch.exp(pred[i]), torch.exp(cardinalities_batch[i])). \
                 cpu().detach().item()
             loss_query = loss[i].cpu().detach().item()
             mae_query = torch.abs(torch.exp(pred[i]).cpu().detach() - torch.exp(cardinalities_batch[i]).cpu().detach())
@@ -110,7 +97,6 @@ def validate_model(graph_embedding_models, cardinality_estimation_head,
             maes.append(mae_query)
     cardinality_estimation_head.train()
     return losses, maes, q_errors, validation_run_stats
-
 
 def test_model_watdiv(queries, cardinalities,
                       graph_embedding_models, cardinality_estimation_head,
@@ -134,8 +120,8 @@ def test_model_watdiv(queries, cardinalities,
         q_errors = []
         # In case loss has no shape, we have single query for a template
         if len(loss.shape) == 0:
-            q_error_query = q_error_function(torch.exp(predictions.detach().squeeze()),
-                                             torch.exp(cardinalities_template.detach().squeeze())).cpu().item()
+            q_error_query = q_error_fn(torch.exp(predictions.detach().squeeze()),
+                                       torch.exp(cardinalities_template.detach().squeeze())).cpu().item()
             prediction_query = predictions.cpu().detach().item()
             cardinality_query = cardinalities_template.cpu().item()
             loss_query = loss.cpu().detach().item()
@@ -148,8 +134,8 @@ def test_model_watdiv(queries, cardinalities,
         # Otherwise we iterate over the predictions for all queries
         else:
             for i in range(predictions.shape[0]):
-                q_error_query = q_error_function(torch.exp(predictions[i].detach().squeeze()),
-                                                 torch.exp(cardinalities_template[i].detach().squeeze())).cpu().item()
+                q_error_query = q_error_fn(torch.exp(predictions[i].detach().squeeze()),
+                                           torch.exp(cardinalities_template[i].detach().squeeze())).cpu().item()
                 prediction_query = predictions[i].cpu().detach().item()
                 cardinality_query = cardinalities_template[i].cpu().item()
                 loss_query = loss[i].cpu().detach().item()
@@ -208,8 +194,7 @@ def load_queries(env, device,
                                                           )
         return queries, cardinalities, test_q, test_c
 
-def load_queries_into_dataset():
-    pass
+
 
 
 def run_pretraining(queries, cardinalities,
@@ -293,8 +278,8 @@ def run_pretraining(queries, cardinalities,
                     "prediction": pred[k].cpu().detach().item(),
                     "actual": cardinalities_batch[k].cpu().detach().item(),
                     "loss": loss_float,
-                    "q_error": q_error_function(torch.exp(pred[k].detach().squeeze()),
-                                                torch.exp(cardinalities_batch[k].detach().squeeze())).cpu().item()
+                    "q_error": q_error_fn(torch.exp(pred[k].detach().squeeze()),
+                                          torch.exp(cardinalities_batch[k].detach().squeeze())).cpu().item()
                 }
 
         val_loss, val_mae, val_q_error, val_stats = validate_model(
@@ -357,14 +342,14 @@ def run_pretraining(queries, cardinalities,
                             statistics_dict
                             )
 
-
 def main_pretraining(train_queries_location, rdf2vec_vector_location, endpoint_uri,
                      n_epoch, batch_size, lr, seed,
                      ckp_dir=None,
                      load_prepared_queries_location=None,
                      train_cardinalities_location=None,
                      test_query_location=None, test_cardinalities_location=None,
-                     save_prepared_queries_location=None):
+                     save_prepared_queries_location=None,
+                     ):
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Training on: {}".format(device))
@@ -388,3 +373,5 @@ def main_pretraining(train_queries_location, rdf2vec_vector_location, endpoint_u
                     ckp_dir=ckp_dir, test_queries=test_q, test_cardinalities=test_c)
 
     pass
+
+

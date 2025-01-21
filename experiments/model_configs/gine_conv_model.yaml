@@ -1,0 +1,40 @@
+model:
+  type: GINEConv
+  layers:
+    - type: GINEConv
+      nn:
+        - type: Linear
+          in_features: 301
+          out_features: 512
+        - type: ReLU
+        - type: Linear
+          in_features: 512
+          out_features: 1024
+        - type: ReLU
+      edge_dim: 9
+    - type: GINEConv
+      nn:
+        - type: Linear
+          in_features: 1024
+          out_features: 512
+        - type: ReLU
+      edge_dim: 9
+    - type: MeanAggregation
+    - type: Linear
+      in_features: 512
+      out_features: 512
+    - type: ReLU
+    - type: Linear
+      in_features: 512
+      out_features: 256
+    - type: ReLU
+    - type: Linear
+      in_features: 256
+      out_features: 1
+
+
+weight_location:
+  directory: ""
+  chkp: true
+
+

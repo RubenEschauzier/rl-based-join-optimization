@@ -39,10 +39,27 @@ class BlazeGraphQueryEnvironment:
         return result, execution_time
 
     def cardinality_triple_pattern(self, triple_pattern: str):
-        query = r"SELECT (COUNT( * ) as ?triplecount) WHERE {{ {} }}".format(triple_pattern)
+        query = r"SELECT (COUNT( * ) as ?tripleCount) WHERE {{ {} }}".format(triple_pattern)
         result = self.query_runner.run_query(query, 60, JSON, {})
-        count = result['results']['bindings'][0]['triplecount']['value']
+        count = result['results']['bindings'][0]['tripleCount']['value']
         return count
+
+    def cardinality_term(self, term):
+        query =  f"""
+        SELECT ?term (COUNT(*) AS ?tripleCount)
+        WHERE {{
+          {{ {term} ?p ?o }} UNION   # Term in the subject position
+          {{ ?s {term} ?o }} UNION   # Term in the predicate position
+          {{ ?s ?p {term} }}         # Term in the object position
+        }}
+        GROUP BY ?term
+        """
+        result = self.query_runner.run_query(query, 60, JSON, {})
+        if len(result['results']['bindings']) == 0:
+            return 0
+        count = int(result['results']['bindings'][0]['tripleCount']['value'])
+        return count
+
 
     @staticmethod
     def reward(query_result, reward_type: Literal['intermediate-results', 'execution_time']):
