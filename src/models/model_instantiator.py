@@ -1,7 +1,7 @@
 import torch.nn as nn
 import yaml
 
-from src.models.gine_conv import GINEConvModel
+from src.models.gine_conv_model import GINEConvModel
 from src.models.graph_convolution_query_embedder import GCNConvQueryEmbeddingModel
 
 

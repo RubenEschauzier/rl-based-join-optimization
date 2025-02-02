@@ -188,3 +188,5 @@ data/*
 /data/pretrain_data/*
 
 /output/*
+
+/experiments/experiment_outputs/*

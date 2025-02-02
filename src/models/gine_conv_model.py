@@ -2,7 +2,9 @@ import torch
 import torch_geometric
 from torch_geometric.nn import GINEConv
 
+from src.models.model_layers.directional_gine_conv import DirectionalGINEConv
 from src.models.model_layers.triple_gine_conv import TripleGineConv
+from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
 from src.utils.training_utils.utils import register_debugging_hooks
 
 
@@ -11,7 +13,8 @@ class GINEConvModel(torch.nn.Module):
         super().__init__(*args, **kwargs)
         self.model = None
         self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus']
-        self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation']
+        self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
+        self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'DirectionalGINEConv']
 
     def init_model(self, model_architecture_config):
         """
@@ -19,7 +22,7 @@ class GINEConvModel(torch.nn.Module):
         """
         layers = []
         for layer_config in model_architecture_config['layers']:
-            if layer_config['type'] == 'GINEConv' or layer_config['type'] == 'TripleGINEConv':
+            if layer_config['type'] in self.supported_gnn_layers:
                 # Build nn used in gine_conv from config
                 nn_config = layer_config['nn']
                 nn_layers = []
@@ -35,13 +38,20 @@ class GINEConvModel(torch.nn.Module):
                 elif layer_config['type'] == 'TripleGINEConv':
                     triple_gine_conv_layer = TripleGineConv(nn, **gine_parameters)
                     layers.append((triple_gine_conv_layer, 'x, edge_index, edge_attr -> x'))
-                    pass
+                elif layer_config['type'] == 'DirectionalGINEConv':
+                    directional_gine_conv_layer = DirectionalGINEConv(nn, **gine_parameters)
+                    layers.append((directional_gine_conv_layer, 'x, edge_index, edge_attr -> x'))
                 else:
                     raise ValueError('Unknown layer type')
             elif layer_config['type'] == 'TripleGINEConv':
                 pass
 
             elif layer_config['type'] in self.supported_pooling:
+                if layer_config['type'] == 'TriplePatternPooling':
+                    layers.append(
+                        (TriplePatternPooling(512, 512), 'x, edge_index, edge_attr, batch -> x')
+                    )
+                    continue
                 layer_type = getattr(torch_geometric.nn.aggr.basic, layer_config['type'])
                 pooling_parameters = {key: value for key, value in list(layer_config.items())[1:]}
                 layers.append((layer_type(**pooling_parameters), 'x, batch -> x'))

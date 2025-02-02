@@ -1,0 +1,15 @@
+# Pretraining configuration for sub_sampled_queries (by Maribel / Tim), rdf2vec vectors by Ruben, and uses the directed gine conv
+# by me
+pretraining:
+  endpoint: "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+  dataset: "data/pretrain_data/datasets/p_e_full_128"
+  embeddings: "data/input/rdf2vec_embeddings/rdf2vec_vectors_depth_2_quick.json"
+  model_config: "experiments/model_configs/t_cv_dir_large.yaml"
+  occurrences_location: "data/pretrain_data/pattern_term_cardinalities/partial/occurrences.json"
+  tp_cardinality_location: "data/pretrain_data/pattern_term_cardinalities/partial/tp_cardinalities.json"
+  feature_type: "predicate_edge"
+  n_epoch: 50
+  batch_size: 32
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/"

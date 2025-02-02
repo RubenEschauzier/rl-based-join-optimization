@@ -1,3 +1,6 @@
+import functools
+import math
+import typing
 from time import sleep
 
 import torch
@@ -5,6 +8,10 @@ import json
 from tqdm import tqdm
 
 from src.datastructures.query import Query
+from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
+from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
+from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
+from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 from src.query_graph_featurizers.quad_views import FeaturizeQueryGraphQuadViews
 
@@ -92,6 +99,50 @@ def prepare_pretraining_queries(env, queries, rdf2vec_vector_location, save_loca
             features_dict[query.query_string] = [query.features, query.query_graph_representations]
         torch.save(features_dict, save_location)
     return queries
+
+
+def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vector_location,
+                              env,
+                              feature_type: typing.Literal["labeled_edge", "predicate_edge"],
+                              validation_size=.2,
+                              to_load=None, occurrences_location=None, tp_cardinality_location=None,):
+    vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
+
+    featurizer_edge_labeled_graph = load_featurizer(feature_type,
+                                                    vectors, env,
+                                                    rdf2vec_vector_location, endpoint_location,
+                                                    occurrences_location, tp_cardinality_location)
+    dataset = QueryCardinalityDataset(root=queries_location,
+                                      featurizer=featurizer_edge_labeled_graph,
+                                      to_load=to_load
+                                      )
+    dataset = dataset.shuffle()
+    train_dataset = dataset[math.floor(len(dataset)*validation_size):]
+    validation_dataset = dataset[:math.floor(len(dataset)*validation_size)]
+
+    return train_dataset, validation_dataset
+
+def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge"],
+                    vectors, query_env,
+                    rdf2vec_vector_location, endpoint_location, occurrences_location=None, tp_cardinality_location=None):
+
+    occurrences = None
+    tp_cardinality = None
+    if occurrences_location:
+        with open(occurrences_location, 'r') as f:
+            occurrences = json.load(f)
+    if tp_cardinality_location:
+        with open(tp_cardinality_location, 'r') as f:
+            tp_cardinality = json.load(f)
+
+    if featurizer_type == "labeled_edge":
+        query_to_graph = QueryToEdgeLabeledGraph(vectors, query_env, tp_cardinalities=tp_cardinality)
+    elif featurizer_type == "predicate_edge":
+        query_to_graph = QueryToEdgePredicateGraph(vectors, query_env, term_occurrences=occurrences)
+    else:
+        raise NotImplementedError
+
+    return functools.partial(query_to_graph.transform_undirected)
 
 if __name__ == '__main__':
     load_queries_and_cardinalities(r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data\generated_queries_subsampler\stars_2.json")

@@ -1,12 +1,9 @@
-from time import sleep
 from typing import Literal
 
-import rdflib.term
-import requests
 import random
 from tqdm import tqdm
 
-from src.random_query_generation.generation_utils import create_variable_dictionary, filter_isomorphic_queries, \
+from src.utils.generation_utils.generation_utils import create_variable_dictionary, filter_isomorphic_queries, \
     query_all_terms, query_triple, sample_start_triples
 
 ENDPOINT_LIMIT = 10000
@@ -191,7 +188,7 @@ if __name__ == "__main__":
     main_generate_star(endpoint_url="http://localhost:8890/sparql",
                        default_graph_uri=['http://localhost:8890/watdiv-default-instantiation'],
                        n_stars=1,
-                       star_sizes=[2, 3, 4, 5, 6],
+                       star_sizes=[2, 3, 5, 8],
                        p_object_star=.1,
                        start_star_type="?s",
                        n_literal_stars=1

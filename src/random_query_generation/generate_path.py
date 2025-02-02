@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -7,25 +8,26 @@ from typing import Literal
 from scipy.special import softmax
 
 from tqdm import tqdm
-from numpy.random import choice
 
-from src.random_query_generation.generation_utils import convert_binding_to_rdflib, query_exhaustively, \
+from src.utils.generation_utils.generation_utils import convert_binding_to_rdflib, query_exhaustively, \
     query_all_terms, sample_start_triples, create_variable_dictionary, filter_isomorphic_queries, cardinality_query, \
     save_queries_to_file, track_predicate_counts
 
 
-def main_sample_paths(endpoint_url, default_graph_uri, n_paths, max_size, proportion_unique_predicates,
+def main_sample_paths(endpoint_url, default_graph_uri, max_queries, n_paths, max_size, proportion_unique_predicates,
                       path_start_type, output_dir, file_name_non_literal, file_name_literal):
-    path_non_literal, path_literal = generate_path_queries(endpoint_url, default_graph_uri, n_paths, max_size,
+    path_non_literal, path_literal = generate_path_queries(endpoint_url, default_graph_uri, max_queries, n_paths, max_size,
                                                            proportion_unique_predicates, path_start_type, output_dir)
     save_queries_to_file(output_dir, file_name_non_literal, path_non_literal)
     save_queries_to_file(output_dir, file_name_literal, path_literal)
 
 
-def generate_path_queries(endpoint_url, default_graph_uri, n_paths, max_size, proportion_unique_predicates,
+def generate_path_queries(endpoint_url, default_graph_uri, max_queries,
+                          n_paths, max_size, proportion_unique_predicates,
                           path_start_type, output_dir):
     sampled_paths, predicate_counts = sample_all_paths(endpoint_url,
                                                        default_graph_uri,
+                                                       max_queries,
                                                        n_paths,
                                                        max_size,
                                                        proportion_unique_predicates,
@@ -65,12 +67,14 @@ def triples_to_query(path_walks, literal_in_path):
     return queries
 
 
-def sample_all_paths(endpoint_url, default_graph_uri,
+def sample_all_paths(endpoint_url, default_graph_uri, max_queries,
                      n_paths, max_size, proportion_unique_predicates, path_start_type: Literal["?s", "?p"]):
     generated_paths = []
     start_terms = query_all_terms(endpoint_url=endpoint_url,
                                   term_type=path_start_type,
                                   default_graph_uri=default_graph_uri)
+    # Shuffle so we can do early stopping without introducing sampling bias
+    start_terms.shuffle()
     predicate_counts = defaultdict(int)
     for term in tqdm(start_terms):
         start_triples = []
@@ -82,11 +86,12 @@ def sample_all_paths(endpoint_url, default_graph_uri,
                                                  samples=n_paths,
                                                  s=term)
         if path_start_type == "?p":
-            start_triples = sample_start_triples(endpoint_url=endpoint_url,
-                                                 default_graph_uri=default_graph_uri,
-                                                 limit=10000,
-                                                 samples=n_paths,
-                                                 p=term)
+            raise NotImplementedError
+            # start_triples = sample_start_triples(endpoint_url=endpoint_url,
+            #                                      default_graph_uri=default_graph_uri,
+            #                                      limit=10000,
+            #                                      samples=n_paths,
+            #                                      p=term)
         for triple in start_triples:
             path_size = random.randint(2, max_size)
             # Randomly decide whether path has unique predicates in walk or not. Most paths should probably have unique
@@ -109,6 +114,10 @@ def sample_all_paths(endpoint_url, default_graph_uri,
                 continue
             predicate_counts = track_predicate_counts(predicate_counts, path_walk)
             generated_paths.append(path_walk)
+            # If we reach hard limit we stop
+            if len(generated_paths) >= max_queries:
+                break
+
     return generated_paths, predicate_counts
 
 
@@ -219,11 +228,12 @@ def query_path_extension(endpoint_url, default_graph_uri, limit, subj, obj):
 
 if __name__ == "__main__":
     main_sample_paths(endpoint_url="http://localhost:8890/sparql",
-                      default_graph_uri=['http://localhost:8890/watdiv-default-instantiation'],
-                      n_paths=1,
+                      default_graph_uri=['http://localhost:8890/watdiv'],
+                      n_paths=2,
+                      max_queries=10000,
                       max_size=5,
-                      proportion_unique_predicates=.95,
-                      path_start_type="?p",
+                      proportion_unique_predicates=.90,
+                      path_start_type="?s",
                       output_dir=r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data"
                                  r"\generated_queries",
                       file_name_literal="path_with_literal.json",

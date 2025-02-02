@@ -9,7 +9,7 @@ from torch_geometric.nn.inits import reset
 from torch_geometric.typing import OptPairTensor, OptTensor, Size, Adj
 
 
-class GineConvDirectional(MessagePassing, ABC):
+class DirectionalGINEConv(MessagePassing, ABC):
     r"""
     Message passing function for directional message passing
     based on the GINE Conv operator
@@ -60,8 +60,8 @@ class GineConvDirectional(MessagePassing, ABC):
           :math:`(|\mathcal{V}_t|, F_{out})` if bipartite
     """
 
-    def __init__(self, nn: torch.nn.Module, eps: float = 0.,
-                 train_eps: bool = False, edge_dim: Optional[int] = None,
+    def __init__(self, nn: torch.nn.Module, edge_dim: int, eps: float = 0.,
+                 train_eps: bool = False,
                  **kwargs):
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
@@ -72,27 +72,30 @@ class GineConvDirectional(MessagePassing, ABC):
             self.eps = torch.nn.Parameter(torch.Tensor([eps]))
         else:
             self.register_buffer('eps', torch.Tensor([eps]))
-        if edge_dim is not None:
-            if isinstance(self.nn, torch.nn.Sequential):
-                nn = self.nn[0]
-            if hasattr(nn, 'in_features'):
-                in_channels = nn.in_features
-            elif hasattr(nn, 'in_channels'):
-                in_channels = nn.in_channels
-            else:
-                raise ValueError("Could not infer input channels from `nn`.")
-            # Bug fix from original, they use 3 * edge_dim, however when hs feature size > edge_dim this fails
-            self.lin = Linear(edge_dim + 2*in_channels, in_channels)
 
+        if isinstance(self.nn, torch.nn.Sequential):
+            nn = self.nn[0]
+        if hasattr(nn, 'in_features'):
+            in_channels = nn.in_features
+        elif hasattr(nn, 'in_channels'):
+            in_channels = nn.in_channels
         else:
-            self.lin = None
+            raise ValueError("Could not infer input channels from `nn`.")
+
+        # Separate transformation of incoming and outgoing edges
+        self.lin_1 = Linear(edge_dim, in_channels)
+        self.lin_2 = Linear(edge_dim, in_channels)
+
         self.reset_parameters()
 
     def reset_parameters(self):
         reset(self.nn)
         self.eps.data.fill_(self.initial_eps)
-        if self.lin is not None:
-            self.lin.reset_parameters()
+        if self.lin_1 is not None:
+            self.lin_1.reset_parameters()
+        if self.lin_2 is not None:
+            self.lin_2.reset_parameters()
+
 
     def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
                 edge_attr: OptTensor = None, size: Size = None) -> Tensor:
@@ -109,15 +112,21 @@ class GineConvDirectional(MessagePassing, ABC):
 
         return self.nn(out)
 
-    def message(self, x_i, x_j, edge_attr: Tensor) -> Tensor:
+    def message(self, x_j: Tensor, edge_attr: Tensor) -> Tensor:
         # Switch i and j based on direction of triple:
-        reverse = edge_attr[:, -1] == -1
-
-        x_i[reverse], x_j[reverse] = x_j[reverse], x_i[reverse]
+        mask = edge_attr[:, -1] == -1
 
         edge_attr = edge_attr[:, :-1]
 
-        return self.lin(torch.cat((x_i, edge_attr, x_j), 1)).relu()
+        # Apply different linear layers based on the mask
+        edge_attr_transformed = torch.empty(size = x_j.shape,
+                                            dtype=edge_attr.dtype, device=edge_attr.device,
+                                            layout=edge_attr.layout)
+
+        edge_attr_transformed[mask] = self.lin_1(edge_attr[mask])
+        edge_attr_transformed[~mask] = self.lin_2(edge_attr[~mask])
+
+        return (x_j + edge_attr_transformed).relu()
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(nn={self.nn})'

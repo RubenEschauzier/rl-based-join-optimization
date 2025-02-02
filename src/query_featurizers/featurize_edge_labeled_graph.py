@@ -7,8 +7,9 @@ from torch_geometric.utils import to_undirected
 
 # TODO: Run this again and see what it does to performance to have undirected graph
 class QueryToEdgeLabeledGraph:
-    def __init__(self, entity_embeddings, env):
+    def __init__(self, entity_embeddings, env, tp_cardinalities = None):
         self.entity_embeddings = entity_embeddings
+        self.tp_cardinalities = tp_cardinalities
         self.env = env
         self.vector_size = len(entity_embeddings[next(iter(entity_embeddings))])
 
@@ -21,7 +22,8 @@ class QueryToEdgeLabeledGraph:
         edge_index_undirected, edge_features_undirected = to_undirected(edge_index, edge_features)
         data_query = Data(x=tp_features, edge_index=edge_index_undirected,
                           edge_attr=edge_features_undirected, y=y,
-                          query=json_query['query'])
+                          query=json_query['query'],
+                          type=json_query['type'])
         return data_query
 
     def to_edge_index(self, rdflib_tps):
@@ -53,7 +55,10 @@ class QueryToEdgeLabeledGraph:
         var_to_id = self.map_variables_to_ids(rdflib_tp)
         tp_embeddings = []
         for i in range(len(rdflib_tp)):
-            tp_emb = [int(self.env.cardinality_triple_pattern(string_tp[i]))]
+            if self.tp_cardinalities and self.tp_cardinalities[string_tp[i]]:
+                tp_emb = [int(self.tp_cardinalities[string_tp[i]])]
+            else:
+                tp_emb = [int(self.env.cardinality_triple_pattern(string_tp[i]))]
             for entity in rdflib_tp[i]:
                 # Embedding strategy from
                 # "Cardinality Estimation over Knowledge Graphs with Embeddings and Graph Neural Networks"

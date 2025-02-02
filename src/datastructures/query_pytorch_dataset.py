@@ -22,10 +22,30 @@ class QueryCardinalityDataset(InMemoryDataset):
 
 
     def raw_file_names(self):
-        return ['star_queries_2_3_5.json']
+        return [
+            "watdiv_path_2025-01-27_16-13-01_2.json",
+            # "watdiv_path_2025-01-27_18-16-59_3.json",
+            # "watdiv_path_2025-01-28_08-14-52_5.json",
+            # "watdiv_path_2025-01-29_06-51-23_8.json",
+            # "watdiv_stars_2025-01-27_09-32-26_2.json",
+            # "watdiv_stars_2025-01-27_09-37-29_3.json",
+            # "watdiv_stars_2025-01-27_09-39-53_5.json",
+            # "watdiv_stars_2025-01-27_10-42-20_8.json"
+        ]
+        # return ['star_queries_2_3_5.json']
 
     def processed_file_names(self):
-        return ['star_queries_2_3_5_edge_graph.pt']
+        return [
+            "watdiv_path_2025-01-27_16-13-01_2.pt",
+            # "watdiv_path_2025-01-27_18-16-59_3.pt",
+            # "watdiv_path_2025-01-28_08-14-52_5.pt",
+            # "watdiv_path_2025-01-29_06-51-23_8.pt",
+            # "watdiv_stars_2025-01-27_09-32-26_2.pt",
+            # "watdiv_stars_2025-01-27_09-37-29_3.pt",
+            # "watdiv_stars_2025-01-27_09-39-53_5.pt",
+            # "watdiv_stars_2025-01-27_10-42-20_8.pt"
+        ]
+        # return ['star_queries_2_3_5_edge_graph.pt']
 
     def process(self):
         raw_queries_list = []
@@ -42,7 +62,8 @@ class QueryCardinalityDataset(InMemoryDataset):
                         "query": data['query'],
                         "cardinality": data['y'],
                         "triple_patterns": tp_str,
-                        "rdflib_patterns": tp_rdflib
+                        "rdflib_patterns": tp_rdflib,
+                        "type": data['type'],
                     })
             raw_queries_list.extend(queries)
 

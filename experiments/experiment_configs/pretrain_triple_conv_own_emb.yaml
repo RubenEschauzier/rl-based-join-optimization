@@ -1,0 +1,16 @@
+# Pretraining configuration for sub_sampled_queries (by Tim), rdf2vec vectors by me, and uses the triple conv by tim,
+# With layers defined by me
+pretraining:
+  endpoint: "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+  dataset: "data/pretrain_data/datasets/p_e_full_128"
+  embeddings: "data/input/rdf2vec_embeddings/rdf2vec_vectors_depth_2_quick.json"
+  model_config: "experiments/model_configs/t_cv_own_large.yaml"
+  feature_type: "predicate_edge"
+  occurrences_location: "data/pretrain_data/pattern_term_cardinalities/partial/occurrences.json"
+  tp_cardinality_location: "data/pretrain_data/pattern_term_cardinalities/partial/tp_cardinalities.json"
+  n_epoch: 50
+  batch_size: 32
+  seed: 0
+  lr: 1e-4
+  experiment_root_directory: "experiments/experiment_outputs/"
+
