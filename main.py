@@ -4,7 +4,7 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 
 from src.policy_gradient_rl_procedure import run_training_policy_gradient
-from src.pretrain_procedure_updated import main_pretraining_dataset
+from src.pretrain_procedure import main_pretraining_dataset
 from src.utils.training_utils.training_tracking import ExperimentWriter
 
 # Root dir global for file loading

@@ -49,7 +49,7 @@ class GINEConvModel(torch.nn.Module):
             elif layer_config['type'] in self.supported_pooling:
                 if layer_config['type'] == 'TriplePatternPooling':
                     layers.append(
-                        (TriplePatternPooling(512, 512), 'x, edge_index, edge_attr, batch -> x')
+                        (TriplePatternPooling(512, 512), 'x, edge_index -> x')
                     )
                     continue
                 layer_type = getattr(torch_geometric.nn.aggr.basic, layer_config['type'])

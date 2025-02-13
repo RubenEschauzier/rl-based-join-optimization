@@ -1,16 +1,8 @@
-import faulthandler
-import functools
 import json
 import os
-import torch
-import torch_geometric
 from torch_geometric.data import InMemoryDataset, download_url
 
 from src.datastructures.query import Query, ProcessQuery
-from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
-from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
-from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
-from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 
 
 class QueryCardinalityDataset(InMemoryDataset):
@@ -23,29 +15,19 @@ class QueryCardinalityDataset(InMemoryDataset):
 
     def raw_file_names(self):
         return [
-            "watdiv_path_2025-01-27_16-13-01_2.json",
-            # "watdiv_path_2025-01-27_18-16-59_3.json",
-            # "watdiv_path_2025-01-28_08-14-52_5.json",
-            # "watdiv_path_2025-01-29_06-51-23_8.json",
-            # "watdiv_stars_2025-01-27_09-32-26_2.json",
-            # "watdiv_stars_2025-01-27_09-37-29_3.json",
-            # "watdiv_stars_2025-01-27_09-39-53_5.json",
-            # "watdiv_stars_2025-01-27_10-42-20_8.json"
+            "watdiv_stars_2025-01-27_09-32-26_2.json",
+            "watdiv_stars_2025-01-27_09-37-29_3.json",
+            "watdiv_stars_2025-01-27_09-39-53_5.json",
+            "watdiv_stars_2025-01-27_10-42-20_8.json"
         ]
-        # return ['star_queries_2_3_5.json']
 
     def processed_file_names(self):
         return [
-            "watdiv_path_2025-01-27_16-13-01_2.pt",
-            # "watdiv_path_2025-01-27_18-16-59_3.pt",
-            # "watdiv_path_2025-01-28_08-14-52_5.pt",
-            # "watdiv_path_2025-01-29_06-51-23_8.pt",
-            # "watdiv_stars_2025-01-27_09-32-26_2.pt",
-            # "watdiv_stars_2025-01-27_09-37-29_3.pt",
-            # "watdiv_stars_2025-01-27_09-39-53_5.pt",
-            # "watdiv_stars_2025-01-27_10-42-20_8.pt"
+            "watdiv_stars_2025-01-27_09-32-26_2.pt",
+            "watdiv_stars_2025-01-27_09-37-29_3.pt",
+            "watdiv_stars_2025-01-27_09-39-53_5.pt",
+            "watdiv_stars_2025-01-27_10-42-20_8.pt"
         ]
-        # return ['star_queries_2_3_5_edge_graph.pt']
 
     def process(self):
         raw_queries_list = []
@@ -65,21 +47,22 @@ class QueryCardinalityDataset(InMemoryDataset):
                         "rdflib_patterns": tp_rdflib,
                         "type": data['type'],
                     })
-            raw_queries_list.extend(queries)
+            raw_queries_list.append(queries)
 
         data_list = []
-        for i, query in enumerate(raw_queries_list):
-            data_list.append(self.featurizer(query))
+        for i, query_type in enumerate(raw_queries_list):
+            data_list.append([self.featurizer(query) for query in query_type])
 
         if self.pre_transform is not None:
-            data_list = [self.pre_transform(data) for data in data_list]
+            data_list = [[self.pre_transform(data) for data in data_type ] for data_type in data_list]
 
         if self.transform is not None:
-            data_list = [self.transform(data) for data in data_list]
+            data_list = [[self.transform(data) for data in data_type ] for data_type in data_list]
 
-        print("Loaded: {} queries".format(len(data_list)))
+        print("Loaded: {} queries".format(sum(len(sublist) for sublist in data_list)))
 
-        self.save(data_list, self.processed_paths[0])
+        for i, data_type in enumerate(data_list):
+            self.save(data_type, self.processed_paths[i])
 
 def get_size_data(data):
     return sum([v.element_size() * v.numel() for k, v in data if type(v) != str])

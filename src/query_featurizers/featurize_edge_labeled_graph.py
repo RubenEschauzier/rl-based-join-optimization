@@ -23,6 +23,7 @@ class QueryToEdgeLabeledGraph:
         data_query = Data(x=tp_features, edge_index=edge_index_undirected,
                           edge_attr=edge_features_undirected, y=y,
                           query=json_query['query'],
+                          triple_patterns=json_query['triple_patterns'],
                           type=json_query['type'])
         return data_query
 

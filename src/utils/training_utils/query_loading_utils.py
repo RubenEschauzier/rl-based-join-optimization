@@ -9,11 +9,10 @@ from tqdm import tqdm
 
 from src.datastructures.query import Query
 from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
-from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
-from src.query_graph_featurizers.quad_views import FeaturizeQueryGraphQuadViews
+from src.query_featurizers.quad_views import FeaturizeQueryGraphQuadViews
 
 
 def load_data_txt_file(location, to_load=None):

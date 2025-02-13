@@ -31,6 +31,7 @@ class QueryToEdgePredicateGraph:
         data_query = Data(x=node_features, edge_index=edge_index,
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
+                          triple_patterns=json_query['triple_patterns'],
                           type=json_query['type'])
         return data_query
 
@@ -60,6 +61,7 @@ class QueryToEdgePredicateGraph:
         data_query = Data(x=node_features, edge_index=edge_index,
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
+                          triple_patterns=json_query['triple_patterns'],
                           type=json_query['type'])
         return data_query
 

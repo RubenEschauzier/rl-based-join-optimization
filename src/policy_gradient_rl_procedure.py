@@ -11,8 +11,8 @@ from src.models.model_instantiator import ModelFactory
 from src.models.pointer_network import PointerNet
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
-from src.query_graph_featurizers.quad_views import FeaturizeQueryGraphQuadViews
-from src.utils.training_utils.utils import initialize_graph_models, run_models, load_watdiv_queries, \
+from src.query_featurizers.quad_views import FeaturizeQueryGraphQuadViews
+from src.utils.training_utils.utils import initialize_graph_models, load_watdiv_queries, \
     get_parameters_model, embed_query_graphs
 
 
