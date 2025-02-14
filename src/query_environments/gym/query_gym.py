@@ -13,7 +13,7 @@ class QueryExecutionGym(gym.Env):
         super().__init__()
         # The environment used to execute queries and obtain rewards
         self.env = env
-        self.query_timeout = 20
+        self.query_timeout = 20000
         # Our frozen pretrained GNN embedding the query.
         self.query_embedder = query_embedder
         for param in self.query_embedder.parameters():
@@ -31,10 +31,11 @@ class QueryExecutionGym(gym.Env):
         self.query_loader = iter(DataLoader(query_dataset, batch_size=1, shuffle=True)) # type: ignore
 
         self.observation_space = gym.spaces.Dict({
-           "result_embeddings": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.max_triples, self.feature_dim)),
-           "joined": gym.spaces.MultiBinary(self.max_triples),
-           "last_action": gym.spaces.Box(low=-1, high=self.max_triples, shape=(1,) ),
+            "result_embeddings": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.max_triples, self.feature_dim)),
+            "joined": gym.spaces.MultiBinary(self.max_triples),
+            "join_order": gym.spaces.MultiDiscrete([self.max_triples + 1] * (self.max_triples - 1)),
         })
+
         self._result_embeddings = None
         self._join_embedding = None
         self._joined = None
@@ -45,7 +46,7 @@ class QueryExecutionGym(gym.Env):
         self.action_space = gym.spaces.Discrete(max_triples)
 
         # Initialize the query (might need to be from the data loader)
-        self.join_order = []
+        self.join_order: np.array = None
         self.n_triples_query = 0
 
 
@@ -56,30 +57,21 @@ class QueryExecutionGym(gym.Env):
         # Input of the model will probably be
         if action >= self.n_triples_query or self._joined[action] == 1:
             raise ValueError("Invalid action")
-            # Invalid action
-            next_obs = {
-                "result_embeddings": self._result_embeddings,
-                "joined": self._joined,
-                "last_action": action,
-            }
-            return next_obs, -1, True, False, {}
+
         self._joined[action] = 1
-        self.join_order.append(action)
+        # Join order is defined from 0 to max_triples + 1 for processing purposes. 0 denotes not made joins
+        self.join_order[self.join_count] = action + 1
         self.join_count += 1
 
-        if self.join_count == 1:
-            # First run we just set the join embedding of the chosen value
-            next_obs = {
-                "result_embeddings": self._result_embeddings,
-                "joined": self._joined,
-                "last_action": action,
-            }
-            return next_obs, 0, False, False, {}
+        next_obs = self._build_obs()
 
-        if len(self.join_order) >= self.n_triples_query - 1:
+        if self.join_count >= self.n_triples_query:
             # Set join order
+            join_order_true = self.retrieve_true_join_order(self.join_order)
+            join_order_trimmed = join_order_true[join_order_true != -1]
+
             rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(self._query.query,
-                                                                             self.join_order,
+                                                                             join_order_trimmed,
                                                                              self._query.triple_patterns)
             # Execute query to obtain selectivity
             env_result, exec_time = self.env.run_raw(rewritten, self.query_timeout, JSON, {"explain": "True"})
@@ -91,23 +83,9 @@ class QueryExecutionGym(gym.Env):
                 # Very large negative reward when query fails.
                 reward = -20
 
-            next_obs = {
-                "result_embeddings": self._result_embeddings,
-                "joined": self._joined,
-                "last_action": action,
-            }
+            next_obs = self._build_obs()
             return next_obs, reward, True, False, {}
 
-        # Use join embedder to get representation of new result set
-        # join_representation = torch.cat(
-        #     (self._join_embedding, self._result_embeddings[action])
-        # )
-        # join_emb = self.join_embedder.forward(join_representation)
-        next_obs = {
-            "result_embeddings": self._result_embeddings,
-            "joined": self._joined,
-            "last_action": action,
-        }
         return next_obs, 0, False, False, {}
 
     def reset(self, seed=None, options=None):
@@ -130,23 +108,29 @@ class QueryExecutionGym(gym.Env):
         joined = torch.cat((torch.zeros(embedded.shape[0],dtype=torch.int8),
                             torch.ones(self.max_triples - embedded.shape[0], dtype=torch.int8)))
 
-        self.join_order = []
+        self.join_order = np.array([0] * (self.max_triples - 1))
         self.join_count = 0
         self.n_triples_query = embedded.shape[0]
         self._query = query
         self._result_embeddings = torch.nn.functional.pad(
                 input=embedded, pad=(0 ,0, 0, self.max_triples - embedded.shape[0]), mode="constant", value=0 )
-        # self._join_embedding = torch.zeros((embedded.shape[1],))
         self._joined = joined.numpy()
 
+        return self._build_obs(), {}
+
+    def _build_obs(self):
         return {
             "result_embeddings": self._result_embeddings,
-            "joined": self._joined,
-            "last_action": -1,
-        }, {}
+            "join_order": self.join_order,
+            "joined": self._joined
+        }
 
     def action_masks(self):
         return self._joined
+
+    @staticmethod
+    def retrieve_true_join_order(join_order):
+        return join_order - 1
 
     @staticmethod
     def query_plan_cost(units_out, counts):

@@ -6,13 +6,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from src.models.model_instantiator import ModelFactory
 from src.models.rl_algorithms.masked_replay_buffer import MaskedDictReplayBuffer
-from src.models.sb3_feature_extractor import MaskableQRDQNPolicy, QRDQNFeatureExtractor
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym import QueryExecutionGym
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
-from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN
-
-
+from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN, QRDQNFeatureExtractor, MaskableQRDQNPolicy
 
 if __name__ == "__main__":
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
@@ -37,7 +34,7 @@ if __name__ == "__main__":
 
     def make_env():
         return QueryExecutionGym(train_dataset, 512, gine_conv_model, temp_join_emb_model, query_env)
-    # gym_env = QueryExecutionGym(train_dataset, 512, gine_conv_model, temp_join_emb_model, query_env)
+
     n_envs = 4
     policy_kwargs = dict(
         features_extractor_class=QRDQNFeatureExtractor,
@@ -45,8 +42,9 @@ if __name__ == "__main__":
     )
     model = MaskableQRDQN(MaskableQRDQNPolicy,
                           make_env(),
-                          policy_kwargs=policy_kwargs, verbose=2, buffer_size=10000,
-                          replay_buffer_class=MaskedDictReplayBuffer)
+                          policy_kwargs=policy_kwargs, verbose=0, buffer_size=10000,
+                          replay_buffer_class=MaskedDictReplayBuffer,
+                          device='cpu')
 
     # model = MaskableQRDQN(MaskableQRDQNPolicy,
     #                       DummyVecEnv([lambda: make_env() for _ in range(n_envs)]),

@@ -72,6 +72,7 @@ class BlazeGraphQueryEnvironment:
             try:
                 explain_result = pd.read_html(query_result)
             except ValueError as e:
+                print("FAIL")
                 return "FAIL"
 
             if len(explain_result) == 0:
