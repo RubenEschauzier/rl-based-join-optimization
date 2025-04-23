@@ -1,7 +1,10 @@
+from typing import Literal
+
 import gymnasium as gym
 import numpy as np
 import torch
 from SPARQLWrapper import JSON
+from charset_normalizer.cli import query_yes_no
 from torch_geometric.loader import DataLoader
 
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
@@ -9,18 +12,17 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
 class QueryExecutionGym(gym.Env):
-    def __init__(self, query_dataset, feature_dim, query_embedder, join_embedder, env, max_triples=20, ):
+    def __init__(self, query_dataset, feature_dim, query_embedder, env,
+                 reward_type: Literal['intermediate_results', 'execution_time'], max_triples=20):
         super().__init__()
         # The environment used to execute queries and obtain rewards
         self.env = env
-        self.query_timeout = 20000
+        self.reward_type = reward_type
+        self.query_timeout = 200
         # Our frozen pretrained GNN embedding the query.
         self.query_embedder = query_embedder
         for param in self.query_embedder.parameters():
             param.requires_grad = False
-
-        # This is a learned embedder and requires gradients
-        self.join_embedder = join_embedder
 
         # Output feature size (lets infer this from the embedder instead
         self.feature_dim = feature_dim
@@ -64,24 +66,27 @@ class QueryExecutionGym(gym.Env):
         self.join_count += 1
 
         next_obs = self._build_obs()
-
         if self.join_count >= self.n_triples_query:
             # Set join order
             join_order_true = self.retrieve_true_join_order(self.join_order)
             join_order_trimmed = join_order_true[join_order_true != -1]
-
             rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(self._query.query,
                                                                              join_order_trimmed,
                                                                              self._query.triple_patterns)
             # Execute query to obtain selectivity
             env_result, exec_time = self.env.run_raw(rewritten, self.query_timeout, JSON, {"explain": "True"})
-            # (Old penalty implementation, should look into how to shape this reward properly)
-            units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
-            if status == "OK":
-                reward = - np.log(QueryExecutionGym.query_plan_cost(units_out, counts)+1)
+            if self.reward_type == 'intermediate_results':
+                # (Old penalty implementation, should look into how to shape this reward properly)
+                units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
+                if status == "OK":
+                    reward = - np.log(QueryExecutionGym.query_plan_cost(units_out, counts)+1)
+                else:
+                    # Very large negative reward when query fails.
+                    reward = -20
+            elif self.reward_type == 'execution_time':
+                reward = - np.log(exec_time)
             else:
-                # Very large negative reward when query fails.
-                reward = -20
+                raise ValueError("Invalid reward_type in environment: {}".format(self.reward_type))
 
             next_obs = self._build_obs()
             return next_obs, reward, True, False, {}
@@ -94,9 +99,13 @@ class QueryExecutionGym(gym.Env):
             query = next(self.query_loader)[0]
         except StopIteration:
 
-            self.query_loader = iter(DataLoader(self.dataset, batch_size=1, shuffle=True)) # type: ignore
+            self.query_loader = iter(DataLoader(self.query_dataset, batch_size=1, shuffle=True)) # type: ignore
             query = next(self.query_loader)[0]
-
+        # print(query.query)
+        # print(query.x)
+        # print(query.edge_attr)
+        # print(query.edge_index)
+        # print(query.batch)
         embedded = self.query_embedder.forward(x=query.x,
                                        edge_index=query.edge_index,
                                        edge_attr=query.edge_attr,
@@ -140,4 +149,6 @@ class QueryExecutionGym(gym.Env):
             # Join work assuming index-based nested loop join (should include a cost for hash join)\
             cost += (units_out[i] * np.log(counts[i + 1]+1))
         return cost
+
+
 

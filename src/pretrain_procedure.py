@@ -1,3 +1,5 @@
+import faulthandler
+
 import numpy as np
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -108,6 +110,7 @@ def main_pretraining_dataset(queries_location, endpoint_location, rdf2vec_vector
                              test_queries=None, test_cardinalities=None,
                              validation_size=.2, to_load=None
                              ):
+    faulthandler.enable()
     writer.create_experiment_directory()
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,

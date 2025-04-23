@@ -4,21 +4,21 @@ model:
     - type: TripleGINEConv
       nn:
         - type: Linear
-          in_features: 129
+          in_features: 101
           out_features: 512
         - type: ReLU
         - type: Linear
           in_features: 512
           out_features: 1024
         - type: ReLU
-      edge_dim: 129
+      edge_dim: 101
     - type: TripleGINEConv
       nn:
         - type: Linear
           in_features: 1024
           out_features: 512
         - type: ReLU
-      edge_dim: 129
+      edge_dim: 101
     - type: TriplePatternPooling
 
 

@@ -70,3 +70,4 @@ class GINEConvModel(torch.nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch):
         return self.model.forward(x, edge_index, edge_attr, batch)
+

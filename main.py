@@ -51,14 +51,14 @@ def main_q_learning_rl():
     pass
 
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
-            config_name="pretrain_directional_gine_conv_large")
+            config_name="pretrain_experiment_triple_conv")
 def main(cfg: DictConfig):
     if cfg.pretraining:
         c1 = cfg.pretraining
 
         with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
             config = yaml.safe_load(f)
-        writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_directional_gine_conv_large",
+        writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_experiment_triple_conv",
                                   dict(c1), dict(config['model']))
         main_pretraining_dataset(
             queries_location=c1.dataset,

@@ -1,32 +1,34 @@
 import json
 import os
-from torch_geometric.data import InMemoryDataset, download_url
+from typing import Type, Tuple
+
+import torch
+from torch_geometric.data import InMemoryDataset, download_url, Dataset
+from torch_geometric.data.data import BaseData, Data
+from torch_geometric.io import fs
 
 from src.datastructures.query import Query, ProcessQuery
 
 
 class QueryCardinalityDataset(InMemoryDataset):
-    def __init__(self, root, featurizer, to_load=None, transform=None, pre_transform=None, ):
+    def __init__(self, root, featurizer, to_load=None, transform=None, pre_transform=None, pre_filter=None ):
         self.featurizer = featurizer
         self.to_load = to_load
-        super().__init__(root, transform, pre_transform)
+        super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
 
 
     def raw_file_names(self):
         return [
-            "watdiv_stars_2025-01-27_09-32-26_2.json",
-            "watdiv_stars_2025-01-27_09-37-29_3.json",
-            "watdiv_stars_2025-01-27_09-39-53_5.json",
-            "watdiv_stars_2025-01-27_10-42-20_8.json"
+            "fixed_stars_2025-03-30_18-49-33_3.json",
+            "fixed_stars_2025-03-30_19-10-42_5.json",
+            "fixed_stars_2025-04-13_14-17-45_8.json",
         ]
+
 
     def processed_file_names(self):
         return [
-            "watdiv_stars_2025-01-27_09-32-26_2.pt",
-            "watdiv_stars_2025-01-27_09-37-29_3.pt",
-            "watdiv_stars_2025-01-27_09-39-53_5.pt",
-            "watdiv_stars_2025-01-27_10-42-20_8.pt"
+            "processed_stars.pt"
         ]
 
     def process(self):
@@ -40,6 +42,9 @@ class QueryCardinalityDataset(InMemoryDataset):
             for i, data in enumerate(raw_data):
                 if not self.to_load or i < self.to_load:
                     tp_str, tp_rdflib = ProcessQuery.deconstruct_to_triple_pattern(data['query'])
+                    # Temp fix for wrong generated queries during testing
+                    if "type" not in data:
+                        data["type"] = "star"
                     queries.append({
                         "query": data['query'],
                         "cardinality": data['y'],
@@ -51,21 +56,21 @@ class QueryCardinalityDataset(InMemoryDataset):
 
         data_list = []
         for i, query_type in enumerate(raw_queries_list):
-            data_list.append([self.featurizer(query) for query in query_type])
+            data_list.extend([self.featurizer(query) for query in query_type])
 
         if self.pre_transform is not None:
-            data_list = [[self.pre_transform(data) for data in data_type ] for data_type in data_list]
+            data_list = [self.pre_transform(data) for data in data_list ]
 
         if self.transform is not None:
-            data_list = [[self.transform(data) for data in data_type ] for data_type in data_list]
+            data_list = [self.transform(data) for data in data_list ]
 
         print("Loaded: {} queries".format(sum(len(sublist) for sublist in data_list)))
 
-        for i, data_type in enumerate(data_list):
-            self.save(data_type, self.processed_paths[i])
+        self.save(data_list, self.processed_paths[0])
 
 def get_size_data(data):
     return sum([v.element_size() * v.numel() for k, v in data if type(v) != str])
+
 
 
 if __name__ == "__main__":

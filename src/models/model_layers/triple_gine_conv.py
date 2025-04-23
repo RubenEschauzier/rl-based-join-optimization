@@ -120,7 +120,6 @@ class TripleGineConv(MessagePassing, ABC):
             x_i[reverse], x_j[reverse] = x_j[reverse], x_i[reverse]
 
         edge_attr = edge_attr[:, :-1]
-
         return self.lin(torch.cat((x_i, edge_attr, x_j), 1)).relu()
 
     def __repr__(self) -> str:

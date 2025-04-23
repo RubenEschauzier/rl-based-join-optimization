@@ -36,14 +36,9 @@ SelfMaskableQRDQN = TypeVar("SelfMaskableQRDQN", bound="MaskableQRDQN")
 
 class MaskableQuantileNetwork(QuantileNetwork):
     def _predict(self, observation: PyTorchObs, action_masks=None, deterministic: bool = True) -> torch.Tensor:
-        print("Quantile network:")
-        print(traceback.print_stack())
-        print(action_masks)
-        q_values = self(observation).mean(dim=1)
-        print(q_values)
-        print("----------------")
+        masked_q_values = self(observation).mean(dim=1).masked_fill(action_masks, -torch.inf)
         # Greedy action
-        action = q_values.argmax(dim=1).reshape(-1)
+        action = masked_q_values.argmax(dim=1).reshape(-1)
         return action
 
     def forward(self, obs: PyTorchObs, action_masks=None) -> torch.Tensor:
@@ -54,9 +49,9 @@ class MaskableQuantileNetwork(QuantileNetwork):
         :param obs: Observation
         :return: The estimated quantiles for each action.
         """
+        #TODO MASK OUT QUANTILES
         quantiles = self.quantile_net(self.extract_features(obs, self.features_extractor))
         output = quantiles.view(-1, self.n_quantiles, int(self.action_space.n))
-        print("Forward quantile network output shap: {}".format(output.shape))
         return output
 
 class QRDQNFeatureExtractor(BaseFeaturesExtractor):
@@ -104,6 +99,7 @@ class QRDQNFeatureExtractor(BaseFeaturesExtractor):
         # (B, max_triples, feature_dim)
         result_embeddings = observations["result_embeddings"]
         joined = observations["joined"]
+
         # Here we do -1 to obtain the actual join order as the environment increments all join orders by 1 for
         # sb3 preprocessing purposes
         join_order = observations["join_order"] - 1
@@ -159,7 +155,7 @@ class MaskableQRDQNPolicy(QRDQNPolicy):
         return action
 
     def _predict(self, obs: PyTorchObs, deterministic: bool = True, action_masks=None) -> torch.Tensor:
-        return self.quantile_net._predict(obs, deterministic=deterministic)
+        return self.quantile_net._predict(obs, deterministic=deterministic, action_masks=action_masks)
 
     def predict(
         self,
@@ -200,9 +196,8 @@ class MaskableQRDQNPolicy(QRDQNPolicy):
         obs_tensor, vectorized_env = self.obs_to_tensor(observation)
 
         with torch.no_grad():
-            print("In MaskableQRDQNPolicy Predict")
-            print(action_masks)
-            actions = self._predict(obs_tensor, deterministic=deterministic, action_masks=action_masks)
+            actions = self._predict(obs_tensor, deterministic=deterministic,
+                                    action_masks=torch.tensor(action_masks, device=self.device).to(torch.bool))
 
         # Convert to numpy, and reshape to the original action shape
         actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
@@ -529,7 +524,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
 
             with torch.no_grad():
                 # Compute the quantiles of next observation
-                print(type(self.quantile_net_target))
                 next_quantiles = self.quantile_net_target(replay_data.next_observations,
                                                           action_masks=replay_data.action_masks)
                 # Compute the greedy actions which maximize the next Q values
@@ -677,9 +671,7 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             # we assume that the policy uses tanh to scale the action
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
             assert self._last_obs is not None, "self._last_obs was not set"
-            print("In sample action")
             unscaled_action, _ = self.predict(self._last_obs, deterministic=False, action_masks=action_masks)
-            print("Done sampling")
 
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, spaces.Box):
