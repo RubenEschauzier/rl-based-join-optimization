@@ -6,6 +6,10 @@ import torch
 from SPARQLWrapper import JSON
 from charset_normalizer.cli import query_yes_no
 from torch_geometric.loader import DataLoader
+import random
+from math import factorial
+
+from tqdm import tqdm
 
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 
@@ -13,7 +17,8 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
 class QueryExecutionGym(gym.Env):
     def __init__(self, query_dataset, feature_dim, query_embedder, env,
-                 reward_type: Literal['intermediate_results', 'execution_time'], max_triples=20):
+                 reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"], max_triples=20,
+                 alpha = .3, gamma = .99, train_mode=True):
         super().__init__()
         # The environment used to execute queries and obtain rewards
         self.env = env
@@ -23,14 +28,15 @@ class QueryExecutionGym(gym.Env):
         self.query_embedder = query_embedder
         for param in self.query_embedder.parameters():
             param.requires_grad = False
-
+        # If train_mode is off, the DataLoader will not shuffle the queries
+        self.train_mode = train_mode
         # Output feature size (lets infer this from the embedder instead
         self.feature_dim = feature_dim
         # Max # of triples in query
         self.max_triples = max_triples
         # Dataset / loader of generated queries used to train RL algorithm on
         self.query_dataset = query_dataset
-        self.query_loader = iter(DataLoader(query_dataset, batch_size=1, shuffle=True)) # type: ignore
+        self.query_loader = iter(DataLoader(query_dataset, batch_size=1, shuffle=self.train_mode)) # type: ignore
 
         self.observation_space = gym.spaces.Dict({
             "result_embeddings": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.max_triples, self.feature_dim)),
@@ -51,8 +57,29 @@ class QueryExecutionGym(gym.Env):
         self.join_order: np.array = None
         self.n_triples_query = 0
 
+        # Mixing functions for intermediate result reward
+        self.alpha = alpha
+        self.gamma = gamma
+
 
     def step(self, action):
+        # Here is what we'll do: One step is ONE query. This function will output a list of actions taken by the model,
+        # which are the actions and combine it with the representations. We store transitions in the replay buffer in
+        # such away that we can rebuild the computational graph.
+        # So we need not only base representations, but also the preceding joins.
+        # This way we can iteratively apply the tree-lstm to get back the representation and the gradient.
+
+        # Then for reward function we will follow the paper I found and try to look up if I can get blazegraph to output
+        # a cost. Furthermore, we will use curriculum learning (test it by using small queries first and see if it will
+        # train). Finally, we will include a latency tuning phase but this will be on virtual wall.
+
+        # For actual model usage. I suggest combining cardinality estimation and QR-DQN to form a robust cardinality
+        # estimation model.
+
+        # Use this to implement Tree-LSTM:
+        # https://github.com/pyg-team/pytorch_geometric/issues/121?utm_source=chatgpt.com?utm_source=chatgpt.com
+
+        print(self._query.edge_index)
         # In this step function we have to define how the representations are updated by adding a join.
         # One idea is to use a simple MLP over the two joined representations to output a new representation. Other is
         # things like tree-lstm. Then I need to figure out a way to include the output of a model in the environment
@@ -75,21 +102,10 @@ class QueryExecutionGym(gym.Env):
                                                                              self._query.triple_patterns)
             # Execute query to obtain selectivity
             env_result, exec_time = self.env.run_raw(rewritten, self.query_timeout, JSON, {"explain": "True"})
-            if self.reward_type == 'intermediate_results':
-                # (Old penalty implementation, should look into how to shape this reward properly)
-                units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
-                if status == "OK":
-                    reward = - np.log(QueryExecutionGym.query_plan_cost(units_out, counts)+1)
-                else:
-                    # Very large negative reward when query fails.
-                    reward = -20
-            elif self.reward_type == 'execution_time':
-                reward = - np.log(exec_time)
-            else:
-                raise ValueError("Invalid reward_type in environment: {}".format(self.reward_type))
-
+            final_reward, reward_per_step = self._get_reward(self._query, env_result, exec_time, join_order_trimmed,
+                                                             self.reward_type)
             next_obs = self._build_obs()
-            return next_obs, reward, True, False, {}
+            return next_obs, final_reward, True, False, {"reward_per_step": reward_per_step}
 
         return next_obs, 0, False, False, {}
 
@@ -98,14 +114,8 @@ class QueryExecutionGym(gym.Env):
         try:
             query = next(self.query_loader)[0]
         except StopIteration:
-
-            self.query_loader = iter(DataLoader(self.query_dataset, batch_size=1, shuffle=True)) # type: ignore
+            self.query_loader = iter(DataLoader(self.query_dataset, batch_size=1, shuffle=self.train_mode)) # type: ignore
             query = next(self.query_loader)[0]
-        # print(query.query)
-        # print(query.x)
-        # print(query.edge_attr)
-        # print(query.edge_index)
-        # print(query.batch)
         embedded = self.query_embedder.forward(x=query.x,
                                        edge_index=query.edge_index,
                                        edge_attr=query.edge_attr,
@@ -133,9 +143,103 @@ class QueryExecutionGym(gym.Env):
             "join_order": self.join_order,
             "joined": self._joined
         }
+    def _get_reward(self, query, env_result_policy, exec_time_policy, join_order_trimmed, reward_type):
+        if reward_type == 'execution_time':
+            reward_per_step_policy = [0] * join_order_trimmed.shape[0]
+            reward_per_step_policy[-1] = np.log(exec_time_policy)
+            final_reward_policy = - np.log(exec_time_policy)
+            return final_reward_policy, reward_per_step_policy
+
+        units_out, counts, join_ratio, status = self.env.process_output(env_result_policy, "intermediate-results")
+        if reward_type == 'cost_ratio':
+            #TODO TEST THIS BADBOY
+            # Run original query to get cost from the default optimizer
+            env_result_base, exec_time_base = self.env.run_raw(
+                query.query, self.query_timeout, JSON, {"explain": "True"}
+            )
+            units_out_base, counts_base, join_ratio_base, status_base = (
+                self.env.process_output(env_result_base, "intermediate-results"))
+            if status == "OK":
+                if status_base != "OK":
+                    # For some reason the default optimizer cant execute it. Return high reward
+                    reward_per_step_policy = 1 * join_order_trimmed.shape[0]
+                    final_reward_policy = 1
+                    return final_reward_policy, reward_per_step_policy
+
+                reward_per_step_policy = QueryExecutionGym.query_plan_cost(units_out, counts)
+                reward_per_step_base = QueryExecutionGym.query_plan_cost(units_out_base, counts_base)
+
+                final_cost_policy = np.sum(reward_per_step_policy)
+                final_cost_base = np.sum(reward_per_step_base)
+                reward_per_step = []
+                for i, (step_reward_policy, step_reward_base) in enumerate(zip(reward_per_step_policy, reward_per_step_base)):
+                    ratio = np.log((((self.alpha * step_reward_base) +
+                              (1 - self.alpha) * (self.gamma**i) * final_cost_base) /
+                             ((self.alpha * step_reward_policy) +
+                              (1 - self.alpha) * (self.gamma ** i) * final_cost_policy)))
+                    reward_per_step.append(ratio)
+
+
+                final_reward = np.log(final_cost_base/final_cost_policy)
+            else:
+                # Very large negative reward when query fails.
+                reward_per_step = [-3] * join_order_trimmed.shape[0]
+                final_reward = -3
+
+            return final_reward, reward_per_step
+
+        if reward_type == 'intermediate_results':
+            if status == "OK":
+                reward_per_step_policy = QueryExecutionGym.query_plan_cost(units_out, counts)
+                final_reward_policy = - np.log(np.sum(reward_per_step_policy) + 1)
+                reward_per_step_policy = [
+                    self.alpha * - np.log(step_reward) + (1 - self.alpha) * self.gamma ** i * final_reward_policy
+                    for i, step_reward in enumerate(reward_per_step_policy)]
+            else:
+                # Very large negative reward when query fails.
+                reward_per_step_policy = [-20] * join_order_trimmed.shape[0]
+                final_reward_policy = -20
+            return final_reward_policy, reward_per_step_policy
+
+        raise ValueError("Invalid reward_type in environment: {}".format(reward_type))
+
 
     def action_masks(self):
         return self._joined
+
+    # TODO: Also validate how execution times differ between the join orders for a singel query
+    #  (this is doable for 3 size queries not otherwise)
+    def validate_cost_function(self, queries, n_to_validate, orders_per_query,
+                               reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"]):
+        loader = iter(DataLoader(queries, batch_size=1, shuffle=self.train_mode)) # type: ignore
+        data_execution_time = []
+        data_reward = []
+        for i in tqdm(range(n_to_validate)):
+            query = next(loader)[0]
+            join_orders = QueryExecutionGym.generate_random_join_order(query, orders_per_query)
+            for order in join_orders:
+                rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
+                                                                                 order,
+                                                                                 query.triple_patterns)
+                # Execute query to obtain selectivity and execution time
+                env_result, exec_time = self.env.run_raw(rewritten, self.query_timeout, JSON, {"explain": "True"})
+                reward, step_reward = self._get_reward(query, env_result, exec_time, order, reward_type)
+                data_execution_time.append(exec_time)
+                data_reward.append(reward)
+        return data_execution_time, data_reward
+
+    @staticmethod
+    def generate_random_join_order(query, k):
+        n = len(query.triple_patterns)
+        if k > factorial(n):
+            raise ValueError(f"Cannot generate {k} unique permutations of {n} elements (max is {factorial(n)}).")
+
+        seen = set()
+        while len(seen) < k:
+            perm = tuple(random.sample(range(0, n), n))
+            seen.add(perm)
+
+        return [np.array(p) for p in seen]
 
     @staticmethod
     def retrieve_true_join_order(join_order):
@@ -144,10 +248,13 @@ class QueryExecutionGym(gym.Env):
     @staticmethod
     def query_plan_cost(units_out, counts):
         # We add first count to reward query plans with small initial scans
-        cost = counts[0]
+        cost = [counts[0]]
+        # cost = counts[0]
         for i in range(units_out.shape[0] - 1):
-            # Join work assuming index-based nested loop join (should include a cost for hash join)\
-            cost += (units_out[i] * np.log(counts[i + 1]+1))
+            # Join work assuming index-based nested loop join (should include a cost for hash join)
+            cost.append(units_out[i]*counts[i+1])
+            # cost.append((units_out[i] * np.log(counts[i + 1]+1)))
+            # cost += (units_out[i] * np.log(counts[i + 1]+1))
         return cost
 
 

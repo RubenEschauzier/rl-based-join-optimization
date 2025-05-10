@@ -1,9 +1,11 @@
 import torch.nn
-from numpy.ma.core import MaskError
-from sb3_contrib import QRDQN
-from gymnasium.utils.env_checker import check_env
-from stable_baselines3.common.callbacks import BaseCallback
+import numpy as np
+from matplotlib import pyplot as plt
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from scipy.stats import linregress, stats
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from torch.utils.tensorboard import SummaryWriter
 
@@ -45,11 +47,57 @@ def load_weights_from_pretraining(model_to_init, state_dict_location, float_weig
     if float_weights:
         model_to_init.float()
 
+def scatter_plot_reward_execution_time(reward, execution_time):
+    slope, intercept, r_value, p_value, std_err = linregress(reward, execution_time)
+    regression_line = [slope * data_reward + intercept for data_reward in reward]
+
+    # Plot
+    plt.scatter(reward, execution_time, color='blue', label='Data points')
+    plt.plot(reward, regression_line, color='red', label=f'Regression line (R²={r_value ** 2:.2f})')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('Scatter Plot with Regression Line')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def scatter_plot_updated(reward, execution_time):
+    # Perform linear regression
+    slope, intercept, r_value, p_value, std_err = linregress(reward, execution_time)
+    line = slope * reward + intercept
+
+    # Create confidence interval
+    pred_y = slope * reward + intercept
+    n = len(reward)
+
+    # Plot
+    plt.figure(figsize=(10, 6))
+    plt.style.use('seaborn-v0_8-darkgrid')
+
+    plt.scatter(reward, execution_time, color='dodgerblue', s=5, edgecolor='k', label='Query Executions')
+    plt.plot(reward, line, color='crimson', linewidth=2.5, label='Linear OLS fit')
+
+    # Annotate regression info
+    plt.text(min(reward), max(execution_time), f'$R^2$ = {r_value ** 2:.3f}',
+             fontsize=12, color='crimson', bbox=dict(facecolor='white', alpha=0.8))
+
+    plt.title('Query execution time as a function of query reward signal', fontsize=16)
+    plt.xlabel('Query Reward Signal', fontsize=20)
+    plt.ylabel('Log(Query Execution Time)', fontsize=20)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def make_env(dataset, train_mode):
+    return QueryExecutionGym(dataset, 512, gine_conv_model, query_env, reward_type='cost_ratio',
+                             train_mode=train_mode)
+
 
 if __name__ == "__main__":
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
-    queries_location = "data/pretrain_data/datasets/p_e_full_101"
+    queries_location = "data/pretrain_data/datasets/p_e_size_3_only_101"
     rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
     occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
     tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
@@ -70,23 +118,43 @@ if __name__ == "__main__":
     load_weights_from_pretraining(gine_conv_model, weights_path, float_weights=True)
     gine_conv_model.eval()
 
-    def make_env():
-        return QueryExecutionGym(train_dataset, 512, gine_conv_model, query_env, reward_type='intermediate_results')
 
-    n_envs = 4
     policy_kwargs = dict(
         features_extractor_class=QRDQNFeatureExtractor,
         features_extractor_kwargs=dict(feature_dim=512),
     )
+    train_env = make_env(train_dataset, True)
+    val_env = Monitor(make_env(val_dataset.shuffle()[:30], False)),
+    data_execution_time, data_reward = train_env.validate_cost_function(
+        train_dataset, 100, 3, "intermediate_results"
+    )
+    scatter_plot_reward_execution_time(data_reward, data_execution_time)
+    scatter_plot_reward_execution_time(data_reward, np.log(data_execution_time))
+    scatter_plot_updated(np.array(data_reward), np.log(data_execution_time))
     model = MaskableQRDQN(MaskableQRDQNPolicy,
-                          make_env(),
+                          train_env,
                           policy_kwargs=policy_kwargs,
-                          exploration_fraction=0.5,
+                          exploration_fraction=0.2,
+                          exploration_initial_eps=1,
+                          exploration_final_eps=0.05,
+                          learning_starts=100,
                           verbose=1,
                           buffer_size=10000,
                           replay_buffer_class=MaskedDictReplayBuffer,
                           tensorboard_log="./tensorboard_logs/",
-                          device='cpu')
+                          device='cpu',
+                          train_freq=(15, "episode"),
+                          delayed_rewards=False
+                          )
+    eval_dataset = val_dataset.shuffle()[:30]
+    eval_callback = MaskableEvalCallback(
+        eval_env=val_env,
+        use_masking=True,
+        n_eval_episodes=30,
+        eval_freq=300,
+        deterministic=True,
+        render=False,
+    )
 
     # model = MaskableQRDQN(MaskableQRDQNPolicy,
     #                       DummyVecEnv([lambda: make_env() for _ in range(n_envs)]),
@@ -94,7 +162,7 @@ if __name__ == "__main__":
     #                       replay_buffer_class=MaskedDictReplayBuffer)
 
     # Train the model
-    model.learn(total_timesteps=20000, callback = RewardLoggerCallback(verbose=0))
+    model.learn(total_timesteps=20000, callback=eval_callback)
     model.save("TempModelNoRnn")
     mean_reward, std_reward = evaluate_policy(model, model.get_env(), n_eval_episodes=1000)
 

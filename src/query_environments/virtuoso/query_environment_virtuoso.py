@@ -34,6 +34,7 @@ class VirtuosoQueryEnvironment:
         return rewritten_query_string
 
 
+
 """
 Need to ensure environment is seperate from agent. So agent merely communicates with environment through an api
 What will the agent communicate?
