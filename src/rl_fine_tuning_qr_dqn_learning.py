@@ -48,34 +48,17 @@ def load_weights_from_pretraining(model_to_init, state_dict_location, float_weig
         model_to_init.float()
 
 def scatter_plot_reward_execution_time(reward, execution_time):
-    slope, intercept, r_value, p_value, std_err = linregress(reward, execution_time)
-    regression_line = [slope * data_reward + intercept for data_reward in reward]
-
-    # Plot
-    plt.scatter(reward, execution_time, color='blue', label='Data points')
-    plt.plot(reward, regression_line, color='red', label=f'Regression line (R²={r_value ** 2:.2f})')
-    plt.xlabel('X')
-    plt.ylabel('Y')
-    plt.title('Scatter Plot with Regression Line')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-def scatter_plot_updated(reward, execution_time):
     # Perform linear regression
     slope, intercept, r_value, p_value, std_err = linregress(reward, execution_time)
     line = slope * reward + intercept
 
-    # Create confidence interval
-    pred_y = slope * reward + intercept
-    n = len(reward)
 
     # Plot
     plt.figure(figsize=(10, 6))
     plt.style.use('seaborn-v0_8-darkgrid')
 
     plt.scatter(reward, execution_time, color='dodgerblue', s=5, edgecolor='k', label='Query Executions')
-    plt.plot(reward, line, color='crimson', linewidth=2.5, label='Linear OLS fit')
+    plt.plot(reward, line, color='crimson', linewidth=1, label='Linear OLS fit')
 
     # Annotate regression info
     plt.text(min(reward), max(execution_time), f'$R^2$ = {r_value ** 2:.3f}',
@@ -126,11 +109,10 @@ if __name__ == "__main__":
     train_env = make_env(train_dataset, True)
     val_env = Monitor(make_env(val_dataset.shuffle()[:30], False)),
     data_execution_time, data_reward = train_env.validate_cost_function(
-        train_dataset, 100, 3, "intermediate_results"
+        train_dataset, 400, 3, "intermediate_results"
     )
-    scatter_plot_reward_execution_time(data_reward, data_execution_time)
-    scatter_plot_reward_execution_time(data_reward, np.log(data_execution_time))
-    scatter_plot_updated(np.array(data_reward), np.log(data_execution_time))
+    scatter_plot_reward_execution_time(np.array(data_reward), np.array(data_execution_time))
+    scatter_plot_reward_execution_time(np.array(data_reward), np.log(data_execution_time))
     model = MaskableQRDQN(MaskableQRDQNPolicy,
                           train_env,
                           policy_kwargs=policy_kwargs,
@@ -167,7 +149,7 @@ if __name__ == "__main__":
     mean_reward, std_reward = evaluate_policy(model, model.get_env(), n_eval_episodes=1000)
 
     # I have not yet disabled gradients for other Q-values, how do I know my Q-values are being masked properly in the
-    # training part of my model. Also still have no statefulness
+    # training part of my model. Also, still have no statefulness
     # https://sb3-contrib.readthedocs.io/en/master/_modules/sb3_contrib/qrdqn/qrdqn.html#QRDQN
     # Note that this DOES include a state variable, how can we use it? Look at how recurrent PPO works?
     # Overwrite _sample_action to use the mask and state, collect_rollout, use a recurrent buffer (?)
