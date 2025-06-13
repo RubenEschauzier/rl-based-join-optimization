@@ -12,36 +12,17 @@ from torch.utils.tensorboard import SummaryWriter
 from src.models.model_instantiator import ModelFactory
 from src.models.rl_algorithms.masked_replay_buffer import MaskedDictReplayBuffer
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
-from src.query_environments.gym.query_gym import QueryExecutionGym
+from src.query_environments.gym.query_gym_cardinality_estimation_feedback import QueryGymCardinalityEstimationFeedback
+from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN, QRDQNFeatureExtractor, MaskableQRDQNPolicy
-
-class RewardLoggerCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.writer = None
-
-    def _on_training_start(self) -> None:
-        # Get the writer from the logger (SB3 uses TensorBoard by default if specified)
-        self.writer = SummaryWriter(log_dir=self.logger.dir)
-
-    def _on_step(self) -> bool:
-        # Get the reward of the current step
-        reward = self.locals["rewards"][0]  # assuming a single environment
-        step = self.num_timesteps
-
-        if self.writer:
-            self.writer.add_scalar("raw_reward", reward, step)
-        return True
-
-    def _on_training_end(self) -> None:
-        if self.writer:
-            self.writer.close()
 
 
 def load_weights_from_pretraining(model_to_init, state_dict_location, float_weights=False):
     partial = model_to_init.state_dict()
+    print(partial)
     weights = torch.load(state_dict_location, weights_only=True)
+    print(weights)
     filtered = {k: v for k, v in weights.items() if k in partial}
     model_to_init.load_state_dict(filtered)
     if float_weights:
@@ -73,8 +54,13 @@ def scatter_plot_reward_execution_time(reward, execution_time):
 
 
 def make_env(dataset, train_mode):
-    return QueryExecutionGym(dataset, 512, gine_conv_model, query_env, reward_type='cost_ratio',
-                             train_mode=train_mode)
+    return QueryExecutionGymExecutionFeedback(dataset, 512, gine_conv_model, query_env, reward_type='cost_ratio',
+                                              train_mode=train_mode)
+
+def make_env_cardinality_estimation(dataset, train_mode):
+    return QueryGymCardinalityEstimationFeedback(query_dataset=dataset, feature_dim=512,
+                                              query_embedder=gine_conv_model, env=query_env,
+                                              reward_type='cost_ratio', train_mode=train_mode)
 
 
 if __name__ == "__main__":

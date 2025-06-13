@@ -166,18 +166,19 @@ class NAryTreeLSTM(MessagePassing, ABC):
         mapped_index = torch.tensor([self.partial_dense_mapping[int(i.item())] for i in index], device=index.device)
         n_parents = int(mapped_index.max() + 1)
 
+        # Sum part of calculation of i o u
         p_iou_sum = torch.zeros(n_parents, self.hidden_dim*3, device=p_iou.device)
         p_iou_sum = p_iou_sum.index_add(0, mapped_index, p_iou)
 
         # ∑ f_{jk} * c_k
         f_c_sum = torch.zeros_like(torch.zeros(n_parents, self.hidden_dim, device=h_j.device))
         f_c_sum = f_c_sum.index_add(0, mapped_index, f_c)
-        return h_j, f_c_sum, p_iou_sum
+        return f_c_sum, p_iou_sum
 
 
     #TODO Test this
     def update(self, aggr_out, x):
-        h_j, f_c_sum, p_iou_sum = aggr_out
+        f_c_sum, p_iou_sum = aggr_out
         # Take all x of nodes that will be updated in this call
         x_to_update = x[list(self.partial_dense_mapping.keys())]
 
@@ -186,18 +187,6 @@ class NAryTreeLSTM(MessagePassing, ABC):
         u = torch.tanh(u)
 
         return self.get_h_c(i, o, u, f_c_sum)
-    #
-    # def get_iou(self, x, h_j):
-    #     # iou = self.W_iou(x) + self.U_iou(h_tilde)
-    #     # i, o, u = torch.chunk(iou, 3, dim=1)
-    #     i, o, u = self.batched_chunked_linear(
-    #         weight_x = self.W_iou, weight_h = self.U_iou,
-    #         input_x = x, input_h = h_j,
-    #         chunks=3, dim=1
-    #     )
-    #     i, o = torch.sigmoid(i), torch.sigmoid(o)
-    #     u = torch.tanh(u)
-    #     return i, o, u
 
     @staticmethod
     def batched_chunked_linear(weight_x: nn.Linear, weight_h: nn.Parameter,

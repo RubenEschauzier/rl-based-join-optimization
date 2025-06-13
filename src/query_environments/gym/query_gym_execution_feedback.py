@@ -15,7 +15,7 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 
 
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
-class QueryExecutionGym(gym.Env):
+class QueryExecutionGymExecutionFeedback(gym.Env):
     def __init__(self, query_dataset, feature_dim, query_embedder, env,
                  reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"], max_triples=20,
                  alpha = .3, gamma = .99, train_mode=True):
@@ -166,8 +166,8 @@ class QueryExecutionGym(gym.Env):
                     final_reward_policy = 1
                     return final_reward_policy, reward_per_step_policy
 
-                reward_per_step_policy = QueryExecutionGym.query_plan_cost(units_out, counts)
-                reward_per_step_base = QueryExecutionGym.query_plan_cost(units_out_base, counts_base)
+                reward_per_step_policy = QueryExecutionGymExecutionFeedback.query_plan_cost(units_out, counts)
+                reward_per_step_base = QueryExecutionGymExecutionFeedback.query_plan_cost(units_out_base, counts_base)
 
                 final_cost_policy = np.sum(reward_per_step_policy)
                 final_cost_base = np.sum(reward_per_step_base)
@@ -190,7 +190,7 @@ class QueryExecutionGym(gym.Env):
 
         if reward_type == 'intermediate_results':
             if status == "OK":
-                reward_per_step_policy = QueryExecutionGym.query_plan_cost(units_out, counts)
+                reward_per_step_policy = QueryExecutionGymExecutionFeedback.query_plan_cost(units_out, counts)
                 final_reward_policy = - np.log(np.sum(reward_per_step_policy) + 1)
                 reward_per_step_policy = [
                     self.alpha * - np.log(step_reward) + (1 - self.alpha) * self.gamma ** i * final_reward_policy
@@ -207,7 +207,7 @@ class QueryExecutionGym(gym.Env):
     def action_masks(self):
         return self._joined
 
-    # TODO: Also validate how execution times differ between the join orders for a singel query
+    # TODO: Also validate how execution times differ between the join orders for a single query
     #  (this is doable for 3 size queries not otherwise)
     def validate_cost_function(self, queries, n_to_validate, orders_per_query,
                                reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"]):
@@ -216,7 +216,7 @@ class QueryExecutionGym(gym.Env):
         data_reward = []
         for i in tqdm(range(n_to_validate)):
             query = next(loader)[0]
-            join_orders = QueryExecutionGym.generate_random_join_order(query, orders_per_query)
+            join_orders = QueryExecutionGymExecutionFeedback.generate_random_join_order(query, orders_per_query)
             for order in join_orders:
                 rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
                                                                                  order,

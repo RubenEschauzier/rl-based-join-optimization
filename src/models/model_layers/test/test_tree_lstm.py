@@ -244,7 +244,7 @@ class TestNAryTreeLSTM:
         batched_linear_output = NAryTreeLSTM.batched_linear(test_weights, linear_input)
         torch.testing.assert_close(batched_linear_output, expected_output, atol=1e-5, rtol=0)
 
-    def test_batched_linear_n_ary(self, tree_lstm):
+    def test_batched_chunked_linear_n_ary(self, tree_lstm):
         """
         Test for stacked weight matrix (e.g. iou computation)
         :param tree_lstm:
@@ -293,101 +293,6 @@ class TestNAryTreeLSTM:
         for output_tensor, expected_tensor in zip(batched_linear_output, expected_output):
             torch.testing.assert_close(output_tensor, expected_tensor, atol=1e-5, rtol=0)
 
-    def test_get_iou_n_ary(self, tree_lstm_2):
-        # linear_input_h = torch.tensor([
-        #     [1, 1, 1],
-        #     [1, 1, 1]
-        # ], dtype=torch.float)
-        # linear_input_x = torch.tensor([
-        #     [1,1],
-        #     [1,1]
-        # ], dtype=torch.float)
-        # # test_weights_h = torch.nn.Parameter(
-        # #     torch.tensor([
-        # #         [
-        # #             [.5, 1, 1.5, 2, 2.5, 3],
-        # #             [1, 2, 3, 4, 5, 6],
-        # #             [-2, -1, -.5, 0, 1, 2]
-        # #         ],
-        # #         [
-        # #             [1.5, 3, 4.5, 6, 7.5, 9],
-        # #             [-1, -2, -3, -4, -5, -6],
-        # #             [1.5, 3, 1.5, 0, 1.5, 3]
-        # #         ],
-        # #     ], dtype=torch.float)
-        # # )
-        # # [n_child, out_dim*3, out_dim]
-        # # test_weights_h = torch.nn.Parameter(
-        # #     torch.tensor([
-        # #         [
-        # #             [.5, 1, 0], [1, 2, 0], [-2, 1, .5],
-        # #             [1.5, 2, -3], [3, 4, -2], [-.5, 0, -.5],
-        # #             [2.5, 3, -1], [5, 6, -7], [1, 2, -1]
-        # #         ],
-        # #         [
-        # #             [1.5, 3, -1], [-1, -2, 1], [1.5, 3, -2],
-        # #             [4.5, 6, -7], [-3, -4, -2], [1.5, 0, .5],
-        # #             [7.5, 9, -8], [-5, -6, 4], [1.5, 3, 0]
-        # #         ]
-        # #     ])
-        # # )
-        # # print("TRANSPOSE")
-        # # print(torch.transpose(test_weights_h, 1,2))
-        # test_weights_h = torch.nn.Parameter(
-        #     torch.tensor([
-        #         [
-        #
-        #             [.5, 1, 0, 1.5, 2, -3, 2.5, 3, -1],
-        #             [1, 2, 0, 3, 4, -2, 5, 6, -7],
-        #             [-2, 1, .5, -.5, 0, -.5, 1, 2, -1]
-        #         ],
-        #         [
-        #             [1.5, 3, -1, -1, -2, 1, 1.5, 3, -2],
-        #             [4.5, 6, -7, -3, -4, -2, 1.5, 0, .5],
-        #             [7.5, 9, -8, -5, -6, 4, 1.5, 3, 0]
-        #         ]
-        #     ])
-        # )
-        #
-        #
-        # # [n_child, in_dim, out_dim * 3]
-        # # test_weights_x = torch.nn.Linear(2, 3 * 2)
-        # # print(tree_lstm_2.W_iou)
-        # # tree_lstm_2.set_weights({
-        # #     'W_iou': [torch.tensor([
-        # #         [.25, .75, 0.5, -1, .25, .75],
-        # #         [.5, 1, 0.25, -0.5, .5, 1],
-        # #         [.75, .25, 0, 1, .75, .25]
-        # #     ]), torch.zeros(9)]
-        # # })
-        # tree_lstm_2.set_weights({
-        #     'W_iou': [
-        #         # torch.tensor([
-        #         # [.25, .75, 0.5, -1, .25, .75],
-        #         # [.5, 1, 0.25, -0.5, .5, 1],
-        #         # [.75, .25, 0, 1, .75, .25]
-        #         # ]),
-        #         torch.tensor([
-        #             [.25, .75],
-        #             [.5, 1],
-        #             [.75, .25],
-        #             [0.5, -1],
-        #             [0.25, -.5],
-        #             [0, 1],
-        #             [.25, .75],
-        #             [.5, 1],
-        #             [.75, .25]
-        #         ]),
-        #         torch.zeros(9)
-        #     ],
-        #     'U_iou': [test_weights_h]
-        # })
-        #
-        # output = tree_lstm_2.get_iou(x = linear_input_x, h_j = linear_input_h)
-        # print(output)
-        # assert 5==3
-
-        pass
 
     def test_message_n_ary(self, tree_lstm_2):
         #   2
@@ -428,13 +333,44 @@ class TestNAryTreeLSTM:
         expected_f_c_sum = torch.tensor([[0, -4, 2]], dtype=torch.float)
         expected_p_iou_sum = torch.tensor([[1.5, -1, 2, 0, 2, 1, 0, 0.5, 1.5]],dtype=torch.float)
         # noinspection PyTypeChecker
-        output_h_j, f_c_sum, p_iou_sum = tree_lstm_2.aggregate(
+        f_c_sum, p_iou_sum = tree_lstm_2.aggregate(
             (h_j, f_c, p_iou, x_i), input_index
         )
-        torch.testing.assert_close(output_h_j, h_j, atol=1e-4, rtol=0)
         torch.testing.assert_close(f_c_sum, expected_f_c_sum, atol=1e-4, rtol=0)
         torch.testing.assert_close(p_iou_sum, expected_p_iou_sum, atol=1e-4, rtol=0)
 
+    #TODO Test update function
+    def test_update_n_ary(self, tree_lstm_2):
+        f_c_sum = torch.tensor(
+            [[.5, 1, .5]],
+            dtype=torch.float)
+        p_iou_sum = torch.tensor(
+            [[.5, .5, .5, 1, 1, -.5, .5, -1, .5]],
+            dtype=torch.float)
+        x = torch.tensor([
+            [1,1],
+            [1,1],
+            [1,1]
+        ], dtype=torch.float)
+        tree_lstm_2.partial_dense_mapping = {2: 0}
+        tree_lstm_2.set_weights(
+            {
+                "W_iou": [torch.tensor([
+                    [.5, .5],
+                    [.5, .5],
+                    [.5, .5],
+                    [-.5, -.5],
+                    [-.5, -.5],
+                    [-.5, -.5],
+                    [1, 1],
+                    [1, 1],
+                    [1, 1],
+                ]), torch.zeros(3 * 3)]
+            }
+        )
+        expected_h = torch.tensor([[0.4317, 0.4625, 0.1575]])
+        expected_c = torch.tensor([[1.3066, 1.6227, 1.3066]])
+        h, c = tree_lstm_2.update((f_c_sum, p_iou_sum), x)
+        torch.testing.assert_close(h, expected_h, atol=1e-4, rtol=0)
+        torch.testing.assert_close(c, expected_c, atol=1e-4, rtol=0)
 
-    def test_forward_n_ary(self, tree_lstm_2):
-        pass
