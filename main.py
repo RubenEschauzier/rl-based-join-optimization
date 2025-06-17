@@ -58,6 +58,7 @@ def main(cfg: DictConfig):
 
         with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
             config = yaml.safe_load(f)
+
         writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_experiment_triple_conv",
                                   dict(c1), dict(config['model']))
         main_pretraining_dataset(

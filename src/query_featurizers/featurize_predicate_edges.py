@@ -32,7 +32,8 @@ class QueryToEdgePredicateGraph:
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
                           triple_patterns=json_query['triple_patterns'],
-                          type=json_query['type'])
+                          type=json_query['type'],
+                          node_id_to_actual=term_to_id)
         return data_query
 
     def transform_undirected(self, json_query):

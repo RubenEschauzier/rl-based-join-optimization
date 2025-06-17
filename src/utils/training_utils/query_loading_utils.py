@@ -37,30 +37,6 @@ def load_raw_queries(queries_location, to_load=None):
     return queries
 
 
-def load_and_prepare_queries(env, queries_location, rdf2vec_vector_location,
-                             prepared_queries_location, cardinalities_location=None, to_load=None):
-
-    queries, cardinalities = load_queries_and_cardinalities(queries_location,
-                                                            cardinalities_location=cardinalities_location,
-                                                            to_load=to_load)
-
-    # Prepare features of queries
-    queries = prepare_pretraining_queries(env, queries, rdf2vec_vector_location,
-                                          save_location=prepared_queries_location
-                                          )
-    return queries, cardinalities
-
-def load_prepared_queries_cardinalities(queries_location, prepared_queries_location):
-    feature_dict = torch.load(prepared_queries_location)
-
-    num_queries = len(feature_dict.keys())
-    queries = load_raw_queries(queries_location, to_load=num_queries)
-
-    # Iterate over queries to fill with pickled dictionary containing initialized features
-    for query in queries:
-        query.set_features_graph_views_from_dict(feature_dict)
-
-
 def load_queries_and_cardinalities(queries_location, cardinalities_location=None, to_load=None):
     if cardinalities_location:
         tqdm.write("Converting query strings to Query data structure...")
@@ -80,25 +56,6 @@ def load_queries_and_cardinalities(queries_location, cardinalities_location=None
             cardinalities = [query['y'] for query in queries_json ]
 
     return queries, cardinalities
-
-
-def prepare_pretraining_queries(env, queries, rdf2vec_vector_location, save_location=None,
-                                disable_progress_bar=False):
-    vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
-    rdf2vec_featurizer = FeaturizeQueriesRdf2Vec(env, vectors)
-    view_creator = FeaturizeQueryGraphQuadViews()
-
-    queries = rdf2vec_featurizer.run(queries, disable_progress_bar=disable_progress_bar)
-    queries = view_creator.run(queries, "edge_index", disable_progress_bar=disable_progress_bar)
-
-    # When preparing many queries this can be used to reuse the computations
-    if save_location:
-        features_dict = {}
-        for query in queries:
-            features_dict[query.query_string] = [query.features, query.query_graph_representations]
-        torch.save(features_dict, save_location)
-    return queries
-
 
 def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vector_location,
                               env,

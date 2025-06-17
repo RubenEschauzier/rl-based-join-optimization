@@ -15,7 +15,7 @@ class QueryToEdgeLabeledGraph:
 
     def transform(self, json_query):
         tp_features = self.encode_tp_rdf2vec(json_query['triple_patterns'], json_query['rdflib_patterns'])
-        edge_index, edge_features = self.to_edge_index(json_query['rdflib_patterns'])
+        edge_index, edge_features, tp_to_id = self.to_edge_index(json_query['rdflib_patterns'])
         edge_index, y, edge_features, tp_features = (torch_geometric.EdgeIndex(edge_index), torch.tensor(json_query['cardinality']),
                                                      torch.tensor(edge_features, dtype=torch.float32),
                                                      torch.tensor(tp_features))
@@ -24,16 +24,18 @@ class QueryToEdgeLabeledGraph:
                           edge_attr=edge_features_undirected, y=y,
                           query=json_query['query'],
                           triple_patterns=json_query['triple_patterns'],
-                          type=json_query['type'])
+                          type=json_query['type'],
+                          node_id_to_actual=tp_to_id
+                          )
         return data_query
 
     def to_edge_index(self, rdflib_tps):
         edge_index = [[], []]
         edge_features = []
+        tp_to_id = {tp: i for i, tp in enumerate(rdflib_tps)}
         for i in range(len(rdflib_tps)):
             outer_pattern = rdflib_tps[i]
             for j in range(i+1, len(rdflib_tps)):
-
                 inner_pattern = rdflib_tps[j]
                 if self.is_connected(outer_pattern, inner_pattern):
                     edge_feature = self.get_edge_feature_connection_type(outer_pattern, inner_pattern)
@@ -41,7 +43,7 @@ class QueryToEdgeLabeledGraph:
                     edge_index[1].append(j)
                     edge_features.append(edge_feature)
 
-        return edge_index, edge_features
+        return edge_index, edge_features, tp_to_id
 
     def is_connected(self, rdflib_tp1, rdflib_tp2):
         vars_tp1 = self.get_variables_tp(rdflib_tp1)

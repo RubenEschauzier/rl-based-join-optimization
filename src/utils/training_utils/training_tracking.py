@@ -1,6 +1,7 @@
 import builtins
 import os
 import json
+import warnings
 from datetime import datetime
 
 import torch
@@ -73,5 +74,14 @@ class ExperimentWriter:
         with open(os.path.join(epoch_dir, "best_values.json"), "w", encoding="utf-8") as f2:
             json.dump(best_values, f2, indent=2, sort_keys=True)
 
-        torch.save(model.state_dict(), os.path.join(epoch_dir, "model.pt"))
+        # Serialize model in separate directory
+        os.makedirs(os.path.join(epoch_dir, "model"), exist_ok=True)
+        try:
+            # If model has its own serialize_model() function we use that
+            model.serialize_model(os.path.join(epoch_dir, "model"))
+        except AttributeError as err:
+            warnings.warn("{} \n Falling back to default torch.save() call".format(err),
+                stacklevel=2
+            )
+            torch.save(model.state_dict(), os.path.join(epoch_dir, "model.pt"))
 

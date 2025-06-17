@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class TriplePatternPooling(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self):
         super(TriplePatternPooling, self).__init__()
 
     def forward(self, x, edge_index):

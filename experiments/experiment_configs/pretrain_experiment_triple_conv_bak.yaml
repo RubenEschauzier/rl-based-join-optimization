@@ -4,7 +4,7 @@ pretraining:
   endpoint: "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
   dataset: "data/pretrain_data/datasets/p_e_full_101"
   embeddings: "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
-  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head.yaml"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_large.yaml"
   occurrences_location: "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
   tp_cardinality_location: "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
   feature_type: "predicate_edge"

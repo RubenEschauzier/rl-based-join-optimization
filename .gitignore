@@ -188,5 +188,7 @@ data/*
 /data/pretrain_data/*
 
 /output/*
+/outputs
 
 /experiments/experiment_outputs/*
+/tensorboard_logs

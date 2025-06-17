@@ -21,6 +21,7 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn):
                                  edge_index=val_batch.edge_index,
                                  edge_attr=val_batch.edge_attr.double(),
                                  batch=val_batch.batch)
+            pred = pred[0]['output']
 
         loss = loss_fn(pred.squeeze(), torch.log(val_batch.y))
         mae = torch.mean(torch.abs(torch.exp(pred.squeeze()) - val_batch.y))
@@ -75,6 +76,8 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
                                            edge_index=batch.edge_index,
                                            edge_attr=batch.edge_attr.double(),
                                            batch = batch.batch)
+            # Assume only one cardinality estimation head
+            pred = pred[0]['output']
             y = torch.log(batch.y)
 
             loss = loss_fn(pred.squeeze(), y)

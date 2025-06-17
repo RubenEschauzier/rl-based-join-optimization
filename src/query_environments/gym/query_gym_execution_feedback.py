@@ -16,22 +16,26 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
 class QueryExecutionGymExecutionFeedback(gym.Env):
-    def __init__(self, query_dataset, feature_dim, query_embedder, env,
+    def __init__(self, query_dataset, query_embedder, env,
                  reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"], max_triples=20,
-                 alpha = .3, gamma = .99, train_mode=True):
+                 alpha = .3, gamma = .99, train_mode=True, feature_dim = None):
         super().__init__()
         # The environment used to execute queries and obtain rewards
         self.env = env
         self.reward_type = reward_type
         self.query_timeout = 200
+
         # Our frozen pretrained GNN embedding the query.
         self.query_embedder = query_embedder
-        for param in self.query_embedder.parameters():
-            param.requires_grad = False
+
         # If train_mode is off, the DataLoader will not shuffle the queries
         self.train_mode = train_mode
-        # Output feature size (lets infer this from the embedder instead
-        self.feature_dim = feature_dim
+        # Output feature size (lets infer this from the embedder instead)
+        if not feature_dim:
+            self.feature_dim = self.query_embedder.embedding_model[-1].nn[-1].out_features
+        else:
+            self.feature_dim = feature_dim
+
         # Max # of triples in query
         self.max_triples = max_triples
         # Dataset / loader of generated queries used to train RL algorithm on
@@ -79,7 +83,6 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
         # Use this to implement Tree-LSTM:
         # https://github.com/pyg-team/pytorch_geometric/issues/121?utm_source=chatgpt.com?utm_source=chatgpt.com
 
-        print(self._query.edge_index)
         # In this step function we have to define how the representations are updated by adding a join.
         # One idea is to use a simple MLP over the two joined representations to output a new representation. Other is
         # things like tree-lstm. Then I need to figure out a way to include the output of a model in the environment
@@ -120,6 +123,10 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
                                        edge_index=query.edge_index,
                                        edge_attr=query.edge_attr,
                                        batch=query.batch)
+        # Get the embedding head from the model
+        embedded = next(head_output['output']
+                        for head_output in embedded if head_output['output_type'] == 'triple_embedding')
+
         # Query graphs are with two edges to make undirected. These are simply duplicate embeddings so remove them
         # (n_triple_patterns, emb_size)
         embedded = embedded[::2]
