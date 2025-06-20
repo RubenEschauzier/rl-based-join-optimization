@@ -24,29 +24,6 @@ def main_policy_rl():
                                  4, .99, seed)
 
 
-def pretraining():
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
-
-    train_query_location = "data/pretrain_data/generated_queries/sub_sampled/star_queries_2_3_5.json"
-    dataset_root_location = "data/pretrain_data/generated_queries/sub_sampled_predicate_edge_undirected"
-
-    # test_watdiv_query_location = "data/pretrain_data/test_queries/watdiv/template_queries"
-    # test_watdiv_cardinality_location = "data/pretrain_data/test_queries/watdiv/template_cardinalities"
-
-    rdf2vec_vector_location = "data/output/entity_embeddings/rdf2vec_vectors_depth_2_quick.json"
-    rdf2vec_vector_location_dataset = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
-
-    model_config_location = "experiments/model_configs/triple_gine_conv_model.yaml"
-    ckp_directory = "data/output/cardinality_estimation/cardinality_estimation_reproduction"
-
-    n_epoch = 50
-    batch_size = 32
-    seed = 0
-    lr = 1e-4
-    main_pretraining_dataset(dataset_root_location, endpoint_location, rdf2vec_vector_location_dataset,
-                             model_config_location,
-                             n_epoch, batch_size, lr, seed)
-
 def main_q_learning_rl():
     pass
 

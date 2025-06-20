@@ -15,6 +15,7 @@ class QueryToEdgePredicateGraph:
         self.add_direction_feature = add_direction
 
     def transform(self, json_query):
+
         edge_index = [[], []]
         edge_attr = []
         term_to_id = self.map_terms_to_ids(json_query['rdflib_patterns'])
@@ -63,7 +64,8 @@ class QueryToEdgePredicateGraph:
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
                           triple_patterns=json_query['triple_patterns'],
-                          type=json_query['type'])
+                          type=json_query['type'],
+                          node_id_to_actual=term_to_id_nodes)
         return data_query
 
     def get_node_features(self, rdflib_tp, term_to_id):

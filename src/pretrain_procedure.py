@@ -71,6 +71,7 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
         train_losses = []
         # noinspection PyTypeChecker
         for batch in train_data_loader:
+            print(batch)
             optimizer.zero_grad()
             pred = gine_conv_model.forward(x=batch.x.double(),
                                            edge_index=batch.edge_index,
