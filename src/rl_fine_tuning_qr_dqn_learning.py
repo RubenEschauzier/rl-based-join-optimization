@@ -13,12 +13,14 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from torch.utils.tensorboard import SummaryWriter
 
 from src.models.model_instantiator import ModelFactory
+from src.models.rl_algorithms.maskable_qrdqn_policy import MaskableQRDQNPolicy
 from src.models.rl_algorithms.masked_replay_buffer import MaskedDictReplayBuffer
+from src.models.rl_algorithms.qrdqn_feature_extractors import QRDQNFeatureExtractor, QRDQNFeatureExtractorTreeLSTM
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_cardinality_estimation_feedback import QueryGymCardinalityEstimationFeedback
 from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
-from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN, QRDQNFeatureExtractor, MaskableQRDQNPolicy
+from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN
 
 
 def load_weights_from_pretraining(model_to_init, model_dir: str,
@@ -112,17 +114,14 @@ def make_env_cardinality_estimation(embedding_cardinality_model, dataset, train_
 if __name__ == "__main__":
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
-    queries_location = "data/pretrain_data/datasets/p_e_size_3_only_101"
+    queries_location = "data/pretrain_data/datasets/p_e_full_101"
     rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
     occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
     tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
     model_config = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
-    weights_path = (r"experiments/experiment_outputs/"
-                    r"pretrain_experiment_triple_conv-15-04-2025-19-54-41/epoch-40/"
-                    r"model.pt")
     model_directory = (r"experiments/experiment_outputs/"
-                       r"pretrain_experiment_triple_conv-15-06-2025-15-14-51"
-                       r"/epoch-36/model")
+                       r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
+                       r"/epoch-49/model")
 
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
@@ -139,6 +138,7 @@ if __name__ == "__main__":
                                   float_weights=True)
 
     gine_conv_model.embedding_model.eval()
+
     # Set the embedding head to eval too as these layers will be frozen
     embedding_head_name = "triple_embedding"
     if embedding_head_name in gine_conv_model.head_types:
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     freeze_weights(gine_conv_model)
 
     policy_kwargs = dict(
-        features_extractor_class=QRDQNFeatureExtractor,
+        features_extractor_class=QRDQNFeatureExtractorTreeLSTM,
         features_extractor_kwargs=dict(feature_dim=200),
     )
 
@@ -172,14 +172,14 @@ if __name__ == "__main__":
                           exploration_final_eps=0.05,
                           learning_starts=100,
                           verbose=1,
-                          buffer_size=10000,
+                          buffer_size=200000,
                           replay_buffer_class=MaskedDictReplayBuffer,
                           tensorboard_log="./tensorboard_logs/",
-                          device='cpu',
+                          device='cuda',
                           train_freq=(15, "episode"),
                           delayed_rewards=False
                           )
-    eval_dataset = val_dataset.shuffle()[:30]
+    eval_dataset = val_dataset.shuffle()
     eval_callback = MaskableEvalCallback(
         eval_env=val_env,
         use_masking=True,
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     #                       replay_buffer_class=MaskedDictReplayBuffer)
 
     # Train the model
-    model.learn(total_timesteps=20000, callback=eval_callback)
+    model.learn(total_timesteps=1000000, callback=eval_callback)
     model.save("TempModelNoRnn")
     mean_reward, std_reward = evaluate_policy(model, model.get_env(), n_eval_episodes=1000)
 

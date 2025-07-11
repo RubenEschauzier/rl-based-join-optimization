@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from typing import Type, Tuple
 
 import torch
@@ -11,20 +12,32 @@ from src.datastructures.query import Query, ProcessQuery
 
 
 class QueryCardinalityDataset(InMemoryDataset):
-    def __init__(self, root, featurizer, to_load=None, transform=None, pre_transform=None, pre_filter=None ):
+
+    def __init__(self, root, featurizer, load_mappings=True,
+                 to_load=None, transform=None, pre_transform=None, pre_filter=None ):
         self.featurizer = featurizer
         self.to_load = to_load
+        self.load_mappings = load_mappings
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
+        if os.path.exists(os.path.join(self.processed_dir, "node_mappings.json")) and load_mappings:
+            with open(os.path.join(self.processed_dir, "node_mappings.json"), "r") as fr:
+                mappings = json.load(fr)
+            self.data_mappings = mappings
 
+    def get(self, idx: int):
+        data = super().get(idx)
+        if self.load_mappings:
+            data.term_to_id = self.data_mappings[idx]
+
+        return data
 
     def raw_file_names(self):
         return [
             "fixed_stars_2025-03-30_18-49-33_3.json",
-            # "fixed_stars_2025-03-30_19-10-42_5.json",
-            # "fixed_stars_2025-04-13_14-17-45_8.json",
+            "fixed_stars_2025-03-30_19-10-42_5.json",
+            "fixed_stars_2025-04-13_14-17-45_8.json",
         ]
-
 
     def processed_file_names(self):
         return [
@@ -58,6 +71,17 @@ class QueryCardinalityDataset(InMemoryDataset):
         for i, query_type in enumerate(raw_queries_list):
             data_list.extend([self.featurizer(query) for query in query_type])
 
+        # Dictionary cannot be collated so it is saved seperately
+        node_mappings = []
+        for data in data_list:
+            node_mappings.append(data.id_to_term)
+            del data.id_to_term
+        self.data_mappings = node_mappings
+
+        with open(self.processed_dir + '/node_mappings.json', 'w') as fm:
+            # noinspection PyTypeChecker
+            json.dump(node_mappings, fm, indent=2)
+
         if self.pre_transform is not None:
             data_list = [self.pre_transform(data) for data in data_list ]
 
@@ -65,7 +89,6 @@ class QueryCardinalityDataset(InMemoryDataset):
             data_list = [self.transform(data) for data in data_list ]
 
         print("Loaded: {} queries".format(sum(len(sublist) for sublist in data_list)))
-
         self.save(data_list, self.processed_paths[0])
 
 def get_size_data(data):

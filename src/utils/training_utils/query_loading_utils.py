@@ -61,6 +61,7 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                               env,
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
                               validation_size=.2,
+                              load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
 
@@ -70,7 +71,8 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                                                     occurrences_location, tp_cardinality_location)
     dataset = QueryCardinalityDataset(root=queries_location,
                                       featurizer=featurizer_edge_labeled_graph,
-                                      to_load=to_load
+                                      to_load=to_load,
+                                      load_mappings=load_mappings,
                                       )
     dataset = dataset.shuffle()
     train_dataset = dataset[math.floor(len(dataset)*validation_size):]
@@ -97,7 +99,6 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
         query_to_graph = QueryToEdgePredicateGraph(vectors, query_env, term_occurrences=occurrences)
     else:
         raise NotImplementedError
-
     return functools.partial(query_to_graph.transform_undirected)
 
 if __name__ == '__main__':

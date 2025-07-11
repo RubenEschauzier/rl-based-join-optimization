@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import rdflib
 import torch
 import torch_geometric
@@ -33,8 +36,9 @@ class QueryToEdgePredicateGraph:
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
                           triple_patterns=json_query['triple_patterns'],
-                          type=json_query['type'],
-                          node_id_to_actual=term_to_id)
+                          type=json_query['type'])
+        data_query.id_to_term = {key.n3(): value for key, value in term_to_id.items()}
+
         return data_query
 
     def transform_undirected(self, json_query):
@@ -59,13 +63,13 @@ class QueryToEdgePredicateGraph:
         edge_attr = torch.tensor(edge_attr)
         edge_index = torch_geometric.EdgeIndex(edge_index)
         y = torch.tensor(json_query['cardinality'])
-
         data_query = Data(x=node_features, edge_index=edge_index,
                           edge_attr=edge_attr, y=y,
                           query=json_query['query'],
                           triple_patterns=json_query['triple_patterns'],
-                          type=json_query['type'],
-                          node_id_to_actual=term_to_id_nodes)
+                          type=json_query['type']
+                          )
+        data_query.id_to_term = {key.n3(): value for key, value in term_to_id_nodes.items()}
         return data_query
 
     def get_node_features(self, rdflib_tp, term_to_id):
@@ -78,16 +82,22 @@ class QueryToEdgePredicateGraph:
                     processed.add(term)
         return torch.tensor(node_features)
 
-    def term_to_embedding(self, term, term_to_id):
+    def term_to_embedding(self, term, term_to_id, log_occurrences = True):
         if type(term) == rdflib.term.Variable:
             var_embedding = [term_to_id[term]]
             var_embedding.extend([1] * self.vector_size)
             return var_embedding
         if type(term) == rdflib.term.URIRef or type(term) == rdflib.term.Literal:
             if self.term_occurrences and term.n3() in self.term_occurrences:
-                entity_embedding = [self.term_occurrences[term.n3()]]
+                term_count = self.term_occurrences[term.n3()]
             else:
-                entity_embedding = [self.get_term_count(term.n3())]
+                print("Counts not exist: {}".format(term.n3()))
+                term_count = self.get_term_count(term.n3())
+                print("Term count: {}".format(term_count))
+
+            if log_occurrences:
+                term_count = math.log(term_count)
+            entity_embedding = [term_count]
             if self.entity_embeddings.get(str(term)):
                 entity_embedding.extend(self.entity_embeddings.get(str(term)))
             else:
@@ -111,6 +121,7 @@ class QueryToEdgePredicateGraph:
                     term_to_id[entity] = term_id
                     term_id += 1
         return term_to_id
+
 
     def map_variables_to_ids(self, rdflib_tp):
         var_to_id = {}

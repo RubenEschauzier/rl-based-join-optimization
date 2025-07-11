@@ -17,8 +17,9 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
 class QueryExecutionGymExecutionFeedback(gym.Env):
     def __init__(self, query_dataset, query_embedder, env,
-                 reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"], max_triples=20,
-                 alpha = .3, gamma = .99, train_mode=True, feature_dim = None):
+                 reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"],
+                 max_triples=20,
+                 alpha = .3, gamma = .99, train_mode=True, feature_dim=None):
         super().__init__()
         # The environment used to execute queries and obtain rewards
         self.env = env
@@ -91,15 +92,13 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
             raise ValueError("Invalid action")
 
         self._joined[action] = 1
-        # Join order is defined from 0 to max_triples + 1 for processing purposes. 0 denotes not made joins
-        self.join_order[self.join_count] = action + 1
+        self.join_order[self.join_count] = action
         self.join_count += 1
 
         next_obs = self._build_obs()
         if self.join_count >= self.n_triples_query:
             # Set join order
-            join_order_true = self.retrieve_true_join_order(self.join_order)
-            join_order_trimmed = join_order_true[join_order_true != -1]
+            join_order_trimmed = self.join_order[self.join_order != -1]
             rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(self._query.query,
                                                                              join_order_trimmed,
                                                                              self._query.triple_patterns)
@@ -134,7 +133,7 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
         joined = torch.cat((torch.zeros(embedded.shape[0],dtype=torch.int8),
                             torch.ones(self.max_triples - embedded.shape[0], dtype=torch.int8)))
 
-        self.join_order = np.array([0] * (self.max_triples - 1))
+        self.join_order = np.array([-1] * (self.max_triples - 1))
         self.join_count = 0
         self.n_triples_query = embedded.shape[0]
         self._query = query
@@ -150,6 +149,7 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
             "join_order": self.join_order,
             "joined": self._joined
         }
+
     def _get_reward(self, query, env_result_policy, exec_time_policy, join_order_trimmed, reward_type):
         if reward_type == 'execution_time':
             reward_per_step_policy = [0] * join_order_trimmed.shape[0]
@@ -213,6 +213,7 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
 
     def action_masks(self):
         return self._joined
+
 
     # TODO: Also validate how execution times differ between the join orders for a single query
     #  (this is doable for 3 size queries not otherwise)

@@ -84,6 +84,12 @@ def embed_query_graphs(queries, embedding_models, training=True):
 def q_error_fn(pred, true, eps=1e-7):
     return torch.max(true / (pred + eps), pred / (true + eps))
 
+
+def mixed_mae_q_error_loss(alpha, pred, true):
+    mae = alpha * torch.nn.L1Loss(reduction='mean')(pred, true)
+    q_error =  (1 - alpha) * torch.mean(q_error_fn(torch.exp(pred), torch.exp(true)))
+    return mae + q_error
+
 def save_checkpoint(ckp_dir, optimizer, models, model_file_names, statistics):
     if not os.path.isdir(ckp_dir):
         os.mkdir(ckp_dir)
