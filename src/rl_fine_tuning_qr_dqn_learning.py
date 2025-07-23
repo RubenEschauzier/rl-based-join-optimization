@@ -119,9 +119,10 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
     train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
                                                            rdf2vec_vector_location, query_env,
                                                            "predicate_edge",
-                                                           validation_size=.05, to_load=None,
+                                                           validation_size=.02, to_load=None,
                                                            occurrences_location=occurrences_location,
-                                                           tp_cardinality_location=tp_cardinality_location)
+                                                           tp_cardinality_location=tp_cardinality_location,
+                                                           shuffle=True)
     model_factory_gine_conv = ModelFactory(model_config)
     gine_conv_model = model_factory_gine_conv.load_gine_conv()
     load_weights_from_pretraining(gine_conv_model, model_directory,
@@ -145,22 +146,9 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
                                               val_dataset.shuffle(),
                                               False,
                                               query_env,
-                                              enable_optimal_eval=False)
+                                              enable_optimal_eval=True)
 
     return train_env, val_env, train_dataset, val_dataset
-
-def prepare_parameters(endpoint_location, queries_location, rdf2vec_vector_location, occurrences_location,
-                       tp_cardinality_location, model_config, model_directory,
-                       extractor_class, extractor_kwargs):
-    train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location,
-                 model_config, model_directory)
-    policy_kwargs = dict(
-        features_extractor_class=extractor_class,
-        features_extractor_kwargs=extractor_kwargs,
-    )
-    return train_env, val_env, train_dataset, val_dataset, policy_kwargs
-
 
 
 def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
@@ -170,11 +158,17 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
                                      occurrences_location,
                                      tp_cardinality_location,
                                      model_config, model_directory,
-                                     extractor_class, extractor_kwargs
+                                     extractor_class, extractor_kwargs, net_arch
                                      ):
-    train_env, val_env, train_dataset, val_dataset, policy_kwargs = prepare_parameters(
-        endpoint_location, queries_location, rdf2vec_vector_location,occurrences_location, tp_cardinality_location,
-                 model_config, model_directory, extractor_class, extractor_kwargs)
+    train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+                 occurrences_location, tp_cardinality_location,
+                 model_config, model_directory)
+    policy_kwargs = dict(
+        features_extractor_class=extractor_class,
+        features_extractor_kwargs=extractor_kwargs,
+        net_arch=net_arch,
+    )
+
     model = MaskableQRDQN(MaskableQRDQNPolicy,
                           train_env,
                           policy_kwargs=policy_kwargs,
@@ -189,112 +183,30 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
                           device='cpu',
                           train_freq=(15, "episode"),
                           )
-    eval_dataset = val_dataset.shuffle()
+    print("Validation set contains {} queries".format(len(val_dataset)))
     eval_callback = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(val_env),
-        n_eval_episodes=min(len(eval_dataset), 1000),
-        eval_freq=2000,
+        n_eval_episodes=len(val_dataset),
+        eval_freq=10000,
         deterministic=True,
         render=False,
     )
 
     model.learn(total_timesteps=n_steps, callback=eval_callback)
     model.save(model_save_loc)
-# def run_qr_dqn_estimated_cardinality_training_tree_lstm(endpoint_location, queries_location, rdf2vec_vector_location,
-#                                                         occurrences_location, tp_cardinality_location,
-#                                                         model_config, model_directory):
-#     train_env, val_env, train_dataset, val_dataset, policy_kwargs = prepare_parameters(
-#         endpoint_location, queries_location, rdf2vec_vector_location,occurrences_location, tp_cardinality_location,
-#                  model_config, model_directory, QRDQNFeatureExtractorTreeLSTM, dict(feature_dim=200)
-#     )
-#     # train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
-#     #              occurrences_location, tp_cardinality_location,
-#     #              model_config, model_directory)
-#     # policy_kwargs = dict(
-#     #     features_extractor_class=QRDQNFeatureExtractorTreeLSTM,
-#     #     features_extractor_kwargs=dict(feature_dim=200),
-#     # )
-#
-#     model = MaskableQRDQN(MaskableQRDQNPolicy,
-#                           train_env,
-#                           policy_kwargs=policy_kwargs,
-#                           exploration_fraction=0.3,
-#                           exploration_initial_eps=1,
-#                           exploration_final_eps=0.05,
-#                           learning_starts=10000,
-#                           verbose=0,
-#                           buffer_size=150000,
-#                           replay_buffer_class=MaskedDictReplayBuffer,
-#                           tensorboard_log="./tensorboard_logs/",
-#                           device='cpu',
-#                           train_freq=(30, "episode"),
-#                           delayed_rewards=False
-#                           )
-#     eval_dataset = val_dataset.shuffle()
-#     eval_callback = MaskableEvalCallback(
-#         eval_env=Monitor(val_env),
-#         use_masking=True,
-#         n_eval_episodes=min(len(eval_dataset), 1000),
-#         eval_freq=10000,
-#         deterministic=True,
-#         render=False,
-#     )
-#
-#     # Train the model
-#     model.learn(total_timesteps=500000, callback=eval_callback)
-#     model.save("tree_lstm_qr_dqn")
-#     mean_reward, std_reward = evaluate_policy(model, model.get_env(), n_eval_episodes=1000)
-#
-#
-# def run_qr_dqn_estimated_cardinality_training_naive(endpoint_location, queries_location, rdf2vec_vector_location,
-#                  occurrences_location, tp_cardinality_location,
-#                  model_config, model_directory):
-#
-#     train_env, val_env, train_dataset, val_dataset, policy_kwargs = prepare_parameters(
-#         endpoint_location, queries_location, rdf2vec_vector_location,occurrences_location, tp_cardinality_location,
-#                  model_config, model_directory, QRDQNFeatureExtractor, dict(feature_dim=200)
-#     )
-#
-#     model = MaskableQRDQN(MaskableQRDQNPolicy,
-#                           train_env,
-#                           policy_kwargs=policy_kwargs,
-#                           exploration_fraction=0.3,
-#                           exploration_initial_eps=1,
-#                           exploration_final_eps=0.05,
-#                           learning_starts=10000,
-#                           verbose=0,
-#                           buffer_size=150000,
-#                           replay_buffer_class=MaskedDictReplayBuffer,
-#                           tensorboard_log="./tensorboard_logs/",
-#                           device='cpu',
-#                           train_freq=(30, "episode"),
-#                           delayed_rewards=False
-#                           )
-#     eval_dataset = val_dataset.shuffle()
-#     eval_callback = MaskableEvalCallback(
-#         eval_env=Monitor(val_env),
-#         use_masking=True,
-#         n_eval_episodes=min(len(eval_dataset), 1000),
-#         eval_freq=10000,
-#         deterministic=True,
-#         render=False,
-#     )
-#
-#     # Train the model
-#     model.learn(total_timesteps=500000, callback=eval_callback)
-#     model.save("tree_lstm_qr_dqn")
-#     mean_reward, std_reward = evaluate_policy(model, model.get_env(), n_eval_episodes=1000)
-#
 
-def run_ppo_estimated_cardinality(endpoint_location, queries_location, rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location,
-                 model_config, model_directory):
+def run_ppo_estimated_cardinality(n_steps, model_save_loc,
+                                  endpoint_location, queries_location, rdf2vec_vector_location,
+                                  occurrences_location, tp_cardinality_location,
+                                  model_config, model_directory,
+                                  extractor_class, extractor_kwargs
+                                  ):
     train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location,
                  model_config, model_directory)
     policy_kwargs = dict(
-        features_extractor_class=QRDQNFeatureExtractorTreeLSTM,
-        features_extractor_kwargs=dict(feature_dim=200),
+        features_extractor_class=extractor_class,
+        features_extractor_kwargs=extractor_kwargs,
     )
 
     def mask_fn(env):
@@ -324,9 +236,44 @@ def run_ppo_estimated_cardinality(endpoint_location, queries_location, rdf2vec_v
 
 
 def main_qr_dqn():
+    torch.manual_seed(0)
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
-    queries_location = "data/pretrain_data/datasets/p_e_size_3_only_101"
+    queries_location = "data/pretrain_data/datasets/p_e_size_3_5_101"
+    rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
+    occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
+    tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
+    model_config = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    model_directory = (r"experiments/experiment_outputs/"
+                       r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
+                       r"/epoch-49/model")
+
+    extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
+    if extractor_type == "tree_lstm":
+        run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/tree-lstm-3-only",
+                                         endpoint_location, queries_location, rdf2vec_vector_location,
+                                         occurrences_location, tp_cardinality_location,
+                                         model_config, model_directory,
+                                         extractor_class=QRDQNFeatureExtractorTreeLSTM,
+                                         extractor_kwargs=dict(feature_dim=200),
+                                         net_arch=[256, 256])
+    elif extractor_type == "naive":
+        run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/naive-3-only",
+                                         endpoint_location, queries_location, rdf2vec_vector_location,
+                                         occurrences_location, tp_cardinality_location,
+                                         model_config, model_directory,
+                                         extractor_class=QRDQNFeatureExtractor,
+                                         extractor_kwargs=dict(feature_dim=200),
+                                         net_arch=[256, 256])
+    else:
+        raise ValueError("Invalid extractor type: {}".format(extractor_type))
+
+def main_ppo():
+    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+
+    # queries_location = "data/pretrain_data/datasets/p_e_full_101"
+    queries_location = "data/pretrain_data/datasets/p_e_size_3_5_101"
+
     rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
     occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
     tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
@@ -336,14 +283,14 @@ def main_qr_dqn():
                        r"/epoch-49/model")
     extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
     if extractor_type == "tree_lstm":
-        run_qr_dqn_estimated_cardinality(100000, "experiments/experiment_outputs/tree-lstm-3-only",
-                                         endpoint_location, queries_location, rdf2vec_vector_location,
-                                         occurrences_location, tp_cardinality_location,
-                                         model_config, model_directory,
-                                         extractor_class=QRDQNFeatureExtractorTreeLSTM,
-                                         extractor_kwargs=dict(feature_dim=200))
+        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-tree-lstm-3-5",
+                                      endpoint_location, queries_location, rdf2vec_vector_location,
+                                      occurrences_location, tp_cardinality_location,
+                                      model_config, model_directory,
+                                      extractor_class=QRDQNFeatureExtractorTreeLSTM,
+                                      extractor_kwargs=dict(feature_dim=200))
     elif extractor_type == "naive":
-        run_qr_dqn_estimated_cardinality(100000, "experiments/experiment_outputs/naive-3-only",
+        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-naive-3-5-only",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
                                          occurrences_location, tp_cardinality_location,
                                          model_config, model_directory,
@@ -351,23 +298,6 @@ def main_qr_dqn():
                                          extractor_kwargs=dict(feature_dim=200))
     else:
         raise ValueError("Invalid extractor type: {}".format(extractor_type))
-
-def main_ppo():
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
-
-    # queries_location = "data/pretrain_data/datasets/p_e_full_101"
-    queries_location = "data/pretrain_data/datasets/p_e_size_3_only_101"
-
-    rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
-    occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
-    tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
-    model_config = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
-    model_directory = (r"experiments/experiment_outputs/"
-                       r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
-                       r"/epoch-49/model")
-    run_ppo_estimated_cardinality(endpoint_location, queries_location, rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location,
-                 model_config, model_directory)
 
 
 if __name__ == "__main__":

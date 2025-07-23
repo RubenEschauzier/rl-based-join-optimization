@@ -184,7 +184,6 @@ class EvalWithOptimalLoggingCallback(MaskableEvalCallback):
             list containing per-episode rewards and second containing per-episode lengths
             (in number of steps).
         """
-        print("Evaluate")
         if use_masking and not is_masking_supported(env):
             raise ValueError("Environment does not support action masking. Consider using ActionMasker wrapper")
 

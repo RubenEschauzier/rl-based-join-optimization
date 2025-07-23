@@ -113,16 +113,3 @@ class MaskableQRDQNPolicy(QRDQNPolicy):
             actions = actions.squeeze(axis=0)
 
         return actions, state  # type: ignore[return-value]
-
-
-    class InternalStateResetCallback(BaseCallback):
-        def __init__(self, verbose=0):
-            super().__init__(verbose)
-
-        def _on_step(self):
-            done = self.locals["dones"]
-
-            if done[0]:  # If episode ended
-                print("End episode resetting state")
-
-            return True  # Continue training

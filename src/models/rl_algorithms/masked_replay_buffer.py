@@ -60,7 +60,6 @@ class MaskedReplayBuffer(ReplayBuffer):
         super().reset()
 
     def reset(self) -> None:
-        print("WE CALLED RESET!")
         super().reset()
 
     def add(self, *args, action_masks: Optional[np.ndarray] = None, **kwargs):
@@ -150,7 +149,6 @@ class MaskedDictReplayBuffer(DictReplayBuffer):
 
 
     def reset(self) -> None:
-        print("CALL RESET")
         super().reset()
 
     def add(self, *args, action_masks: Optional[np.ndarray] = None, **kwargs):

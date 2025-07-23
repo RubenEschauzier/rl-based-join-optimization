@@ -367,7 +367,7 @@ class MaskableQRDQN(OffPolicyAlgorithm):
         losses = []
         for _ in range(gradient_steps):
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env) # type: ignore[union-attr]
             with torch.no_grad():
                 # Compute the quantiles of next observation
                 next_quantiles = self.quantile_net_target(replay_data.next_observations,
