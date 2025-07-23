@@ -68,16 +68,6 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
 
 
     def step(self, action):
-        # Here is what we'll do: One step is ONE query. This function will output a list of actions taken by the model,
-        # which are the actions and combine it with the representations. We store transitions in the replay buffer in
-        # such away that we can rebuild the computational graph.
-        # So we need not only base representations, but also the preceding joins.
-        # This way we can iteratively apply the tree-lstm to get back the representation and the gradient.
-
-        # Then for reward function we will follow the paper I found and try to look up if I can get blazegraph to output
-        # a cost. Furthermore, we will use curriculum learning (test it by using small queries first and see if it will
-        # train). Finally, we will include a latency tuning phase but this will be on virtual wall.
-
         # For actual model usage. I suggest combining cardinality estimation and QR-DQN to form a robust cardinality
         # estimation model.
 
@@ -214,6 +204,8 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
     def action_masks(self):
         return self._joined
 
+    def action_masks_ppo(self):
+        return (1 - self._joined).astype(bool)
 
     # TODO: Also validate how execution times differ between the join orders for a single query
     #  (this is doable for 3 size queries not otherwise)

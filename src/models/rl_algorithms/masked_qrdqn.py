@@ -119,7 +119,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             seed: Optional[int] = None,
             device: Union[torch.device, str] = "auto",
             _init_setup_model: bool = True,
-            delayed_rewards = False,
     ):
         super().__init__(
             policy,
@@ -156,7 +155,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
         # "epsilon" for the epsilon-greedy exploration
         self.exploration_rate = 0.0
         # Delayed rewards
-        self.delayed_rewards = delayed_rewards
         if "optimizer_class" not in self.policy_kwargs:
             self.policy_kwargs["optimizer_class"] = torch.optim.Adam
             # Proposed in the QR-DQN paper where `batch_size = 32`
@@ -255,7 +253,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
 
         if env.num_envs > 1:
             assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
-            assert self.delayed_rewards == False, "Delayed rewards does not work with multiple environments."
 
         if self.use_sde:
             self.actor.reset_noise(env.num_envs)
@@ -286,33 +283,33 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             # Only stop training if return value is False, not when it is None.
             if not callback.on_step():
                 return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
-            if self.delayed_rewards:
-                self._update_info_buffer(infos, dones)
-                for i in range(self.n_envs):
-                    # Retrieve reward and episode length if using Monitor wrapper
+            # if self.delayed_rewards:
+            #     self._update_info_buffer(infos, dones)
+            #     for i in range(self.n_envs):
+            #         # Retrieve reward and episode length if using Monitor wrapper
+            #
+            #         single_new_obs = OrderedDict()
+            #         for key, value in new_obs.items():
+            #             single_new_obs[key] = np.array([value[i]])
+            #
+            #         episode_buffer[i].append({
+            #             "buffer_action": np.array([buffer_actions[i]]),
+            #             "new_ob": single_new_obs,
+            #             "done": np.array([dones[i]]),
+            #             "info": np.array([infos[i]]),
+            #             "action_mask": np.array([action_masks[i]]) if action_masks is not None else None,
+            #         })
+            #
+            #         self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+            # else:
+            # Retrieve reward and episode length if using Monitor wrapper
+            self._update_info_buffer(infos, dones)
 
-                    single_new_obs = OrderedDict()
-                    for key, value in new_obs.items():
-                        single_new_obs[key] = np.array([value[i]])
+            # Store data in replay buffer (normalized action and unnormalized observation)
+            self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos,
+                                   action_masks=action_masks)
 
-                    episode_buffer[i].append({
-                        "buffer_action": np.array([buffer_actions[i]]),
-                        "new_ob": single_new_obs,
-                        "done": np.array([dones[i]]),
-                        "info": np.array([infos[i]]),
-                        "action_mask": np.array([action_masks[i]]) if action_masks is not None else None,
-                    })
-
-                    self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
-            else:
-                # Retrieve reward and episode length if using Monitor wrapper
-                self._update_info_buffer(infos, dones)
-
-                # Store data in replay buffer (normalized action and unnormalized observation)
-                self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos,
-                                       action_masks=action_masks)
-
-                self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 
             # For DQN, check if the target network should be updated
             # and update the exploration schedule
@@ -322,30 +319,30 @@ class MaskableQRDQN(OffPolicyAlgorithm):
 
             for idx, done in enumerate(dones):
                 if done:
-                    if self.delayed_rewards:
-                        # 1. Compute true rewards for this episode
-                        transitions = episode_buffer[idx]
-                        step_rewards = infos[idx]['reward_per_step']
-
-                        # 2. Store them step-by-step
-                        for j, step in enumerate(transitions):
-                            self._store_transition(
-                                replay_buffer,
-                                buffer_actions, new_obs, rewards, dones, infos,
-                                                   action_masks=action_masks)
-                            self._store_transition(
-                                replay_buffer,
-                                step["buffer_action"],
-                                step["new_ob"],
-                                step_rewards[j],
-                                step["done"],
-                                step["info"],
-                                action_masks=step["action_mask"] if step["action_mask"] is not None else None,
-                            )
-
-                        # 3. Clear buffer
-                        episode_buffer[idx] = []
-
+                    # if self.delayed_rewards:
+                    #     # 1. Compute true rewards for this episode
+                    #     transitions = episode_buffer[idx]
+                    #     step_rewards = infos[idx]['reward_per_step']
+                    #
+                    #     # 2. Store them step-by-step
+                    #     for j, step in enumerate(transitions):
+                    #         self._store_transition(
+                    #             replay_buffer,
+                    #             buffer_actions, new_obs, rewards, dones, infos,
+                    #                                action_masks=action_masks)
+                    #         self._store_transition(
+                    #             replay_buffer,
+                    #             step["buffer_action"],
+                    #             step["new_ob"],
+                    #             step_rewards[j],
+                    #             step["done"],
+                    #             step["info"],
+                    #             action_masks=step["action_mask"] if step["action_mask"] is not None else None,
+                    #         )
+                    #
+                    #     # 3. Clear buffer
+                    #     episode_buffer[idx] = []
+                    #
                     # Update stats
                     num_collected_episodes += 1
                     self._episode_num += 1
@@ -373,7 +370,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
             with torch.no_grad():
                 # Compute the quantiles of next observation
-                print("Here first call quantile network, line 376 masked_qrdqn.py")
                 next_quantiles = self.quantile_net_target(replay_data.next_observations,
                                                           action_masks=replay_data.action_masks)
                 # Compute the greedy actions which maximize the next Q values

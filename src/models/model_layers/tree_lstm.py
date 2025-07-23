@@ -117,7 +117,6 @@ class NAryTreeLSTM(MessagePassing, ABC):
     def forward(self, x, edge_index, h, c, orders):
         for order in orders:
             self.partial_dense_mapping = {}
-
             mask = order[edge_index[1]]
             masked_graph = edge_index[:, mask]
             i = 0

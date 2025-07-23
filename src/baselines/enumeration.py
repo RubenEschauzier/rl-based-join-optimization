@@ -1,0 +1,341 @@
+from typing import Dict, List, Set, Tuple,  Optional, Callable
+import re
+
+class JoinPlan:
+    """Represents a join plan with cost estimation"""
+
+    def __init__(self, left: Optional['JoinPlan'], right: Optional['JoinPlan'],
+                 entries: Set[int], estimated_size: float, left_deep: bool):
+        self.left = left
+        self.right = right
+        self.entries = entries
+        self.estimated_size = estimated_size
+        self.left_deep = left_deep
+        self.is_leaf = self.left is None or self.right is None
+        self.cost = self._calculate_cost()
+
+    def _calculate_cost(self) -> float:
+        """
+        Calculate cost using a simple cost function
+        Returns: calculated cost
+        """
+        # If either left or right is undefined, we are triple pattern
+        if self.is_leaf:
+            return self.estimated_size
+
+        if self.left_deep:
+            # Left deep plan cost is equivalent to Q-learning reward currently.
+            return self.left.cost + self.estimated_size
+        else:
+            if self.left.is_leaf:
+                return self.right.cost + self.estimated_size
+            elif self.right.is_leaf:
+                return self.left.cost + self.estimated_size
+            else:
+                return self.left.cost + self.right.cost + self.estimated_size
+            # join_cost = (self.left.estimated_size * self.right.estimated_size) + self.estimated_size
+            # return join_cost + self.left.cost + self.right.cost
+
+    def __str__(self) -> str:
+        return self._build_tree_string()
+
+    def _build_tree_string(self, indent: int = 0, prefix: str = "") -> str:
+        """
+        Build tree string representation recursively
+        """
+        # Current node representation
+        if not self.left or not self.right:
+            # Leaf node (triple pattern)
+            node_str = f"TP{sorted(self.entries)} (size: {self.estimated_size:.2f}, cost: {self.cost:.2f})"
+        else:
+            # Internal join node
+            join_type = "LD" if self.left_deep else "BT"  # Left-Deep or Bushy-Tree
+            node_str = f"Join[{join_type}] {sorted(self.entries)} (size: {self.estimated_size:.2f}, cost: {self.cost:.2f})"
+
+        result = " " * indent + prefix + node_str
+
+        # Add children if they exist
+        if self.left and self.right:
+            result += "\n" + self.left._build_tree_string(indent + 4, "├── L: ")
+            result += "\n" + self.right._build_tree_string(indent + 4, "└── R: ")
+
+        return result
+
+
+
+class JoinOrderEnumerator:
+    """
+    Enumerates join orders using dynamic programming with connected complement pairs (DPccp).
+    This algorithm finds optimal join orders for query optimization by exploring all possible
+    connected sub graphs and their complements.
+    """
+
+    def __init__(self, adjacency_list: Dict[int, List[int]],
+                 estimated_cardinality: Callable[[tuple], float], n_entries: int):
+        self.adjacency_list = adjacency_list
+        self.estimated_cardinality = estimated_cardinality
+        self.n_entries = n_entries
+
+    def search(self) -> [JoinPlan, JoinPlan]:
+        """Main search method that finds the optimal join plan"""
+        best_plan: Dict[tuple, JoinPlan] = {}
+        best_plan_left_deep: Dict[tuple, JoinPlan] = {}
+
+        # Initialize singleton plans
+        for i in range(self.n_entries):
+            singleton = {i}
+            singleton_key = (i,)
+            estimated_cardinality = self.estimated_cardinality(singleton_key)
+            best_plan[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, False)
+            best_plan_left_deep[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, True)
+
+        # Enumerate all connected subgraph-complement pairs
+        csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
+        for csg_cmp_pair in csg_cmp_pairs:
+            csg, cmp = csg_cmp_pair[0], csg_cmp_pair[1]
+            tree1_key = tuple(self._sort_array_asc(list(csg)))
+            tree2_key = tuple(self._sort_array_asc(list(cmp)))
+
+            tree1 = best_plan[tree1_key]
+            tree2 = best_plan[tree2_key]
+            new_entries = tree1.entries | tree2.entries
+
+            estimate_key = tuple(self._sort_array_asc(list(new_entries)))
+            estimate = self.estimated_cardinality(estimate_key)
+
+            self.update_best_plan(tree1, tree2, new_entries, estimate, best_plan, best_plan_left_deep, False)
+
+            # If tree2 key is size 1 we are working with left-deep plan
+            if len(tree2_key) == 1 or len(tree1_key) == 1:
+                tree1_left_deep = best_plan_left_deep[tree1_key]
+                tree2_left_deep = best_plan_left_deep[tree2_key]
+                self.update_best_plan(tree1_left_deep, tree2_left_deep,
+                                      new_entries, estimate, best_plan, best_plan_left_deep, True)
+
+
+        all_entries_key = tuple(list(range(self.n_entries)))
+        return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
+
+    def enumerate_csg_cmp_pairs(self, n_tps: int) -> List[Tuple[Set[int], Set[int]]]:
+        """Enumerate all connected subgraph-complement pairs"""
+        all_tps = set(range(n_tps))
+        csgs = self.enumerate_csg(n_tps)
+        csg_cmp_pairs: List[Tuple[Set[int], Set[int]]] = []
+
+        for csg in csgs:
+            cmps = self.enumerate_cmp(csg, all_tps)
+            for cmp in cmps:
+                csg_cmp_pairs.append((csg, cmp))
+
+        return csg_cmp_pairs
+
+    def enumerate_csg(self, n_tps: int) -> List[Set[int]]:
+        """Enumerate all connected sub graphs"""
+        csgs: List[Set[int]] = []
+        for i in range(n_tps - 1, -1, -1):
+            v_i = {i}
+            csgs.append(v_i)
+            self._enumerate_csg_recursive(csgs, v_i, set(range(i + 1)))
+        return csgs
+
+    def enumerate_cmp(self, tps_subset: Set[int], all_tps: Set[int]) -> List[Set[int]]:
+        """Enumerate complements for a given connected sub graph"""
+        cmps: List[Set[int]] = []
+        min_vertex = self._set_minimum(tps_subset)
+        x = self._reduce_set(min_vertex, all_tps) | tps_subset
+        neighbours = self._get_neighbours(tps_subset)
+
+        # Remove vertices that are in X from neighbours
+        for vertex in x:
+            neighbours.discard(vertex)
+
+        for vertex in self._sort_set_desc(neighbours):
+            cmps.append({vertex})
+            reduced_neighbours = self._reduce_set(vertex, neighbours)
+            self._enumerate_csg_recursive(
+                cmps,
+                {vertex},
+                x | reduced_neighbours
+            )
+        return cmps
+
+    def _enumerate_csg_recursive(self, csgs: List[Set[int]], s: Set[int], x: Set[int]):
+        """Recursively enumerate connected subgraphs"""
+        neighbours = self._get_neighbours(s)
+        # Remove vertices that are in X from neighbours
+        for vertex in x:
+            neighbours.discard(vertex)
+
+        subsets = self._get_all_subsets(neighbours)
+        for subset in subsets:
+            csgs.append(s | subset)
+
+        for subset in subsets:
+            self._enumerate_csg_recursive(csgs, s | subset, x | neighbours)
+
+    def update_best_plan(self, tree1, tree2, new_entries, estimate_size,
+                         best_plan, best_plan_left_deep,
+                         left_deep: bool):
+        if left_deep:
+            curr_plan_left = JoinPlan(tree1, tree2, new_entries, estimate_size, True)
+            curr_plan_right = JoinPlan(tree2, tree1, new_entries, estimate_size, True)
+            if len(tree1.entries) == 1:
+              curr_plan = curr_plan_right
+            elif len(tree2.entries) == 1:
+              curr_plan = curr_plan_left
+            else:
+                raise ValueError("Bushy plan passed to left-deep update")
+            curr_plan_key = tuple(self._sort_array_asc(list(curr_plan.entries)))
+            if (curr_plan_key not in best_plan_left_deep or
+                    best_plan_left_deep[curr_plan_key].cost > curr_plan.cost):
+                best_plan_left_deep[curr_plan_key] = curr_plan
+
+        else:
+            curr_plan_left = JoinPlan(tree1, tree2, new_entries, estimate_size, False)
+            curr_plan_right = JoinPlan(tree2, tree1, new_entries, estimate_size, False)
+            curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
+                         else curr_plan_left)
+
+            curr_plan_key = tuple(self._sort_array_asc(list(curr_plan.entries)))
+
+            if (curr_plan_key not in best_plan or
+                    best_plan[curr_plan_key].cost > curr_plan.cost):
+                best_plan[curr_plan_key] = curr_plan
+        return
+
+    def _get_neighbours(self, s: Set[int]) -> Set[int]:
+        """Get all neighbours of vertices in set S"""
+        neighbours: Set[int] = set()
+        for vertex in s:
+            if vertex in self.adjacency_list:
+                neighbours.update(self.adjacency_list[vertex])
+        return neighbours
+
+    @staticmethod
+    def _get_all_subsets(s: Set[int]) -> List[Set[int]]:
+        """Get all non-empty subsets of a set"""
+        subsets: List[Set[int]] = [set()]
+        for el in s:
+            last = len(subsets) - 1
+            for i in range(last + 1):
+                subsets.append(subsets[i] | {el})
+        # Remove empty set
+        return subsets[1:]
+
+    @staticmethod
+    def _reduce_set(i: int, s: Set[int]) -> Set[int]:
+        """Reduce set to elements <= i"""
+        return {vertex for vertex in s if vertex <= i}
+
+    @staticmethod
+    def _set_minimum(s: Set[int]) -> int:
+        """Get minimum element from set"""
+        return min(s)
+
+    @staticmethod
+    def _sort_set_desc(s: Set[int]) -> List[int]:
+        """Sort set in descending order"""
+        return sorted(s, reverse=True)
+
+    @staticmethod
+    def _sort_array_asc(arr: List[int]) -> List[int]:
+        """Sort array in ascending order"""
+        return sorted(arr)
+
+def build_adj_list(query):
+    # Parse each triple pattern to extract variables
+    triple_patterns = query.triple_patterns
+    parsed_patterns = []
+
+    for i, pattern in enumerate(triple_patterns):
+        # Create a simple SPARQL query to parse the pattern
+        variables = set(re.findall(r'\?[a-zA-Z0-9_]+', pattern))
+
+        parsed_patterns.append({
+            'index': i,
+            'pattern': pattern,
+            'variables': variables
+        })
+    # Create adjacency dictionary - regular dict since we're initializing all keys
+    adjacency_dict = {i: set() for i in range(len(triple_patterns))}
+
+    # Check each pair for shared variables
+    for i in range(len(parsed_patterns)):
+        for j in range(i + 1, len(parsed_patterns)):
+            vars_i = parsed_patterns[i]['variables']
+            vars_j = parsed_patterns[j]['variables']
+
+            if vars_i.intersection(vars_j):
+                adjacency_dict[i].add(j)
+                adjacency_dict[j].add(i)
+    # Convert to a list
+    adjacency_dict = {key: sorted(list(value)) for key, value in adjacency_dict.items()}
+    return adjacency_dict
+
+
+# def predict_cardinality(model, query, join_order, join_count):
+#     query_to_estimate = QueryGymCardinalityEstimationFeedback.reduced_form_query(query, join_order, join_count)
+#     with torch.no_grad():
+#         output = model.forward(x=query_to_estimate.x,
+#                                edge_index=query_to_estimate.edge_index,
+#                                edge_attr=query_to_estimate.edge_attr,
+#                                batch=query_to_estimate.batch)
+#         card =  float(next(head_output['output'] for head_output in output
+#                            if head_output['output_type'] == 'cardinality'))
+#     return card
+
+
+# def enumerate_optimal_order(query, bound_predict):
+#     adjacency_list = build_adj_list(query)
+#     return JoinOrderEnumerator(adjacency_list, bound_predict, len(query.triple_patterns)).search()
+
+if __name__ == '__main__':
+    pass
+    # queries_location = "data/pretrain_data/datasets/p_e_full_101"
+    # endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+    # rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
+    # occurrences_location = "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
+    # tp_cardinality_location = "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
+    #
+    # model_config = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    # model_directory = (r"experiments/experiment_outputs/"
+    #                    r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
+    #                    r"/epoch-49/model")
+    #
+    # query_env = BlazeGraphQueryEnvironment(endpoint_location)
+    # train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
+    #                                                        rdf2vec_vector_location, query_env,
+    #                                                        "predicate_edge",
+    #                                                        validation_size=.05, to_load=None,
+    #                                                        occurrences_location=occurrences_location,
+    #                                                        tp_cardinality_location=tp_cardinality_location,
+    #                                                        shuffle=False)
+    # loader = iter(DataLoader(train_dataset, batch_size=1, shuffle=True)) # type: ignore
+    #
+    # model_factory_gine_conv = ModelFactory(model_config)
+    # gine_conv_model = model_factory_gine_conv.load_gine_conv()
+    # load_weights_from_pretraining(gine_conv_model, model_directory,
+    #                               "embedding_model.pt",
+    #                               ["head_cardinality.pt"],
+    #                               float_weights=True)
+    #
+    # gine_conv_model.embedding_model.eval()
+    #
+    # # Set the embedding head to eval too as these layers will be frozen
+    # embedding_head_name = "triple_embedding"
+    # if embedding_head_name in gine_conv_model.head_types:
+    #     idx = gine_conv_model.head_types.index(embedding_head_name)
+    #     gine_conv_model.heads[idx].eval()
+    #
+    # query_test = next(loader)
+    # while len(query_test[0].triple_patterns) == 3:
+    #     query_test = next(loader)
+    #
+    #
+    # def bound_predict(join_order: Tuple):
+    #     return predict_cardinality(gine_conv_model, query_test, list(join_order), len(join_order))
+    #
+    #
+    # test_bushy, test_left_deep = enumerate_optimal_order(gine_conv_model, query_test[0], bound_predict)
+    # print(test_bushy)
+    # print(test_left_deep)

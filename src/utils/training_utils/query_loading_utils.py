@@ -62,7 +62,8 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
                               validation_size=.2,
                               load_mappings = True,
-                              to_load=None, occurrences_location=None, tp_cardinality_location=None,):
+                              to_load=None, occurrences_location=None, tp_cardinality_location=None,
+                              shuffle=True):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
 
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
@@ -74,7 +75,8 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                                       to_load=to_load,
                                       load_mappings=load_mappings,
                                       )
-    dataset = dataset.shuffle()
+    if shuffle:
+        dataset = dataset.shuffle()
     train_dataset = dataset[math.floor(len(dataset)*validation_size):]
     validation_dataset = dataset[:math.floor(len(dataset)*validation_size)]
 

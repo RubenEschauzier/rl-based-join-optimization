@@ -35,8 +35,8 @@ class QueryCardinalityDataset(InMemoryDataset):
     def raw_file_names(self):
         return [
             "fixed_stars_2025-03-30_18-49-33_3.json",
-            "fixed_stars_2025-03-30_19-10-42_5.json",
-            "fixed_stars_2025-04-13_14-17-45_8.json",
+            # "fixed_stars_2025-03-30_19-10-42_5.json",
+            # "fixed_stars_2025-04-13_14-17-45_8.json",
         ]
 
     def processed_file_names(self):

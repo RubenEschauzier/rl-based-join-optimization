@@ -25,11 +25,6 @@ class MaskableQuantileNetwork(QuantileNetwork):
         :param obs: Observation
         :return: The estimated quantiles for each action.
         """
-        # print("Obs in quantile network")
-        # print(obs)
-        # TODO: Translation from join order to feature extractor likely goes wrong in the preprocess of the
-        #  feature extractor!!
-        print(self.observation_space)
         quantiles = self.quantile_net(self.extract_features(obs, self.features_extractor))
         output = quantiles.view(-1, self.n_quantiles, int(self.action_space.n))
         return output

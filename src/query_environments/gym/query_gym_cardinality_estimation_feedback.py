@@ -5,11 +5,12 @@ import torch_geometric
 from torch_geometric import EdgeIndex
 from torch_geometric.data import Data
 
+from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
 
 
 class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
-    def __init__(self, **kwargs):
+    def __init__(self, enable_optimal_eval=False, **kwargs):
         super().__init__(**kwargs)
         self.observation_space = gym.spaces.Dict({
             # Default observation space
@@ -21,21 +22,31 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
                                          dtype=np.int64),
             # The order in which tree-lstm operations should be executed, denoting 1 if a parent node representation
             # should be computed in that pass
-            "lstm_order": gym.spaces.Box(low=0, high=1, shape=(self.max_triples-1,(self.max_triples-1)*2),
+            "lstm_order": gym.spaces.Box(low=0, high=1, shape=(self.max_triples-1, (self.max_triples*2)-1),
                                          dtype=np.int64),
             # What orders should be masked out as these are padding orders, 1 means it is NOT masked
             "lstm_order_mask": gym.spaces.Box(low=0, high=1, shape=(self.max_triples-1,),
                                               dtype=np.int64),
-
-            "joins_made": gym.spaces.Discrete(self.max_triples),
+            # How many joins have already been made
+            "joins_made": gym.spaces.Box(low=0, high=self.max_triples-1, shape=(1,), dtype=np.int64),
+            # Number of triple patterns in the query
+            "n_triples": gym.spaces.Box(low=0, high=self.max_triples-1, shape=(1,), dtype=np.int64)
         })
         self.join_graph = None
         self.lstm_order = None
         self.lstm_order_mask = None
 
+        # Evaluation of performance compared to dynamic programming optimal cost
+        self.enable_optimal_eval = enable_optimal_eval
+        self.optimal_plans_left_deep = {}
+        self.optimal_rewards_bushy = {}
+        self.optimal_rewards_left_deep = {}
+        self.last_optimal_reward = None
+
+
     def reset(self, seed=None, options=None):
         self.join_graph = np.zeros((2, (self.max_triples-1)*2), dtype=np.int64)
-        self.lstm_order = np.zeros((self.max_triples-1,(self.max_triples-1)*2), dtype=np.int64)
+        self.lstm_order = np.zeros((self.max_triples-1,(self.max_triples*2)-1), dtype=np.int64)
         self.lstm_order_mask = np.zeros((self.max_triples-1,), dtype=np.int64)
         obs, info = super().reset(seed=seed, options=options)
 
@@ -43,12 +54,27 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
         intermediate_join_padding = torch.zeros(
             (self.max_triples-1, self._result_embeddings.shape[1]),
             device=self._result_embeddings.device, dtype=self._result_embeddings.dtype)
+
         self._result_embeddings = torch.cat([self._result_embeddings, intermediate_join_padding], dim=0)
         obs['result_embeddings'] = self._result_embeddings
+
+        if self.enable_optimal_eval:
+            # Compute and cache optimal join order + reward if not seen before
+            if self._query.query not in self.optimal_plans_left_deep:
+                optimal_plan_bushy, optimal_plan_ld = self.get_optimal_order(self._query)
+                # optimal_reward = self.env.evaluate_plan(optimal_plan)
+                # self.optimal_orders[self.current_query_id] = optimal_plan
+                # self.optimal_rewards_left_deep[self._query.query] = optimal_plan_ld.cost
+                self.optimal_plans_left_deep[self._query.query] = optimal_plan_ld
+
+            self.last_optimal_reward = self.optimal_plans_left_deep[self._query.query].cost
+
         return obs, info
+
 
     def step(self, action):
         if action >= self.n_triples_query or self._joined[action] == 1:
+            print("RAISE?")
             raise ValueError("Invalid action")
 
         self._joined[action] = 1
@@ -61,10 +87,11 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
                                   join_order=self.join_order,
                                   join_count=self.join_count)
         done = False
+        infos = {}
         if self.join_count >= self.n_triples_query:
             done = True
-
-        return next_obs, reward, done, False, {}
+            infos["optimal_reward_left_deep"] = self.last_optimal_reward
+        return next_obs, reward, done, False, infos
 
     def _get_reward(self, query, join_order, join_count):
         query_to_estimate = self.reduced_form_query(query, join_order, join_count)
@@ -85,7 +112,8 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
             "join_graph": self.join_graph,
             "lstm_order": self.lstm_order,
             "lstm_order_mask": self.lstm_order_mask,
-            "joins_made": self.join_count
+            "joins_made": self.join_count,
+            "n_triples": self.n_triples_query,
         }
 
     def _build_tree_input(self):
@@ -104,9 +132,7 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
         # Subsequent joins
         elif self.join_count > 2:
             n_triple_patterns = self.n_triples_query
-            n_join_nodes = self.join_count - 1
 
-            # new_join = self.join_order[-1]
             # First two edges are added when join count = 2, then subsequent joins add two edges.
             index_to_add_edge = 2 + (self.join_count - 3)*2
             self.join_graph[0][index_to_add_edge] = self.join_order[self.join_count-1]
@@ -122,29 +148,25 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
 
             # Unmask this order
             self.lstm_order_mask[self.join_count - 2] = 1
-        else:
-            # No join yet, what to doooo
-            pass
 
-
-    def _build_order(self):
-        pass
-
-    def reduced_form_query(self, query, join_order, join_count):
+    @staticmethod
+    def reduced_form_query(query, join_order, join_count):
         # Only get set join_order, slice out all unset 0 padding entries of join order array
         triple_indexes_to_include = join_order[:join_count]
         reduced_triple_patterns = np.array(query.triple_patterns)[triple_indexes_to_include]
 
-        sub_sampled_term_attributes, old_to_new_id = self.sub_sample_term_features(query.x,
+        (sub_sampled_term_attributes,
+         old_to_new_id) = QueryGymCardinalityEstimationFeedback.sub_sample_term_features(query.x,
                                                                     query.triple_patterns,
                                                                     query.term_to_id,
                                                                     triple_indexes_to_include)
-        sub_sampled_edge_attr, sub_sampled_edge_index = self.sub_sample_edges(query.edge_attr,
+        (sub_sampled_edge_attr,
+         sub_sampled_edge_index) = QueryGymCardinalityEstimationFeedback.sub_sample_edges(query.edge_attr,
                                                                               query.edge_index,
                                                                               triple_indexes_to_include,
                                                                               old_to_new_id)
 
-        reduced_query_string = self.triple_patterns_to_query(reduced_triple_patterns)
+        reduced_query_string = QueryGymCardinalityEstimationFeedback.triple_patterns_to_query(reduced_triple_patterns)
         # Don't need y as this query will only be used for prediction target in RL training
         reduced_query_data = Data(
             x=sub_sampled_term_attributes,
@@ -156,6 +178,28 @@ class QueryGymCardinalityEstimationFeedback(QueryExecutionGymExecutionFeedback):
             type=query.type,
             batch=query.batch)
         return reduced_query_data
+
+    def get_optimal_order(self, query):
+        return self.enumerate_optimal_order(query)
+
+    def enumerate_optimal_order(self, query):
+        adjacency_list = build_adj_list(query)
+        return JoinOrderEnumerator(adjacency_list, self.bound_predict, len(query.triple_patterns)).search()
+
+    def bound_predict(self, join_order):
+        return self.predict_cardinality(self.query_embedder, self._query, list(join_order), len(join_order))
+
+    @staticmethod
+    def predict_cardinality(model, query, join_order, join_count):
+        query_to_estimate = QueryGymCardinalityEstimationFeedback.reduced_form_query(query, join_order, join_count)
+        with torch.no_grad():
+            output = model.forward(x=query_to_estimate.x,
+                                   edge_index=query_to_estimate.edge_index,
+                                   edge_attr=query_to_estimate.edge_attr,
+                                   batch=query_to_estimate.batch)
+            card = float(next(head_output['output'] for head_output in output
+                              if head_output['output_type'] == 'cardinality'))
+            return card
 
 
     @staticmethod
