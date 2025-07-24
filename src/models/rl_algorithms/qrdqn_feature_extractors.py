@@ -94,6 +94,8 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
 
     def forward(self, observations):
         """
+        Something is wrong: when using this extractor, the model learns to always do the same action / prediction.
+        Possible avenues of fixing: Maybe the model is unaware of what is joined and isn't?
         observations:
             - result_embeddings: (batch_size, max_triples, feature_dim)
             - join_embedding: (batch_size, feature_dim)

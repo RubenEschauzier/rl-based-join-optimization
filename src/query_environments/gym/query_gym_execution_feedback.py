@@ -207,8 +207,6 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
     def action_masks_ppo(self):
         return (1 - self._joined).astype(bool)
 
-    # TODO: Also validate how execution times differ between the join orders for a single query
-    #  (this is doable for 3 size queries not otherwise)
     def validate_cost_function(self, queries, n_to_validate, orders_per_query,
                                reward_type: Literal['intermediate_results', 'execution_time', "cost_ratio"]):
         loader = iter(DataLoader(queries, batch_size=1, shuffle=self.train_mode)) # type: ignore
@@ -241,20 +239,14 @@ class QueryExecutionGymExecutionFeedback(gym.Env):
 
         return [np.array(p) for p in seen]
 
-    @staticmethod
-    def retrieve_true_join_order(join_order):
-        return join_order - 1
 
     @staticmethod
     def query_plan_cost(units_out, counts):
         # We add first count to reward query plans with small initial scans
         cost = [counts[0]]
-        # cost = counts[0]
         for i in range(units_out.shape[0] - 1):
             # Join work assuming index-based nested loop join (should include a cost for hash join)
             cost.append(units_out[i]*counts[i+1])
-            # cost.append((units_out[i] * np.log(counts[i + 1]+1)))
-            # cost += (units_out[i] * np.log(counts[i + 1]+1))
         return cost
 
 

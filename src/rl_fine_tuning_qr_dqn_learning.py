@@ -199,7 +199,8 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
                                   endpoint_location, queries_location, rdf2vec_vector_location,
                                   occurrences_location, tp_cardinality_location,
                                   model_config, model_directory,
-                                  extractor_class, extractor_kwargs
+                                  extractor_class, extractor_kwargs,
+                                  net_arch
                                   ):
     train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location,
@@ -207,6 +208,7 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
+        net_arch=net_arch,
     )
 
     def mask_fn(env):
@@ -232,11 +234,11 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
         deterministic=True,
         render=False,
     )
-    model.learn(total_timesteps=500000, callback=eval_callback)
+    model.learn(total_timesteps=n_steps, callback=eval_callback)
+    model.save(model_save_loc)
 
 
 def main_qr_dqn():
-    torch.manual_seed(0)
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
     queries_location = "data/pretrain_data/datasets/p_e_size_3_5_101"
@@ -248,7 +250,7 @@ def main_qr_dqn():
                        r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
                        r"/epoch-49/model")
 
-    extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
+    extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
         run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/tree-lstm-3-only",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
@@ -281,24 +283,28 @@ def main_ppo():
     model_directory = (r"experiments/experiment_outputs/"
                        r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
                        r"/epoch-49/model")
-    extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
+    extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
         run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-tree-lstm-3-5",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
                                       occurrences_location, tp_cardinality_location,
                                       model_config, model_directory,
                                       extractor_class=QRDQNFeatureExtractorTreeLSTM,
-                                      extractor_kwargs=dict(feature_dim=200))
+                                      extractor_kwargs=dict(feature_dim=200),
+                                      net_arch=[256, 256])
     elif extractor_type == "naive":
-        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-naive-3-5-only",
-                                         endpoint_location, queries_location, rdf2vec_vector_location,
-                                         occurrences_location, tp_cardinality_location,
-                                         model_config, model_directory,
-                                         extractor_class=QRDQNFeatureExtractor,
-                                         extractor_kwargs=dict(feature_dim=200))
+        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-naive-3-5",
+                                      endpoint_location, queries_location, rdf2vec_vector_location,
+                                      occurrences_location, tp_cardinality_location,
+                                      model_config, model_directory,
+                                      extractor_class=QRDQNFeatureExtractor,
+                                      extractor_kwargs=dict(feature_dim=200),
+                                      net_arch=[256, 256])
     else:
         raise ValueError("Invalid extractor type: {}".format(extractor_type))
 
 
 if __name__ == "__main__":
-    main_qr_dqn()
+    torch.manual_seed(0)
+    main_ppo()
+    # main_qr_dqn()
