@@ -85,9 +85,19 @@ class OrderDynamicProgramming(gym.Wrapper):
             order.append(plan.right.entries.pop())
             return order
         join_order = np.array(traverse_plan(optimal_plan))
-        reward = -self.env.get_reward(query, join_order, len(join_order))
-        return reward
 
+        plan_reward = self.get_intermediate_cost_estimates(query, join_order)
+        return plan_reward
+
+    def get_intermediate_cost_estimates(self, query, join_order):
+        total = 0
+        for i in range(1, len(join_order)+1):
+            reward = self.env.get_reward(query, join_order[0:i], len(join_order[0:i]))
+            if isinstance(reward, (int, float)):
+                total += reward
+            else:
+                total += np.array(reward).squeeze().item()
+        return total
 
     def get_optimal_order(self, query):
         return self.enumerate_optimal_order(query)

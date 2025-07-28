@@ -115,14 +115,15 @@ def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, en
 def wrap_validation_environment_with_baseline(val_env):
     return OrderDynamicProgramming(val_env)
 
-def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+
+def prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location,
                  model_config, model_directory):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
                                                            rdf2vec_vector_location, query_env,
                                                            "predicate_edge",
-                                                           validation_size=.001, to_load=None,
+                                                           validation_size=.03, to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
                                                            shuffle=True)
@@ -143,14 +144,23 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
 
     # Freeze the weights
     freeze_weights(gine_conv_model)
+    return gine_conv_model, train_dataset, val_dataset, query_env
 
-    train_env = make_env_execution_cost(gine_conv_model, train_dataset, False, query_env)
-    val_env = make_env_execution_cost(gine_conv_model, val_dataset.shuffle(),
+def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env):
+    train_env = make_env_estimated_cost(emb_model, train_dataset, False, query_env)
+    val_env = make_env_estimated_cost(emb_model, val_dataset.shuffle(),
                                       False, query_env)
     val_env = wrap_validation_environment_with_baseline(val_env)
 
-    return train_env, val_env, train_dataset, val_dataset, gine_conv_model, query_env
+    return train_env, val_env
 
+def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env):
+    train_env = make_env_execution_cost(emb_model, train_dataset, False, query_env)
+    val_env = make_env_execution_cost(emb_model, val_dataset.shuffle(),
+                                      False, query_env)
+    val_env = wrap_validation_environment_with_baseline(val_env)
+
+    return train_env, val_env
 
 def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
                                      endpoint_location,
@@ -161,10 +171,11 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
                                      model_config, model_directory,
                                      extractor_class, extractor_kwargs, net_arch
                                      ):
-    train_env, val_env, train_dataset, val_dataset, emb_model, query_env = (
-        prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+    emb_model, train_dataset, val_dataset, query_env = (
+        prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
                      occurrences_location, tp_cardinality_location,
                      model_config, model_directory))
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -199,17 +210,19 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
     return model
 
 
-def run_ppo_estimated_cardinality(n_steps, model_save_loc,
+def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
+                                  model_save_loc_estimated, model_save_loc_fine_tuned,
                                   endpoint_location, queries_location, rdf2vec_vector_location,
                                   occurrences_location, tp_cardinality_location,
                                   model_config, model_directory,
                                   extractor_class, extractor_kwargs,
                                   net_arch
                                   ):
-    train_env, val_env, train_dataset, val_dataset, emb_model, query_env = (
-        prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+    emb_model, train_dataset, val_dataset, query_env = (
+        prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
                      occurrences_location, tp_cardinality_location,
                      model_config, model_directory))
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -235,15 +248,31 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
         eval_env=Monitor(val_env),
         use_masking=True,
         n_eval_episodes=len(val_dataset),
-        eval_freq=10,
+        eval_freq=5000,
         deterministic=True,
         render=False,
     )
     model.learn(total_timesteps=n_steps, callback=eval_callback)
-    model.save(model_save_loc)
-    return model, emb_model, query_env
+    model.save(model_save_loc_estimated)
 
-def finetune_ppo_execution_cost(ppo_model, n_steps, val_freq, emb_model, query_env):
+    # Finetune based on query execution. This is with fewer steps due to cost of executing queries
+    exec_train_env, exec_val_env = prepare_execution_cost_envs(
+        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env)
+    exec_train_env = ActionMasker(exec_train_env, mask_fn)
+    exec_val_env = ActionMasker(exec_val_env, mask_fn)
+    print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_queries])))
+
+    model.set_env(exec_train_env)
+    eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(exec_val_env),
+        use_masking=True,
+        n_eval_episodes=len(val_dataset[:n_eval_queries]),
+        eval_freq=500,
+        deterministic=True,
+        render=False,
+    )
+    model.save(model_save_loc_fine_tuned)
+    model.learn(total_timesteps=n_steps_fine_tune, callback=eval_callback_fine_tuned)
 
 def main_qr_dqn():
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
@@ -280,7 +309,6 @@ def main_qr_dqn():
 def main_ppo():
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
-    # queries_location = "data/pretrain_data/datasets/p_e_full_101"
     queries_location = "data/pretrain_data/datasets/p_e_size_3_5_101"
 
     rdf2vec_vector_location = "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
@@ -292,8 +320,9 @@ def main_ppo():
                        r"/epoch-49/model")
     extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
-        model, emb_model, query_env = run_ppo_estimated_cardinality(
-                                      500000, "experiments/experiment_outputs/ppo-tree-lstm-3-5",
+        run_ppo_estimated_cardinality(500000, 20000, 100,
+                 "experiments/experiment_outputs/ppo-lstm-3-5-cost-est",
+                 "experiments/experiment_outputs/ppo-lstm-3-5-fine-tuned",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
                                       occurrences_location, tp_cardinality_location,
                                       model_config, model_directory,
@@ -301,8 +330,9 @@ def main_ppo():
                                       extractor_kwargs=dict(feature_dim=200),
                                       net_arch=[256, 256])
     elif extractor_type == "naive":
-        model, emb_model, query_env = run_ppo_estimated_cardinality(
-                               500000, "experiments/experiment_outputs/ppo-naive-3-5",
+        run_ppo_estimated_cardinality(500000, 20000, 100,
+                 "experiments/experiment_outputs/ppo-naive-3-5-cost-est",
+                 "experiments/experiment_outputs/ppo-naive-3-5-fine-tuned",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
                                       occurrences_location, tp_cardinality_location,
                                       model_config, model_directory,
