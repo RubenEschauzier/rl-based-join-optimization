@@ -33,7 +33,6 @@ class BlazeGraphQueryEnvironment:
         return result, execution_time
 
     def run_default_optimizer(self, query, timeout, result_format, additional_params):
-
         start = time.time()
         result = self.query_runner.run_query(query.query_string, timeout, result_format, additional_params)
         execution_time = time.time() - start
@@ -93,7 +92,7 @@ class BlazeGraphQueryEnvironment:
             raise NotImplementedError()
 
     @staticmethod
-    def process_output(query_result, reward_type: Literal['intermediate-results', 'execution_time']):
+    def process_output(query_result, reward_type: Literal['intermediate-results', 'execution_time'], query=None):
         if reward_type == 'intermediate-results':
             # If the query timed out, return some very bad reward signal TBD
             if query_result == 'time-out':
@@ -146,7 +145,7 @@ class BlazeGraphQueryEnvironment:
                 len(join_order), len(triple_patterns)))
         # Turn off join order optimizer blazegraph
         rewritten_query_string = query.split('{')[0] + ' { \n'
-        rewritten_query_string += 'hint:Query hint:optimizer "None" . \n'
+        rewritten_query_string += 'hint:Query hint:optimizer "None" . \n hint:Query hint:analytic "true" . \n'
 
         for tp_index in join_order:
             rewritten_query_string += triple_patterns[tp_index] + '\n'

@@ -20,6 +20,8 @@ from src.models.rl_algorithms.masked_replay_buffer import MaskedDictReplayBuffer
 from src.models.rl_algorithms.qrdqn_feature_extractors import QRDQNFeatureExtractorTreeLSTM, QRDQNFeatureExtractor
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_cardinality_estimation_feedback import QueryGymCardinalityEstimationFeedback
+from src.query_environments.gym.query_gym_estimated_cost import QueryGymEstimatedCost
+from src.query_environments.gym.query_gym_execution_cost import QueryGymExecutionCost
 from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN
@@ -101,16 +103,22 @@ def scatter_plot_reward_execution_time(reward, execution_time):
 
 
 def make_env(embedding_model, dataset, train_mode, env):
-    #TODO For default without cardinality estimation we can only use the embedding head. By filtering on
-    # the head output type
     return QueryExecutionGymExecutionFeedback(dataset, embedding_model, env, reward_type='cost_ratio',
                                               train_mode=train_mode)
 
-def make_env_cardinality_estimation(embedding_cardinality_model, dataset, train_mode, env, enable_optimal_eval=False):
-    return QueryGymCardinalityEstimationFeedback(query_dataset=dataset,
-                                                 query_embedder=embedding_cardinality_model, env=env,
-                                                 reward_type='cost_ratio', train_mode=train_mode,
-                                                 enable_optimal_eval=enable_optimal_eval)
+
+def make_env_estimated_cost(embedding_cardinality_model, dataset, train_mode, env, enable_optimal_eval=False):
+    return QueryGymEstimatedCost(query_dataset=dataset,
+                                 query_embedder=embedding_cardinality_model,
+                                 env=env,
+                                 train_mode=train_mode)
+
+def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, env, enable_optimal_eval=False):
+    return QueryGymExecutionCost(query_timeout=40,
+                                 query_dataset=dataset,
+                                 query_embedder=embedding_cardinality_model,
+                                 env=env,
+                                 train_mode=train_mode)
 
 def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location,
@@ -141,8 +149,8 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
     # Freeze the weights
     freeze_weights(gine_conv_model)
 
-    train_env = make_env_cardinality_estimation(gine_conv_model, train_dataset, True, query_env)
-    val_env = make_env_cardinality_estimation(gine_conv_model,
+    train_env = make_env_execution_cost(gine_conv_model, train_dataset, False, query_env)
+    val_env = make_env_execution_cost(gine_conv_model,
                                               val_dataset.shuffle(),
                                               False,
                                               query_env,
