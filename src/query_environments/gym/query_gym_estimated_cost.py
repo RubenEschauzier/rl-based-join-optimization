@@ -7,19 +7,18 @@ from torch_geometric.data import Data
 
 from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.query_environments.gym.query_gym_base import QueryGymBase
-from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
 
 
 class QueryGymEstimatedCost(QueryGymBase):
 
-    def _get_reward(self):
-        query_to_estimate = self.reduced_form_query(self._query,
-                                                    self._join_order,
-                                                    self._joins_made)
-        output = self.query_embedder.forward(x=query_to_estimate.x,
-                                             edge_index=query_to_estimate.edge_index,
-                                             edge_attr=query_to_estimate.edge_attr,
-                                             batch=query_to_estimate.batch)
+    def get_reward(self, query, join_order, joins_made):
+        query_to_estimate = self.reduced_form_query(query,
+                                                    join_order,
+                                                    joins_made)
+        output = self._query_embedder.forward(x=query_to_estimate.x,
+                                              edge_index=query_to_estimate.edge_index,
+                                              edge_attr=query_to_estimate.edge_attr,
+                                              batch=query_to_estimate.batch)
         card =  next(head_output['output'] for head_output in output if head_output['output_type'] == 'cardinality')
         return -card
 

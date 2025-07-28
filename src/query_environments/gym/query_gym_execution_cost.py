@@ -11,17 +11,17 @@ class QueryGymExecutionCost(QueryGymBase):
         super().__init__(query_dataset, query_embedder, env, **kwargs)
         self._query_timeout = query_timeout
 
-    def _get_reward(self):
-        if self._joins_made >= self._n_triples_query:
-            join_order_trimmed = self._join_order[self._join_order != -1]
-            rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(self._query.query,
+    def get_reward(self, query, join_order, joins_made):
+        join_order_trimmed = join_order[join_order != -1]
+        if len(join_order_trimmed) >= len(query.triple_patterns):
+            rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
                                                                              join_order_trimmed,
-                                                                             self._query.triple_patterns)
+                                                                             query.triple_patterns)
             # Execute query to obtain selectivity
             env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON, {"explain": "True"})
 
             units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results",
-                                                                            self._query)
+                                                                            query)
 
             if status == "OK":
                 reward_per_step = QueryGymExecutionCost.query_plan_cost(units_out, counts)

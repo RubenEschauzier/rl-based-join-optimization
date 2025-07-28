@@ -57,7 +57,7 @@ class EvalWithOptimalLoggingCallback(MaskableEvalCallback):
             optimal_rewards_each_episode = []
             for ep_info in episode_infos:
                 if "optimal_reward_left_deep" in ep_info and ep_info["optimal_reward_left_deep"] is not None:
-                    optimal_rewards_each_episode.append(-ep_info["optimal_reward_left_deep"])
+                    optimal_rewards_each_episode.append(ep_info["optimal_reward_left_deep"])
             if len(optimal_rewards_each_episode) > 0:
                 self.logger.record("eval/optimal_reward", np.mean(optimal_rewards_each_episode))
                 self.logger.record("eval/std_optimal_reward", np.std(optimal_rewards_each_episode))

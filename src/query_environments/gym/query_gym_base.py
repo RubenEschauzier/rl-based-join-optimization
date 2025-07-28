@@ -12,13 +12,13 @@ class QueryGymBase(gym.Env):
         self.env = env
 
         # Our frozen pretrained GNN embedding the query.
-        self.query_embedder = query_embedder
+        self._query_embedder = query_embedder
 
         # If train_mode is off, the DataLoader will not shuffle the queries
         self.train_mode = train_mode
         # Output feature size (lets infer this from the embedder instead)
         if not feature_dim:
-            self.feature_dim = self.query_embedder.embedding_model[-1].nn[-1].out_features
+            self.feature_dim = self._query_embedder.embedding_model[-1].nn[-1].out_features
         else:
             self.feature_dim = feature_dim
 
@@ -71,10 +71,10 @@ class QueryGymBase(gym.Env):
         except StopIteration:
             self.query_loader = iter(DataLoader(self.query_dataset, batch_size=1, shuffle=self.train_mode)) # type: ignore
             query = next(self.query_loader)[0]
-        embedded = self.query_embedder.forward(x=query.x,
-                                       edge_index=query.edge_index,
-                                       edge_attr=query.edge_attr,
-                                       batch=query.batch)
+        embedded = self._query_embedder.forward(x=query.x,
+                                                edge_index=query.edge_index,
+                                                edge_attr=query.edge_attr,
+                                                batch=query.batch)
         # Get the embedding head from the model
         embedded = next(head_output['output']
                         for head_output in embedded if head_output['output_type'] == 'triple_embedding')
@@ -118,7 +118,7 @@ class QueryGymBase(gym.Env):
         self._joins_made += 1
 
         next_obs = self._build_obs()
-        reward = self._get_reward()
+        reward = self.get_reward(self._query, self._join_order, self._joins_made)
 
         done = False
         if self._joins_made >= self._n_triples_query:
@@ -185,6 +185,22 @@ class QueryGymBase(gym.Env):
         return {}
 
     @abstractmethod
-    def  _get_reward(self):
+    def  get_reward(self, query, join_order, joins_made):
         pass
+
+    @property
+    def query_embedder(self):
+        return self._query_embedder
+
+    @property
+    def query(self):
+        return self._query
+
+    @property
+    def join_order(self):
+        return self._join_order
+
+    @property
+    def joins_made(self):
+        return self._joins_made
 

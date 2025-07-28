@@ -1,4 +1,4 @@
-# Here reset with tree-lstm etc
+# Here reset with tree-lstm etc.
 # Then add step logic and then abstract function that calculates the reward, (either 0 for execution based or cardinaltiy based etc)
 # Then add step logic that calls abstract class get_infos (which is return {} for all except for one where it calculates best plan)
 # For best plan wrapper all it does is override or change the get_infos to include: get best_plan, call _get_reward() on it
@@ -8,7 +8,6 @@ from SPARQLWrapper import JSON
 
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_base import QueryGymBase
-from src.query_environments.gym.query_gym_execution_cost import QueryGymExecutionCost
 
 
 #https://sb3-contrib.readthedocs.io/en/master/modules/qrdqn.html
@@ -22,19 +21,19 @@ class QueryGymExecutionLatency(QueryGymBase):
 
         self.n_episodes = 0
 
-    def _get_reward(self):
-        if self._joins_made >= self._n_triples_query:
+    def get_reward(self, query, join_order, joins_made):
+        join_order_trimmed = join_order[join_order != -1]
+        if len(join_order_trimmed) >= len(query.triple_patterns):
             self.n_episodes += 1
 
-            join_order_trimmed = self._join_order[self._join_order != -1]
-            rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(self._query.query,
+            rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
                                                                              join_order_trimmed,
-                                                                             self._query.triple_patterns)
+                                                                             query.triple_patterns)
             # Execute query to obtain selectivity
             env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON, {"explain": "True"})
             if self._curriculum:
                 units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results",
-                                                                                self._query)
+                                                                                query)
 
                 if status == "OK":
                     reward_per_step = QueryGymExecutionLatency.query_plan_cost(units_out, counts)

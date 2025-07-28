@@ -6,10 +6,8 @@ import gymnasium as gym
 import torch.nn
 from matplotlib import pyplot as plt
 from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.wrappers import ActionMasker
 from scipy.stats import linregress, stats
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 
 from src.models.model_instantiator import ModelFactory
@@ -19,10 +17,9 @@ from src.models.rl_algorithms.maskable_qrdqn_policy import MaskableQRDQNPolicy
 from src.models.rl_algorithms.masked_replay_buffer import MaskedDictReplayBuffer
 from src.models.rl_algorithms.qrdqn_feature_extractors import QRDQNFeatureExtractorTreeLSTM, QRDQNFeatureExtractor
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
-from src.query_environments.gym.query_gym_cardinality_estimation_feedback import QueryGymCardinalityEstimationFeedback
 from src.query_environments.gym.query_gym_estimated_cost import QueryGymEstimatedCost
 from src.query_environments.gym.query_gym_execution_cost import QueryGymExecutionCost
-from src.query_environments.gym.query_gym_execution_feedback import QueryExecutionGymExecutionFeedback
+from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN
 
@@ -102,23 +99,21 @@ def scatter_plot_reward_execution_time(reward, execution_time):
     plt.show()
 
 
-def make_env(embedding_model, dataset, train_mode, env):
-    return QueryExecutionGymExecutionFeedback(dataset, embedding_model, env, reward_type='cost_ratio',
-                                              train_mode=train_mode)
-
-
-def make_env_estimated_cost(embedding_cardinality_model, dataset, train_mode, env, enable_optimal_eval=False):
+def make_env_estimated_cost(embedding_cardinality_model, dataset, train_mode, env):
     return QueryGymEstimatedCost(query_dataset=dataset,
                                  query_embedder=embedding_cardinality_model,
                                  env=env,
                                  train_mode=train_mode)
 
-def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, env, enable_optimal_eval=False):
+def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, env):
     return QueryGymExecutionCost(query_timeout=40,
                                  query_dataset=dataset,
                                  query_embedder=embedding_cardinality_model,
                                  env=env,
                                  train_mode=train_mode)
+
+def wrap_validation_environment_with_baseline(val_env):
+    return OrderDynamicProgramming(val_env)
 
 def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location,
@@ -127,7 +122,7 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
     train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
                                                            rdf2vec_vector_location, query_env,
                                                            "predicate_edge",
-                                                           validation_size=.02, to_load=None,
+                                                           validation_size=.001, to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
                                                            shuffle=True)
@@ -150,13 +145,11 @@ def prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
     freeze_weights(gine_conv_model)
 
     train_env = make_env_execution_cost(gine_conv_model, train_dataset, False, query_env)
-    val_env = make_env_execution_cost(gine_conv_model,
-                                              val_dataset.shuffle(),
-                                              False,
-                                              query_env,
-                                              enable_optimal_eval=True)
+    val_env = make_env_execution_cost(gine_conv_model, val_dataset.shuffle(),
+                                      False, query_env)
+    val_env = wrap_validation_environment_with_baseline(val_env)
 
-    return train_env, val_env, train_dataset, val_dataset
+    return train_env, val_env, train_dataset, val_dataset, gine_conv_model, query_env
 
 
 def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
@@ -168,9 +161,10 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
                                      model_config, model_directory,
                                      extractor_class, extractor_kwargs, net_arch
                                      ):
-    train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location,
-                 model_config, model_directory)
+    train_env, val_env, train_dataset, val_dataset, emb_model, query_env = (
+        prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+                     occurrences_location, tp_cardinality_location,
+                     model_config, model_directory))
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -202,6 +196,8 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
 
     model.learn(total_timesteps=n_steps, callback=eval_callback)
     model.save(model_save_loc)
+    return model
+
 
 def run_ppo_estimated_cardinality(n_steps, model_save_loc,
                                   endpoint_location, queries_location, rdf2vec_vector_location,
@@ -210,9 +206,10 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
                                   extractor_class, extractor_kwargs,
                                   net_arch
                                   ):
-    train_env, val_env, train_dataset, val_dataset = prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location,
-                 model_config, model_directory)
+    train_env, val_env, train_dataset, val_dataset, emb_model, query_env = (
+        prepare_envs(endpoint_location, queries_location, rdf2vec_vector_location,
+                     occurrences_location, tp_cardinality_location,
+                     model_config, model_directory))
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -238,13 +235,15 @@ def run_ppo_estimated_cardinality(n_steps, model_save_loc,
         eval_env=Monitor(val_env),
         use_masking=True,
         n_eval_episodes=len(val_dataset),
-        eval_freq=10000,
+        eval_freq=10,
         deterministic=True,
         render=False,
     )
     model.learn(total_timesteps=n_steps, callback=eval_callback)
     model.save(model_save_loc)
+    return model, emb_model, query_env
 
+def finetune_ppo_execution_cost(ppo_model, n_steps, val_freq, emb_model, query_env):
 
 def main_qr_dqn():
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
@@ -260,7 +259,7 @@ def main_qr_dqn():
 
     extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
-        run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/tree-lstm-3-only",
+        model = run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/tree-lstm-3-only",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
                                          occurrences_location, tp_cardinality_location,
                                          model_config, model_directory,
@@ -268,7 +267,7 @@ def main_qr_dqn():
                                          extractor_kwargs=dict(feature_dim=200),
                                          net_arch=[256, 256])
     elif extractor_type == "naive":
-        run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/naive-3-only",
+        model = run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/naive-3-only",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
                                          occurrences_location, tp_cardinality_location,
                                          model_config, model_directory,
@@ -293,7 +292,8 @@ def main_ppo():
                        r"/epoch-49/model")
     extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
-        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-tree-lstm-3-5",
+        model, emb_model, query_env = run_ppo_estimated_cardinality(
+                                      500000, "experiments/experiment_outputs/ppo-tree-lstm-3-5",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
                                       occurrences_location, tp_cardinality_location,
                                       model_config, model_directory,
@@ -301,7 +301,8 @@ def main_ppo():
                                       extractor_kwargs=dict(feature_dim=200),
                                       net_arch=[256, 256])
     elif extractor_type == "naive":
-        run_ppo_estimated_cardinality(500000, "experiments/experiment_outputs/ppo-naive-3-5",
+        model, emb_model, query_env = run_ppo_estimated_cardinality(
+                               500000, "experiments/experiment_outputs/ppo-naive-3-5",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
                                       occurrences_location, tp_cardinality_location,
                                       model_config, model_directory,
