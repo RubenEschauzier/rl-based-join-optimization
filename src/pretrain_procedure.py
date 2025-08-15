@@ -137,4 +137,5 @@ def main_pretraining_dataset(queries_location, endpoint_location, rdf2vec_vector
                                                            tp_cardinality_location=tp_cardinality_location)
     run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location,'cpu', n_epoch, batch_size, lr,
                             seed, test_queries=test_queries, test_cardinalities=test_cardinalities)
+    return train_dataset, val_dataset
 

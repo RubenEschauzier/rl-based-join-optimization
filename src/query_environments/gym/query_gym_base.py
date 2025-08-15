@@ -16,6 +16,7 @@ class QueryGymBase(gym.Env):
 
         # If train_mode is off, the DataLoader will not shuffle the queries
         self.train_mode = train_mode
+
         # Output feature size (lets infer this from the embedder instead)
         if not feature_dim:
             self.feature_dim = self._query_embedder.embedding_model[-1].nn[-1].out_features
@@ -118,7 +119,7 @@ class QueryGymBase(gym.Env):
         self._joins_made += 1
 
         next_obs = self._build_obs()
-        reward = self.get_reward(self._query, self._join_order, self._joins_made)
+        reward, _ = self.get_reward(self._query, self._join_order, self._joins_made)
 
         done = False
         if self._joins_made >= self._n_triples_query:

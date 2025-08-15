@@ -7,6 +7,7 @@ import torch
 import json
 from tqdm import tqdm
 
+from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
 from src.datastructures.query import Query
 from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
@@ -70,8 +71,10 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                                                     vectors, env,
                                                     rdf2vec_vector_location, endpoint_location,
                                                     occurrences_location, tp_cardinality_location)
+    post_processor = filter_duplicate_subject_predicate_combinations
     dataset = QueryCardinalityDataset(root=queries_location,
                                       featurizer=featurizer_edge_labeled_graph,
+                                      post_processor=post_processor,
                                       to_load=to_load,
                                       load_mappings=load_mappings,
                                       )

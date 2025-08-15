@@ -72,6 +72,7 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict, feature_dim):
         super().__init__(observation_space, features_dim=feature_dim)
 
+        self.max_join_masks = observation_space["joined"].shape[0]  # max_triples
         self.max_triples = observation_space["result_embeddings"].shape[0]  # max_triples
         self.feature_dim = feature_dim
 
@@ -91,6 +92,16 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
 
         # Intermediate join_embedding, this will give a learnable dummy 'x' value for intermediate joins
         self.int_join_emb = nn.Embedding(1, feature_dim)
+
+        # Embed the mask to allow model to learn what actions are invalid
+        self.mask_embedder = nn.Sequential(
+            nn.Linear(self.max_join_masks, self.max_join_masks),
+            nn.ReLU(),
+            nn.Linear(self.max_join_masks, self.max_join_masks),
+            nn.ReLU()
+        )
+
+        self.representation_contractor = nn.Linear(feature_dim+self.max_join_masks, self.feature_dim)
 
     def forward(self, observations):
         """
@@ -177,7 +188,8 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
                 x_c, edge_index_state, h_c, c_c, order_state)
             state_embeddings.append(h_state[-1])
 
-        return torch.stack(state_embeddings)
+        mask_emb = self.mask_embedder(joined)
+        return self.representation_contractor(torch.concat((torch.stack(state_embeddings), mask_emb), dim=1))
 
     @staticmethod
     def get_un_joined_embeddings(joined, x):

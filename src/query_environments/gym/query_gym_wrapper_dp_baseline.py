@@ -12,7 +12,7 @@ class OrderDynamicProgramming(gym.Wrapper):
     to a custom gymnasium environment.
     """
 
-    def __init__(self, env: QueryGymBase):
+    def __init__(self, env: QueryGymBase, cache_optimal_cost=True):
         """
         Initialize the wrapper.
 
@@ -21,6 +21,8 @@ class OrderDynamicProgramming(gym.Wrapper):
         """
         super().__init__(env)
         self.env: QueryGymBase = env
+        self.cache_optimal_cost = cache_optimal_cost
+
         # Cache for optimal plans (left-deep)
         self.optimal_plans_left_deep = {}
         self.optimal_rewards_left_deep = {}
@@ -47,7 +49,7 @@ class OrderDynamicProgramming(gym.Wrapper):
         current_query = self.env.query
 
         # Compute and cache optimal join order if not seen before
-        if current_query.query not in self.optimal_plans_left_deep:
+        if current_query.query not in self.optimal_plans_left_deep or not self.cache_optimal_cost:
             optimal_plan_bushy, optimal_plan_ld = self.get_optimal_order(current_query)
             reward_plan = self.get_reward_left_deep_plan(current_query, optimal_plan_ld)
             self.optimal_plans_left_deep[current_query.query] = optimal_plan_ld
@@ -92,7 +94,7 @@ class OrderDynamicProgramming(gym.Wrapper):
     def get_intermediate_cost_estimates(self, query, join_order):
         total = 0
         for i in range(1, len(join_order)+1):
-            reward = self.env.get_reward(query, join_order[0:i], len(join_order[0:i]))
+            reward, _ = self.env.get_reward(query, join_order[0:i], len(join_order[0:i]))
             if isinstance(reward, (int, float)):
                 total += reward
             else:

@@ -1,21 +1,17 @@
 import json
 import os
-import pickle
-from typing import Type, Tuple
-
-import torch
-from torch_geometric.data import InMemoryDataset, download_url, Dataset
-from torch_geometric.data.data import BaseData, Data
-from torch_geometric.io import fs
+from torch_geometric.data import InMemoryDataset
+from tqdm import tqdm
 
 from src.datastructures.query import Query, ProcessQuery
 
 
 class QueryCardinalityDataset(InMemoryDataset):
 
-    def __init__(self, root, featurizer, load_mappings=True,
+    def __init__(self, root, featurizer, post_processor = None, load_mappings=True,
                  to_load=None, transform=None, pre_transform=None, pre_filter=None ):
         self.featurizer = featurizer
+        self.post_processor = post_processor
         self.to_load = to_load
         self.load_mappings = load_mappings
         super().__init__(root, transform, pre_transform, pre_filter)
@@ -46,13 +42,13 @@ class QueryCardinalityDataset(InMemoryDataset):
 
     def process(self):
         raw_queries_list = []
-
+        print("Processing {} files".format(len(self.raw_file_names())))
         for file in self.raw_file_names():
             queries = []
             path = os.path.join(self.raw_dir, file)
             with open(path, 'r') as f:
                 raw_data = json.load(f)
-            for i, data in enumerate(raw_data):
+            for i, data in tqdm(enumerate(raw_data)):
                 if not self.to_load or i < self.to_load:
                     tp_str, tp_rdflib = ProcessQuery.deconstruct_to_triple_pattern(data['query'])
                     # Temp fix for wrong generated queries during testing
@@ -71,7 +67,22 @@ class QueryCardinalityDataset(InMemoryDataset):
         for i, query_type in enumerate(raw_queries_list):
             data_list.extend([self.featurizer(query) for query in query_type])
 
-        # Dictionary cannot be collated so it is saved seperately
+        if self.pre_transform is not None:
+            data_list = [self.pre_transform(data) for data in data_list ]
+
+        if self.transform is not None:
+            data_list = [self.transform(data) for data in data_list ]
+        print("Before post_processor: {} queries".format(len(data_list)))
+
+        if self.post_processor is not None:
+            filtered_data = []
+            for data in data_list:
+                processed = self.post_processor(data)
+                if processed is not None:
+                    filtered_data.append(processed)
+            data_list = filtered_data
+
+        # Dictionary cannot be collated so it is saved separately
         node_mappings = []
         for data in data_list:
             node_mappings.append(data.id_to_term)
@@ -82,13 +93,7 @@ class QueryCardinalityDataset(InMemoryDataset):
             # noinspection PyTypeChecker
             json.dump(node_mappings, fm, indent=2)
 
-        if self.pre_transform is not None:
-            data_list = [self.pre_transform(data) for data in data_list ]
-
-        if self.transform is not None:
-            data_list = [self.transform(data) for data in data_list ]
-
-        print("Loaded: {} queries".format(sum(len(sublist) for sublist in data_list)))
+        print("Total: {} queries".format(len(data_list)))
         self.save(data_list, self.processed_paths[0])
 
 def get_size_data(data):

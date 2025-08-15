@@ -16,16 +16,17 @@ class BlazeGraphQueryEnvironment:
         self.query_runner = BlazeGraphQueryRunner(endpoint_url)
         pass
 
-    def run(self, query: Query, join_order, timeout: int, result_format, additional_params: dict):
+    def run(self, query: Query, join_order, timeout: int, result_format, additional_params: dict,
+            additional_headers=None):
         rewritten_query = self.set_join_order(query, join_order)
-        return self.run_raw(rewritten_query, timeout, result_format, additional_params)
+        return self.run_raw(rewritten_query, timeout, result_format, additional_params, additional_headers)
 
-    def run_raw(self, query: str, timeout: int, result_format, additional_params: dict):
+    def run_raw(self, query: str, timeout: int, result_format, additional_params: dict, additional_headers=None):
         start = time.time()
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore")
-                result = self.query_runner.run_query(query, timeout, result_format, additional_params)
+                result = self.query_runner.run_query(query, timeout, result_format, additional_params, additional_headers)
         except TimeoutError:
             return "time-out", timeout
 
@@ -71,6 +72,7 @@ class BlazeGraphQueryEnvironment:
             try:
                 explain_result = pd.read_html(query_result)
             except ValueError as e:
+                print(query_result)
                 print("FAIL")
                 return "FAIL"
 
@@ -92,7 +94,7 @@ class BlazeGraphQueryEnvironment:
             raise NotImplementedError()
 
     @staticmethod
-    def process_output(query_result, reward_type: Literal['intermediate-results', 'execution_time'], query=None):
+    def process_output(query_result, reward_type: Literal['intermediate-results', 'execution_time']):
         if reward_type == 'intermediate-results':
             # If the query timed out, return some very bad reward signal TBD
             if query_result == 'time-out':
@@ -100,15 +102,25 @@ class BlazeGraphQueryEnvironment:
             try:
                 explain_result = pd.read_html(query_result)
             except ValueError as e:
-                return [], [], [], "FAIL"
+                if "Statistics are not available (query already terminated)" in str(query_result):
+                    return [], [], [], "FAIL_FAST_QUERY_NO_STATS"
+                else:
+                    warnings.warn("FAIL NOT DUE TO NO AVAILABLE STATS")
+                    return [], [], [], "FAIL"
 
             if len(explain_result) == 0:
                 raise ValueError("Explain result of size 0")
-            if len(explain_result) == 1:
-                reward_information = explain_result[0][['unitsOut', 'bopSummary', 'joinRatio', 'fastRangeCount']]
-            else:
-                reward_information = explain_result[1][['unitsOut', 'bopSummary', 'joinRatio', 'fastRangeCount']]
-
+            try:
+                if len(explain_result) == 1:
+                    reward_information = explain_result[0][['unitsOut', 'bopSummary', 'joinRatio', 'fastRangeCount']]
+                else:
+                    reward_information = explain_result[1][['unitsOut', 'bopSummary', 'joinRatio', 'fastRangeCount']]
+            except KeyError:
+                if "TimeoutException" in str(query_result):
+                    return [], [], [], "TIME_OUT"
+                else:
+                    warnings.warn("FAIL IN PARSING EXPLAIN RESULT NOT CAUSED BY TIMEOUT")
+                    return [], [], [], "FAIL"
             # The operators with join in them are likely pipeline joins and of interest
             is_join = np.array(["Join" in x for x in np.array(reward_information['bopSummary'])])
             join_ratio = np.array(reward_information['joinRatio'])[is_join]
@@ -145,7 +157,7 @@ class BlazeGraphQueryEnvironment:
                 len(join_order), len(triple_patterns)))
         # Turn off join order optimizer blazegraph
         rewritten_query_string = query.split('{')[0] + ' { \n'
-        rewritten_query_string += 'hint:Query hint:optimizer "None" . \n hint:Query hint:analytic "true" . \n'
+        rewritten_query_string += 'hint:Query hint:optimizer "None" . \n'
 
         for tp_index in join_order:
             rewritten_query_string += triple_patterns[tp_index] + '\n'

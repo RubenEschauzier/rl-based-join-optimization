@@ -20,7 +20,7 @@ class QueryGymEstimatedCost(QueryGymBase):
                                               edge_attr=query_to_estimate.edge_attr,
                                               batch=query_to_estimate.batch)
         card =  next(head_output['output'] for head_output in output if head_output['output_type'] == 'cardinality')
-        return -card
+        return -card, None
 
 
     @staticmethod

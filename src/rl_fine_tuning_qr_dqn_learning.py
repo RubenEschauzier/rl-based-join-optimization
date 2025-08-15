@@ -19,9 +19,11 @@ from src.models.rl_algorithms.qrdqn_feature_extractors import QRDQNFeatureExtrac
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_estimated_cost import QueryGymEstimatedCost
 from src.query_environments.gym.query_gym_execution_cost import QueryGymExecutionCost
+from src.query_environments.gym.query_gym_execution_latency import QueryGymExecutionLatency
 from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.models.rl_algorithms.masked_qrdqn import MaskableQRDQN
+from src.utils.training_utils.utils import reset_value_head_only
 
 
 def load_weights_from_pretraining(model_to_init, model_dir: str,
@@ -106,14 +108,57 @@ def make_env_estimated_cost(embedding_cardinality_model, dataset, train_mode, en
                                  train_mode=train_mode)
 
 def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, env):
-    return QueryGymExecutionCost(query_timeout=40,
+    return QueryGymExecutionCost(query_timeout=30000,
                                  query_dataset=dataset,
                                  query_embedder=embedding_cardinality_model,
                                  env=env,
                                  train_mode=train_mode)
 
-def wrap_validation_environment_with_baseline(val_env):
-    return OrderDynamicProgramming(val_env)
+def make_env_execution_latency(embedding_cardinality_model, dataset, train_mode, env, curriculum):
+    return QueryGymExecutionLatency(query_timeout=30000,
+                                    query_dataset=dataset,
+                                    query_embedder=embedding_cardinality_model,
+                                    env=env,
+                                    train_mode=train_mode,
+                                    n_train_episodes=50000,
+                                    cost_frac=.2,
+                                    curriculum=curriculum)
+
+def wrap_validation_environment_with_baseline(val_env, cache_optimal_cost):
+    return OrderDynamicProgramming(val_env, cache_optimal_cost)
+
+def prepare_queries(query_env,
+                    queries_location, endpoint_location, rdf2vec_vector_location, occurrences_location,
+                    tp_cardinality_location,
+                    validation_size = .1):
+    train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
+                                                           rdf2vec_vector_location, query_env,
+                                                           "predicate_edge",
+                                                           validation_size=validation_size, to_load=None,
+                                                           occurrences_location=occurrences_location,
+                                                           tp_cardinality_location=tp_cardinality_location,
+                                                           shuffle=True)
+    return train_dataset, val_dataset
+
+def prepare_embedding_model(model_config, model_directory)
+    model_factory_gine_conv = ModelFactory(model_config)
+    gine_conv_model = model_factory_gine_conv.load_gine_conv()
+    load_weights_from_pretraining(gine_conv_model, model_directory,
+                                  "embedding_model.pt",
+                                  ["head_cardinality.pt"],
+                                  float_weights=True)
+
+    gine_conv_model.embedding_model.eval()
+
+    # Set the embedding head to eval too as these layers will be frozen
+    embedding_head_name = "triple_embedding"
+    if embedding_head_name in gine_conv_model.head_types:
+        idx = gine_conv_model.head_types.index(embedding_head_name)
+        gine_conv_model.heads[idx].eval()
+
+    # Freeze the weights
+    freeze_weights(gine_conv_model)
+    return gine_conv_model
 
 
 def prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
@@ -146,23 +191,31 @@ def prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_locat
     freeze_weights(gine_conv_model)
     return gine_conv_model, train_dataset, val_dataset, query_env
 
-def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env):
-    train_env = make_env_estimated_cost(emb_model, train_dataset, False, query_env)
+def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost):
+    train_env = make_env_estimated_cost(emb_model, train_dataset, True, query_env)
     val_env = make_env_estimated_cost(emb_model, val_dataset.shuffle(),
                                       False, query_env)
-    val_env = wrap_validation_environment_with_baseline(val_env)
+    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
 
     return train_env, val_env
 
-def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env):
-    train_env = make_env_execution_cost(emb_model, train_dataset, False, query_env)
+def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost):
+    train_env = make_env_execution_cost(emb_model, train_dataset, True, query_env)
     val_env = make_env_execution_cost(emb_model, val_dataset.shuffle(),
                                       False, query_env)
-    val_env = wrap_validation_environment_with_baseline(val_env)
+    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
 
     return train_env, val_env
 
-def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
+def prepare_execution_latency_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost, curriculum):
+    train_env = make_env_execution_latency(emb_model, train_dataset, True, query_env, curriculum)
+    val_env = make_env_execution_latency(emb_model, val_dataset.shuffle(),
+                                      False, query_env, curriculum)
+    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
+    return train_env, val_env
+
+def run_qr_dqn_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
+                                     model_save_loc_estimated, model_save_loc_fine_tuned,
                                      endpoint_location,
                                      queries_location,
                                      rdf2vec_vector_location,
@@ -175,7 +228,7 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
         prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
                      occurrences_location, tp_cardinality_location,
                      model_config, model_directory))
-    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env)
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -206,7 +259,29 @@ def run_qr_dqn_estimated_cardinality(n_steps, model_save_loc,
     )
 
     model.learn(total_timesteps=n_steps, callback=eval_callback)
-    model.save(model_save_loc)
+    model.save(model_save_loc_estimated)
+
+    # Finetune based on query execution. This is with fewer steps due to cost of executing queries
+    exec_train_env, exec_val_env = prepare_execution_cost_envs(
+        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False)
+    # exec_train_env, exec_val_env = prepare_execution_latency_envs(
+    #     emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False, False)
+
+    model.set_env(exec_train_env)
+    model.learning_rate = .1 * model.learning_rate
+    model.exploration_rate = .5
+
+    eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(exec_val_env),
+        use_masking=True,
+        n_eval_episodes=len(val_dataset[:n_eval_queries]),
+        eval_freq=500,
+        deterministic=True,
+        render=False,
+    )
+    model.learn(total_timesteps=n_steps_fine_tune, callback=eval_callback_fine_tuned)
+    model.save(model_save_loc_fine_tuned)
+
     return model
 
 
@@ -222,7 +297,7 @@ def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
         prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
                      occurrences_location, tp_cardinality_location,
                      model_config, model_directory))
-    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env)
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -257,12 +332,27 @@ def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
-        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env)
+        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False)
+
     exec_train_env = ActionMasker(exec_train_env, mask_fn)
     exec_val_env = ActionMasker(exec_val_env, mask_fn)
     print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_queries])))
-
+    #TODO: Finetuning collapses policy behavior as explained variance goes below zero.
+    # # Reinitialize only the critic
+    # model.policy.value_net.apply(model.policy._init_weights)
+    # Reinitialize value network. Also look into how QR-DQN behaves.
+    # Problem: in execution environment intermediate reward is 0, this leads to collapse of value function and thus
+    # policy updates.
+    # Solution? Use estimated reward as intermediate step, which introduces bias but smooths the reward compared to
+    # pretraining.
+    # Another: decay the estimated reward slowly
+    # Another (not sure yet look-up paper) http://chatgpt.com/c/6887ed05-7fec-832a-8af1-8f93783248a9
+    #TODO: Queries with multiple predicates are impossible to properly optimize and will cause a lot of timeouts due
+    # to cartesian products. REMOVE THEM / PREVENT THEM.
     model.set_env(exec_train_env)
+    # Ensure critic is reset due to change in reward function
+    reset_value_head_only(model)
+    model.learning_rate = .1 * model.learning_rate
     eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(exec_val_env),
         use_masking=True,
@@ -288,7 +378,9 @@ def main_qr_dqn():
 
     extractor_type: Literal["tree_lstm", "naive"] = "naive"
     if extractor_type == "tree_lstm":
-        model = run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/tree-lstm-3-only",
+        model = run_qr_dqn_estimated_cardinality(500000, 20000, 100,
+                    "experiments/experiment_outputs/qr_dqn_tree_lstm_3_5",
+                    "experiments/experiment_outputs/qr_dqn_tree_lstm_3_5_fine_tuned",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
                                          occurrences_location, tp_cardinality_location,
                                          model_config, model_directory,
@@ -296,7 +388,9 @@ def main_qr_dqn():
                                          extractor_kwargs=dict(feature_dim=200),
                                          net_arch=[256, 256])
     elif extractor_type == "naive":
-        model = run_qr_dqn_estimated_cardinality(500000, "experiments/experiment_outputs/naive-3-only",
+        model = run_qr_dqn_estimated_cardinality(400000, 50000, 100,
+                    "experiments/experiment_outputs/qr_dqn_tree_naive_3_5",
+                    "experiments/experiment_outputs/qr_dqn_tree_naive_3_5_fine_tuned",
                                          endpoint_location, queries_location, rdf2vec_vector_location,
                                          occurrences_location, tp_cardinality_location,
                                          model_config, model_directory,
@@ -307,6 +401,7 @@ def main_qr_dqn():
         raise ValueError("Invalid extractor type: {}".format(extractor_type))
 
 def main_ppo():
+    # TODO: Use same train-val-test split as pretraining?
     endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
 
     queries_location = "data/pretrain_data/datasets/p_e_size_3_5_101"
@@ -318,9 +413,9 @@ def main_ppo():
     model_directory = (r"experiments/experiment_outputs/"
                        r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
                        r"/epoch-49/model")
-    extractor_type: Literal["tree_lstm", "naive"] = "naive"
+    extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
     if extractor_type == "tree_lstm":
-        run_ppo_estimated_cardinality(500000, 20000, 100,
+        run_ppo_estimated_cardinality(100000, 40000, 100,
                  "experiments/experiment_outputs/ppo-lstm-3-5-cost-est",
                  "experiments/experiment_outputs/ppo-lstm-3-5-fine-tuned",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
@@ -330,7 +425,7 @@ def main_ppo():
                                       extractor_kwargs=dict(feature_dim=200),
                                       net_arch=[256, 256])
     elif extractor_type == "naive":
-        run_ppo_estimated_cardinality(500000, 20000, 100,
+        run_ppo_estimated_cardinality(100000, 40000, 100,
                  "experiments/experiment_outputs/ppo-naive-3-5-cost-est",
                  "experiments/experiment_outputs/ppo-naive-3-5-fine-tuned",
                                       endpoint_location, queries_location, rdf2vec_vector_location,
@@ -342,8 +437,32 @@ def main_ppo():
     else:
         raise ValueError("Invalid extractor type: {}".format(extractor_type))
 
+def main_rl_tuning(endpoint_location, model_config, model_directory, train_dataset=None, val_dataset=None,
+                   query_location_dict = None):
+    query_env = BlazeGraphQueryEnvironment(endpoint_location)
+    if query_location_dict:
+        train_dataset, val_dataset = prepare_queries(query_env,
+                                                     endpoint_location,
+                                                     query_location_dict['queries'],
+                                                     query_location_dict['rdf2vec_vectors'],
+                                                     query_location_dict['occurrences'],
+                                                     query_location_dict['tp_cardinalities'],
+                                                     )
+    if train_dataset is None or val_dataset is None:
+        raise ValueError("Either train or validation dataset was None and there is no query_location_directory given in"
+                         "config")
+    emb_model = prepare_embedding_model(model_config, model_directory)
 
 if __name__ == "__main__":
+    #TODO: Fix Tree-LSTM
+    #TODO: Make config based experiment for RL
+    #TODO: Train on full queries, train on full query sets with all different shapes
+    #TODO: Make functions that given trained RL model and trained pretrained model
+    # - tests on full validation set.
+    # - test on watdiv queries
+    # - test the variability in performance
+    #TODO: Ensure that pretraining train and validation sets are separated and are the same separation for RL training
+    #TODO: Check validity baseline
     torch.manual_seed(0)
     main_ppo()
     # main_qr_dqn()

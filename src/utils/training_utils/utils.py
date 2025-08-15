@@ -101,6 +101,15 @@ def save_checkpoint(ckp_dir, optimizer, models, model_file_names, statistics):
         torch.save(model.state_dict(), path.join(ckp_dir, filename))
 
 
+def reset_value_head_only(model):
+    # Get the last layer of the value network (the actual value head)
+    value_head = model.policy.value_net  # Usually the last Linear layer
+
+    if isinstance(value_head, torch.nn.Linear):
+        torch.nn.init.orthogonal_(value_head.weight, gain=1)
+        torch.nn.init.constant_(value_head.bias, 0)
+
+
 def register_debugging_hooks(module):
     def hook_fn(module, input, output):
         print(f"Layer: {module}")

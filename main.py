@@ -38,7 +38,7 @@ def main(cfg: DictConfig):
 
         writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_experiment_triple_conv",
                                   dict(c1), dict(config['model']))
-        main_pretraining_dataset(
+        train_set, val_set = main_pretraining_dataset(
             queries_location=c1.dataset,
             endpoint_location=c1.endpoint,
             rdf2vec_vector_location=c1.embeddings,

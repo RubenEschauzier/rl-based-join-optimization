@@ -30,25 +30,30 @@ class QueryGymExecutionLatency(QueryGymBase):
                                                                              join_order_trimmed,
                                                                              query.triple_patterns)
             # Execute query to obtain selectivity
-            env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON, {"explain": "True"})
-            if self._curriculum:
-                units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results",
-                                                                                query)
+            env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON,
+                                                     {},
+                                                     {"X-BIGDATA-MAX-QUERY-MILLIS": str(self._query_timeout + 1)}
+                                                     )
 
-                if status == "OK":
-                    reward_per_step = QueryGymExecutionLatency.query_plan_cost(units_out, counts)
-                    reward_per_step = np.log(reward_per_step)
-                    final_cost_policy = -np.sum(reward_per_step)
-                else:
-                    # Very large negative reward when query fails.
-                    final_cost_policy = -70
-                alpha = self._get_alpha()
-                reward = alpha * -exec_time + (1-alpha) * final_cost_policy
-                return reward
+            if self._curriculum:
+                raise NotImplementedError
+                # units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results",
+                #                                                                 query)
+                #
+                # if status == "OK":
+                #     reward_per_step = QueryGymExecutionLatency.query_plan_cost(units_out, counts)
+                #     reward_per_step = np.log(reward_per_step)
+                #     final_cost_policy = -np.sum(reward_per_step)
+                # else:
+                #     # Very large negative reward when query fails.
+                #     final_cost_policy = -70
+                # alpha = self._get_alpha()
+                # reward = alpha * -exec_time + (1-alpha) * final_cost_policy
+                # return reward
             else:
-                return -exec_time
+                return -exec_time, None
         else:
-            return 0
+            return 0, None
     def _get_alpha(self):
         return min(self.n_episodes / self.switch_point, 1)
 
