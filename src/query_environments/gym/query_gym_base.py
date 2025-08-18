@@ -98,8 +98,14 @@ class QueryGymBase(gym.Env):
         # Initialize internal variables for observation space
         self._joined = joined.numpy()
         self._join_order = np.array([-1] * (self.max_triples - 1))
+        # Join graph is edges: source -> target denoting join graph. So has given (max_triples - 1) joins needed and
+        # each join 2 edges, we get given shape.
         self._join_graph = np.zeros((2, (self.max_triples-1)*2), dtype=np.int64)
+        # Order (hierarchy) in which Tree-LSTM should be applied equal to n_joins (self.max_triples-1) and the number
+        # of nodes max_triples (triple patter nodes) + max_triples - 1 (join nodes)
+        # Order basically is a mask that says which _parent_ nodes (or target) should be computed
         self._lstm_order = np.zeros((self.max_triples-1,(self.max_triples*2)-1), dtype=np.int64)
+        # Mask to remove padding from lstm_order (probably can be done without)
         self._lstm_order_mask = np.zeros((self.max_triples-1,), dtype=np.int64)
         self._joins_made = 0
         self._n_triples_query = embedded.shape[0]
@@ -150,19 +156,16 @@ class QueryGymBase(gym.Env):
         }
 
     def _build_tree_input(self):
-        # First join
-        if self._joins_made == 2:
-            # First join is a special case
+        # Add selected join to a single child tree node
+        if self._joins_made == 1:
             self._join_graph[0][0] = self._join_order[0]
             self._join_graph[1][0] = self._n_triples_query
+            self._lstm_order[0][self._n_triples_query] = 1
+            self._lstm_order_mask[0] = 1
+        # Fill the other side of join, don't need to change the order, because it still is the same 'parent' join node
+        elif self._joins_made == 2:
             self._join_graph[0][1] = self._join_order[1]
             self._join_graph[1][1] = self._n_triples_query
-            # First order mask set join node to 1 to represent it should get its hidden state computed
-            self._lstm_order[0][self._n_triples_query] = 1
-            # Unmask the order we just made to show model that this is a valid order entry
-            self._lstm_order_mask[0] = 1
-
-        # Subsequent joins
         elif self._joins_made > 2:
             n_triple_patterns = self._n_triples_query
 
@@ -181,6 +184,38 @@ class QueryGymBase(gym.Env):
 
             # Unmask this order
             self._lstm_order_mask[self._joins_made - 2] = 1
+
+    # First join
+        # if self._joins_made == 2:
+        #     # First join is a special case
+        #     self._join_graph[0][0] = self._join_order[0]
+        #     self._join_graph[1][0] = self._n_triples_query
+        #     self._join_graph[0][1] = self._join_order[1]
+        #     self._join_graph[1][1] = self._n_triples_query
+        #     # First order mask set join node to 1 to represent it should get its hidden state computed
+        #     self._lstm_order[0][self._n_triples_query] = 1
+        #     # Unmask the order we just made to show model that this is a valid order entry
+        #     self._lstm_order_mask[0] = 1
+        #
+        # # Subsequent joins
+        # elif self._joins_made > 2:
+        #     n_triple_patterns = self._n_triples_query
+        #
+        #     # First two edges are added when join count = 2, then subsequent joins add two edges.
+        #     index_to_add_edge = 2 + (self._joins_made - 3)*2
+        #     self._join_graph[0][index_to_add_edge] = self._join_order[self._joins_made-1]
+        #     # The index representing the join increments by one for each join, starting from n_tps - 1
+        #     # The first two join counts increment it by 1, so subtract 1.
+        #     self._join_graph[1][index_to_add_edge] = n_triple_patterns - 1 + self._joins_made - 1
+        #     # The previous join is always included in the next (left-deep)
+        #     self._join_graph[0][index_to_add_edge+1] = n_triple_patterns - 1 + self._joins_made - 1 - 1
+        #     self._join_graph[1][index_to_add_edge+1] = n_triple_patterns - 1 + self._joins_made - 1
+        #
+        #     # Set the order array for the new join node
+        #     self._lstm_order[self._joins_made - 2][self._n_triples_query+(self._joins_made-2)] = 1
+        #
+        #     # Unmask this order
+        #     self._lstm_order_mask[self._joins_made - 2] = 1
 
     def _build_infos(self, done: bool):
         return {}

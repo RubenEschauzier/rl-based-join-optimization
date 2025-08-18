@@ -8,6 +8,7 @@ from matplotlib import pyplot as plt
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from scipy.stats import linregress, stats
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
 from src.models.model_instantiator import ModelFactory
@@ -140,7 +141,7 @@ def prepare_queries(query_env,
                                                            shuffle=True)
     return train_dataset, val_dataset
 
-def prepare_embedding_model(model_config, model_directory)
+def prepare_embedding_model(model_config, model_directory):
     model_factory_gine_conv = ModelFactory(model_config)
     gine_conv_model = model_factory_gine_conv.load_gine_conv()
     load_weights_from_pretraining(gine_conv_model, model_directory,
@@ -165,30 +166,10 @@ def prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_locat
                  occurrences_location, tp_cardinality_location,
                  model_config, model_directory):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
-                                                           rdf2vec_vector_location, query_env,
-                                                           "predicate_edge",
-                                                           validation_size=.03, to_load=None,
-                                                           occurrences_location=occurrences_location,
-                                                           tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle=True)
-    model_factory_gine_conv = ModelFactory(model_config)
-    gine_conv_model = model_factory_gine_conv.load_gine_conv()
-    load_weights_from_pretraining(gine_conv_model, model_directory,
-                                  "embedding_model.pt",
-                                  ["head_cardinality.pt"],
-                                  float_weights=True)
-
-    gine_conv_model.embedding_model.eval()
-
-    # Set the embedding head to eval too as these layers will be frozen
-    embedding_head_name = "triple_embedding"
-    if embedding_head_name in gine_conv_model.head_types:
-        idx = gine_conv_model.head_types.index(embedding_head_name)
-        gine_conv_model.heads[idx].eval()
-
-    # Freeze the weights
-    freeze_weights(gine_conv_model)
+    train_dataset, val_dataset = prepare_queries(query_env,queries_location, endpoint_location,
+                                                 rdf2vec_vector_location,occurrences_location,
+                                                 tp_cardinality_location)
+    gine_conv_model = prepare_embedding_model(model_config, model_directory)
     return gine_conv_model, train_dataset, val_dataset, query_env
 
 def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost):
@@ -284,6 +265,67 @@ def run_qr_dqn_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
 
     return model
 
+def run_ppo(emb_model, train_dataset, val_dataset, query_env, extractor_class, extractor_kwargs, net_arch):
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
+    policy_kwargs = dict(
+        features_extractor_class=extractor_class,
+        features_extractor_kwargs=extractor_kwargs,
+        net_arch=net_arch,
+    )
+
+    def mask_fn(env):
+        return env.action_masks_ppo()
+
+    train_env = ActionMasker(train_env, mask_fn)
+    val_env = ActionMasker(val_env, mask_fn)
+
+
+    model = MaskablePPO(MaskableActorCriticPolicyCustomPreprocessing,
+                        train_env,
+                        policy_kwargs=policy_kwargs,
+                        device='cpu',
+                        tensorboard_log="./tensorboard_logs/",
+                        verbose=0
+                        )
+    print("Validation environment contains {} queries".format(len(val_dataset)))
+    eval_callback = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(val_env),
+        use_masking=True,
+        n_eval_episodes=len(val_dataset),
+        eval_freq=5000,
+        deterministic=True,
+        render=False,
+    )
+    model.learn(total_timesteps=n_steps, callback=eval_callback)
+    model.save(model_save_loc_estimated)
+
+    # Finetune based on query execution. This is with fewer steps due to cost of executing queries
+    exec_train_env, exec_val_env = prepare_execution_cost_envs(
+        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False)
+
+    exec_train_env = ActionMasker(exec_train_env, mask_fn)
+    exec_val_env = ActionMasker(exec_val_env, mask_fn)
+    print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_queries])))
+    model.set_env(exec_train_env)
+    # Ensure critic is reset due to change in reward function
+    reset_value_head_only(model)
+    model.learning_rate = .1 * model.learning_rate
+    eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(exec_val_env),
+        use_masking=True,
+        n_eval_episodes=len(val_dataset[:n_eval_queries]),
+        eval_freq=500,
+        deterministic=True,
+        render=False,
+    )
+    model.save(model_save_loc_fine_tuned)
+    model.learn(total_timesteps=n_steps_fine_tune, callback=eval_callback_fine_tuned)
+
+    pass
+
+def run_qr_dqn():
+    pass
+
 
 def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
                                   model_save_loc_estimated, model_save_loc_fine_tuned,
@@ -376,7 +418,7 @@ def main_qr_dqn():
                        r"pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025"
                        r"/epoch-49/model")
 
-    extractor_type: Literal["tree_lstm", "naive"] = "naive"
+    extractor_type: Literal["tree_lstm", "naive"] = "tree_lstm"
     if extractor_type == "tree_lstm":
         model = run_qr_dqn_estimated_cardinality(500000, 20000, 100,
                     "experiments/experiment_outputs/qr_dqn_tree_lstm_3_5",
@@ -437,7 +479,12 @@ def main_ppo():
     else:
         raise ValueError("Invalid extractor type: {}".format(extractor_type))
 
-def main_rl_tuning(endpoint_location, model_config, model_directory, train_dataset=None, val_dataset=None,
+def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
+                   n_steps, n_steps_fine_tune, n_eval_episodes,
+                   model_save_loc_estimated, model_save_loc_fine_tuned,
+                   net_arch, feature_dim,
+                   endpoint_location, model_config, model_directory,
+                   train_dataset=None, val_dataset=None,
                    query_location_dict = None):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     if query_location_dict:
@@ -452,6 +499,33 @@ def main_rl_tuning(endpoint_location, model_config, model_directory, train_datas
         raise ValueError("Either train or validation dataset was None and there is no query_location_directory given in"
                          "config")
     emb_model = prepare_embedding_model(model_config, model_directory)
+    extractor_type_to_class = {
+        "naive": QRDQNFeatureExtractor,
+        "tree_lstm": QRDQNFeatureExtractorTreeLSTM
+    }
+
+    os.makedirs(os.path.join(model_save_loc_estimated, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(model_save_loc_fine_tuned, "checkpoints"), exist_ok=True)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=5_000,
+        save_path=os.path.join(model_save_loc_fine_tuned, "checkpoints"),
+        name_prefix="{}_{}".format(rl_algorithm, extractor_type)
+    )
+
+    if rl_algorithm == "ppo":
+        run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_episodes,
+                                      model_save_loc_estimated, model_save_loc_fine_tuned,
+                                      endpoint_location, queries_location, rdf2vec_vector_location,
+                                      occurrences_location, tp_cardinality_location,
+                                      model_config, model_directory,
+                                      extractor_class=extractor_type_to_class[extractor_type],
+                                      extractor_kwargs=dict(feature_dim=feature_dim),
+                                      net_arch=net_arch)
+
+    elif rl_algorithm == "qr_dqn":
+        pass
+    else:
+        raise NotImplementedError
 
 if __name__ == "__main__":
     #TODO: Fix Tree-LSTM
@@ -464,5 +538,5 @@ if __name__ == "__main__":
     #TODO: Ensure that pretraining train and validation sets are separated and are the same separation for RL training
     #TODO: Check validity baseline
     torch.manual_seed(0)
-    main_ppo()
-    # main_qr_dqn()
+    # main_ppo()
+    main_qr_dqn()

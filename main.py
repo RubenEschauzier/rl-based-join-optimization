@@ -52,6 +52,8 @@ def main(cfg: DictConfig):
             seed=c1.seed,
             lr=c1.lr
         )
+    # One cardinality estimation model can spawn multiple RL-based fine-tuning experiments that use the same train/val
+    # dataset and estimated cardinality model.
     if cfg.rltraining:
         pass
 

@@ -91,6 +91,10 @@ class TestChildSumTreeLSTM:
         h = torch.zeros(x.shape)
         c = torch.zeros(x.shape)
         edges = torch.tensor([[0, 1, 2, 3, 4, 5],[4, 4, 5, 5, 6, 6]])
+        print(edges.T)
+        edges = edges[[1, 0], :]
+
+        print(edges.T)
         #      6
         #    /   \
         #   4     5

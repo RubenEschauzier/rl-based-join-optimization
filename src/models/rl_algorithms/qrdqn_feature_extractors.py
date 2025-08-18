@@ -1,3 +1,5 @@
+import math
+
 import gym
 import numpy as np
 import torch
@@ -68,6 +70,8 @@ class QRDQNFeatureExtractor(BaseFeaturesExtractor):
         mask_emb = self.mask_embedder(joined)
         return torch.concat((result_features, mask_emb), dim=1)
 
+import treelstm
+
 class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict, feature_dim):
         super().__init__(observation_space, features_dim=feature_dim)
@@ -77,11 +81,14 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
         self.feature_dim = feature_dim
 
         # Recursively builds the join state
-        self.n_ary_tree_lstm = NAryTreeLSTM(self.feature_dim, self.feature_dim, 2)
-
+        # self.n_ary_tree_lstm = NAryTreeLSTM(self.feature_dim, self.feature_dim, 2)
+        self.child_sum_tree_lstm_intermediate = ChildSumTreeLSTM(self.feature_dim, self.feature_dim)
         # Takes all other triple patterns not joined and the join representation from the n-ary tree lstm
         # and outputs a vector representing the current state
         self.child_sum_tree_lstm = ChildSumTreeLSTM(self.feature_dim, self.feature_dim)
+
+        self.tree_lstm_intermediate = treelstm.TreeLSTM(self.feature_dim, self.feature_dim)
+        self.tree_lstm_final = treelstm.TreeLSTM(self.feature_dim, self.feature_dim)
 
         # We apply this over the embedding of the triple pattern used in a state with a single join. Then this value
         # is used as 'h' input, while the embedding from self.intermediate_join_embedding is used as x. This signifies
@@ -130,63 +137,69 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
         device = result_embeddings.device
         state_embeddings = []
         for i in range(result_embeddings.shape[0]):
-            n_joins = joins_made[i][0]
             n_triples = n_triples_obs[i][0]
-
             x = result_embeddings[i]
-            result_embeddings_un_joined = self.get_un_joined_embeddings(joined[i], x)
-            if n_joins == 0:
-                empty_join_representation = torch.empty(result_embeddings_un_joined[0].shape).unsqueeze(dim=0)
-                h_c, c_c, x_c = self.get_state_child_sum_input(result_embeddings_un_joined,
-                                                               empty_join_representation,
-                                                               empty_join_representation,
-                                                               empty_join_representation,
-                                                               x)
-            elif n_joins == 1:
-                join_order = observations["join_order"][i]
-                last_join = join_order[0]
 
-                # The triple pattern embedding is transformed by a single layer mlp and then fed as hidden state
-                h_last_join = self.join_embedding_mlp(x[last_join])
-                # The x is the learned dummy representation of intermediate joins
-                x_last_join = self.int_join_emb(torch.tensor([0], device=device))
-                empty_join_representation = torch.empty((0,result_embeddings_un_joined[0].shape[0]))
-                h_c, c_c, x_c = self.get_state_child_sum_input(result_embeddings_un_joined,
-                                                               empty_join_representation,
-                                                               empty_join_representation,
-                                                               empty_join_representation,
-                                                               x)
-                h_c[last_join] = h_last_join
-                x_c[last_join] = x_last_join
+            # Construct edge index in format of package with all padding edges removed (This can be done faster)
+            edge_index_tree_lstm = join_graphs[i][[1, 0], :].T
+            mask = ~(edge_index_tree_lstm == 0).all(dim=1)
+            edge_index_join_tree = edge_index_tree_lstm[mask]
 
-            else:
-                edge_index = EdgeIndex(join_graphs[i], is_undirected=False)
-                h = torch.zeros_like(x)
-                c = torch.zeros_like(x)
-                order_mask = lstm_order[i][lstm_order_mask[i].bool()].bool()
-                h_join, c_join = self.n_ary_tree_lstm.forward(x, edge_index, h, c, order_mask)
+            # First join makes intermediate join with one edge, rest all 2 edges per join
+            n_intermediate_join_nodes = math.ceil(mask.sum()/2)
+            n_nodes_join_tree = n_triples+n_intermediate_join_nodes
 
+            # Create final 'super' node representing the current join state by adding all un-joined triple patterns and
+            # the intermediate result representation as children.
+            # result_embeddings_un_joined = self.get_un_joined_embeddings(joined[i], x)
+            index_un_joined = torch.where(~joined[i].bool())[0]
+            index_forest_representation = torch.concat(
+                (index_un_joined, torch.tensor([n_nodes_join_tree-1])),
+                dim=0)
+            edges_forest = torch.stack(
+                (torch.full(index_forest_representation.shape, n_nodes_join_tree), index_forest_representation),
+                dim=0
+            ).T
+            edge_index_join_forest = torch.concat((edge_index_join_tree, edges_forest), dim=0)
+            node_order, edge_order = treelstm.calculate_evaluation_orders(edge_index_join_forest,
+                                                                          n_intermediate_join_nodes+n_triples+1)
 
-                # TODO: Add zero embeddings to these three to represent the to be added parent embedding that will
-                # Input to the child-sum tree-lstm. Consists of:
-                # - The left-over triple patterns not joined yet
-                # - The intermediate join representation obtained from hierarchical 2-ary tree-lstm. The x value for
-                # the intermediate join is obtained from a learnable dummy
-                # - A zeros tensor for the aggregating parent node, this parent node obtains its representation from
-                # a forward pass from child-sum tree-lstm.
-                h_c, c_c, x_c = self.get_state_child_sum_input(result_embeddings_un_joined,
-                                                               h_join[n_triples + n_joins - 2].unsqueeze(dim=0),
-                                                               c_join[n_triples + n_joins - 2].unsqueeze(dim=0),
-                                                               self.int_join_emb(torch.tensor([0], device=device)),
-                                                               x)
-                # edge_index_state, order_state = self.get_join_state_graph(x_c, device)
-                # h_state, c_state = self.child_sum_tree_lstm.forward(
-                #     x_c, edge_index_state, h_c, c_c, order_state)
-                # state_embeddings.append(h_state[-1])
-            edge_index_state, order_state = self.get_join_state_graph(x_c, device)
-            h_state, c_state = self.child_sum_tree_lstm.forward(
-                x_c, edge_index_state, h_c, c_c, order_state)
-            state_embeddings.append(h_state[-1])
+            # state_shapes = (n_nodes_join_tree+1, x.shape[1])
+            # h = torch.zeros(state_shapes)
+            # c = torch.zeros(state_shapes)
+
+            # X is already padded with zero rows, so just slice out unneeded ones
+            x_input = x[:n_nodes_join_tree+1]
+
+            h_final_lstm, c_final_lstm = self.tree_lstm_final(x_input, node_order, edge_index_join_forest, edge_order)
+            # order_mask = lstm_order[i][lstm_order_mask[i].bool()].bool()
+
+            # Build intermediate join result representation ( OWN IMPLEMENTATION
+            # h_lstm, c_lstm = self.child_sum_tree_lstm_intermediate(x_input, edge_index, h, c, order_mask)
+
+            # Build intermediate join result representation using package implementation
+            # h_lstm, c_lstm = self.tree_lstm_intermediate(x_input, node_order, edge_index_join_tree, edge_order)
+
+            # # Zero embedding tensor
+            # zero_embedding = torch.zeros(x[0].shape).unsqueeze(dim=0)
+            #
+            # # Create final input to tree-lstm that will create the state representation by simply adding a
+            # # parent node connected to both un-joined triple pattern representations and the hidden and cell state
+            # # output by the previous step
+            # state_selection_mask = self.get_final_input_state_mask(joined[i], h_lstm)
+            #
+            # h_final = torch.cat((h_lstm[state_selection_mask], zero_embedding), dim=0)
+            # c_final = torch.cat((c_lstm[state_selection_mask], zero_embedding), dim=0)
+            # x_final = torch.cat(
+            #     (result_embeddings_un_joined, zero_embedding, zero_embedding), dim=0
+            # )
+            # # Build join graph and order (which is just simply only True for the new 'parent' node rest False)
+            # edge_index_state, order_state = self.get_join_state_graph(x_final, device)
+            #
+            # # Pass un-joined triple pattern representations, join representation through Tree-LSTM final layer.
+            # h_state, c_state = self.child_sum_tree_lstm.forward(
+            #     x_final, edge_index_state, h_final, c_final, order_state)
+            state_embeddings.append(h_final_lstm[-1])
 
         mask_emb = self.mask_embedder(joined)
         return self.representation_contractor(torch.concat((torch.stack(state_embeddings), mask_emb), dim=1))
@@ -198,6 +211,14 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
                                                 (0, x.shape[0] - joined.shape[0]),
                                                 value=True)
         return x[~joined_padded]
+
+    @staticmethod
+    def get_final_input_state_mask(joined, state):
+        un_joined_indexes = torch.cat([
+            (joined == 0).nonzero(as_tuple=True)[0],
+            torch.tensor([state.shape[0] - 1], device=joined.device)
+        ])
+        return un_joined_indexes
 
     @staticmethod
     def get_state_child_sum_input(result_emb_un_joined,

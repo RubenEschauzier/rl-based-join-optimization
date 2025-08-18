@@ -105,11 +105,13 @@ class NAryTreeLSTM(MessagePassing, ABC):
         self.W_iou = nn.Linear(in_dim, 3 * out_dim)
         # Individual U_iou for each child hidden state
         self.U_iou = nn.Parameter(torch.empty(max_children, out_dim, 3*out_dim), requires_grad=True)
+        nn.init.xavier_uniform_(self.U_iou)
 
         self.W_f = nn.Linear(in_dim, out_dim)
         # Fix the forget gate off-diagonal matrices to save space otherwise 16 matrices are needed.
         # Parameter tensor with size (max_child, in_dim, out_dim)
         self.U_f = nn.Parameter(torch.empty(max_children, out_dim, out_dim), requires_grad=True)
+        nn.init.xavier_uniform_(self.U_f)
 
         self.hidden_dim = out_dim
         self.partial_dense_mapping = {}
