@@ -265,7 +265,13 @@ def run_qr_dqn_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
 
     return model
 
-def run_ppo(emb_model, train_dataset, val_dataset, query_env, extractor_class, extractor_kwargs, net_arch):
+def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
+            model_save_loc_estimated, model_save_loc_fine_tuned,
+            emb_model,
+            train_dataset, val_dataset,
+            query_env,
+            extractor_class, extractor_kwargs, net_arch,
+            ckp_callback_estimate, ckp_callback_fine_tuning):
     train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
@@ -296,16 +302,16 @@ def run_ppo(emb_model, train_dataset, val_dataset, query_env, extractor_class, e
         deterministic=True,
         render=False,
     )
-    model.learn(total_timesteps=n_steps, callback=eval_callback)
+    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
     model.save(model_save_loc_estimated)
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
-        emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False)
+        emb_model, train_dataset, val_dataset[:n_eval_episodes], query_env, False)
 
     exec_train_env = ActionMasker(exec_train_env, mask_fn)
     exec_val_env = ActionMasker(exec_val_env, mask_fn)
-    print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_queries])))
+    print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_episodes])))
     model.set_env(exec_train_env)
     # Ensure critic is reset due to change in reward function
     reset_value_head_only(model)
@@ -313,18 +319,77 @@ def run_ppo(emb_model, train_dataset, val_dataset, query_env, extractor_class, e
     eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(exec_val_env),
         use_masking=True,
-        n_eval_episodes=len(val_dataset[:n_eval_queries]),
+        n_eval_episodes=len(val_dataset[:n_eval_episodes]),
         eval_freq=500,
         deterministic=True,
         render=False,
     )
+    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
     model.save(model_save_loc_fine_tuned)
-    model.learn(total_timesteps=n_steps_fine_tune, callback=eval_callback_fine_tuned)
+    return model
 
-    pass
+def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
+               model_save_loc_estimated, model_save_loc_fine_tuned,
+               emb_model,
+               train_dataset, val_dataset,
+               query_env,
+               extractor_class, extractor_kwargs, net_arch,
+               ckp_callback_estimate, ckp_callback_fine_tuning
+               ):
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
+    policy_kwargs = dict(
+        features_extractor_class=extractor_class,
+        features_extractor_kwargs=extractor_kwargs,
+        net_arch=net_arch,
+    )
 
-def run_qr_dqn():
-    pass
+    model = MaskableQRDQN(MaskableQRDQNPolicy,
+                          train_env,
+                          policy_kwargs=policy_kwargs,
+                          exploration_fraction=0.2,
+                          exploration_initial_eps=1,
+                          exploration_final_eps=0.05,
+                          learning_starts=1000,
+                          verbose=0,
+                          buffer_size=100000,
+                          replay_buffer_class=MaskedDictReplayBuffer,
+                          tensorboard_log="./tensorboard_logs/",
+                          device='cpu',
+                          train_freq=(15, "episode"),
+                          )
+    print("Validation set contains {} queries".format(len(val_dataset)))
+    eval_callback = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(val_env),
+        n_eval_episodes=len(val_dataset),
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+    )
+
+    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
+    model.save(model_save_loc_estimated)
+
+    # Finetune based on query execution. This is with fewer steps due to cost of executing queries
+    exec_train_env, exec_val_env = prepare_execution_cost_envs(
+        emb_model, train_dataset, val_dataset[:n_eval_episodes], query_env, False)
+    # exec_train_env, exec_val_env = prepare_execution_latency_envs(
+    #     emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False, False)
+
+    model.set_env(exec_train_env)
+    model.learning_rate = .1 * model.learning_rate
+    model.exploration_rate = .5
+
+    eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
+        eval_env=Monitor(exec_val_env),
+        use_masking=True,
+        n_eval_episodes=len(val_dataset[:n_eval_episodes]),
+        eval_freq=500,
+        deterministic=True,
+        render=False,
+    )
+    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
+    model.save(model_save_loc_fine_tuned)
+    return model
 
 
 def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
@@ -485,12 +550,14 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
                    net_arch, feature_dim,
                    endpoint_location, model_config, model_directory,
                    train_dataset=None, val_dataset=None,
-                   query_location_dict = None):
+                   query_location_dict=None,
+                   seed=0):
+    torch.manual_seed(seed)
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     if query_location_dict:
         train_dataset, val_dataset = prepare_queries(query_env,
-                                                     endpoint_location,
                                                      query_location_dict['queries'],
+                                                     endpoint_location,
                                                      query_location_dict['rdf2vec_vectors'],
                                                      query_location_dict['occurrences'],
                                                      query_location_dict['tp_cardinalities'],
@@ -506,24 +573,41 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
 
     os.makedirs(os.path.join(model_save_loc_estimated, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(model_save_loc_fine_tuned, "checkpoints"), exist_ok=True)
-    checkpoint_callback = CheckpointCallback(
+    checkpoint_callback_estimated = CheckpointCallback(
         save_freq=5_000,
+        save_path=os.path.join(model_save_loc_estimated, "checkpoints"),
+        name_prefix="{}_{}".format(rl_algorithm, extractor_type)
+    )
+    checkpoint_callback_fine_tuned = CheckpointCallback(
+        save_freq=500,
         save_path=os.path.join(model_save_loc_fine_tuned, "checkpoints"),
         name_prefix="{}_{}".format(rl_algorithm, extractor_type)
     )
 
-    if rl_algorithm == "ppo":
-        run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_episodes,
-                                      model_save_loc_estimated, model_save_loc_fine_tuned,
-                                      endpoint_location, queries_location, rdf2vec_vector_location,
-                                      occurrences_location, tp_cardinality_location,
-                                      model_config, model_directory,
-                                      extractor_class=extractor_type_to_class[extractor_type],
-                                      extractor_kwargs=dict(feature_dim=feature_dim),
-                                      net_arch=net_arch)
 
+    if rl_algorithm == "ppo":
+        run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
+                model_save_loc_estimated, model_save_loc_fine_tuned,
+                emb_model,
+                train_dataset, val_dataset,
+                query_env,
+                extractor_class=extractor_type_to_class[extractor_type],
+                extractor_kwargs=dict(feature_dim=feature_dim),
+                net_arch=net_arch,
+                ckp_callback_estimate=checkpoint_callback_estimated,
+                ckp_callback_fine_tuning=checkpoint_callback_fine_tuned)
     elif rl_algorithm == "qr_dqn":
-        pass
+        run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
+                   model_save_loc_estimated, model_save_loc_fine_tuned,
+                   emb_model,
+                   train_dataset, val_dataset,
+                   query_env,
+                   extractor_class=extractor_type_to_class[extractor_type],
+                   extractor_kwargs=dict(feature_dim=feature_dim),
+                   net_arch=net_arch,
+                   ckp_callback_estimate= checkpoint_callback_estimated,
+                   ckp_callback_fine_tuning= checkpoint_callback_fine_tuned
+                   )
     else:
         raise NotImplementedError
 

@@ -1,0 +1,21 @@
+rl_training:
+  algorithm: 'ppo'
+  extractor_type: 'tree_lstm'
+  n_steps: 200000
+  n_steps_fine_tune: 50000
+  n_eval_episodes: 200
+  model_save_loc_estimated: "experiments/experiment_outputs/ppo_lstm_test_3_5-cost_est"
+  model_save_loc_fine_tuned: "experiments/experiment_outputs/ppo_lstm_test_3_5_fine_tuned"
+  net_arch:
+    - 256
+    - 256
+  feature_dim: 200
+  endpoint_location: "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+  model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+  model_directory: "experiments/experiment_outputs/pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025/epoch-49/model"
+  query_location_dict:
+    queries: "data/pretrain_data/datasets/p_e_size_3_5_101"
+    rdf2vec_vectors: "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
+    occurrences: "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
+    tp_cardinalities: "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
+  seed: 0

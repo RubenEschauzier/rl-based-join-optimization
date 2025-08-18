@@ -5,12 +5,14 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.policy_gradient_rl_procedure import run_training_policy_gradient
 from src.pretrain_procedure import main_pretraining_dataset
+from src.rl_fine_tuning_qr_dqn_learning import main_rl_tuning
 from src.utils.training_utils.training_tracking import ExperimentWriter
 
 # Root dir global for file loading
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
-os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR, "experiments", "experiment_configs")
+os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
+                                               "experiments", "experiment_configs", "rl_fine_tuning_experiments")
 
 
 def main_policy_rl():
@@ -28,9 +30,10 @@ def main_q_learning_rl():
     pass
 
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
-            config_name="pretrain_experiment_triple_conv")
+            config_name="fine_tune_3_5_stars_ppo_lstm")
 def main(cfg: DictConfig):
-    if cfg.pretraining:
+    train_set, val_set = None, None
+    if "pretraining" in cfg:
         c1 = cfg.pretraining
 
         with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
@@ -54,10 +57,28 @@ def main(cfg: DictConfig):
         )
     # One cardinality estimation model can spawn multiple RL-based fine-tuning experiments that use the same train/val
     # dataset and estimated cardinality model.
-    if cfg.rltraining:
-        pass
-
-
+    if "rl_training" in cfg:
+        c2 = cfg.rl_training
+        if (not train_set or not val_set) and not c2.query_location_dict:
+            raise ValueError("Either train_set and val_set or query_location_dict must be specified")
+        main_rl_tuning(
+            c2.algorithm,
+            c2.extractor_type,
+            c2.n_steps,
+            c2.n_steps_fine_tune,
+            c2.n_eval_episodes,
+            c2.model_save_loc_estimated,
+            c2.model_save_loc_fine_tuned,
+            c2.net_arch,
+            c2.feature_dim,
+            c2.endpoint_location,
+            c2.model_config_location,
+            c2.model_directory,
+            train_set,
+            val_set,
+            c2.query_location_dict,
+            c2.seed
+        )
 
 if __name__ == "__main__":
     main()
