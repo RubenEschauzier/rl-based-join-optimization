@@ -1,4 +1,5 @@
 import os
+import re
 import hydra
 import yaml
 from omegaconf import DictConfig, OmegaConf
@@ -13,6 +14,62 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
                                                "experiments", "experiment_configs", "rl_fine_tuning_experiments")
+
+
+#TODO:
+# Take the .nt and .ttl files downloaded and convert to data graph files for G-CARE.
+# Then validate that I can use G-Care for my queries.
+# Upload to data storage in cloud.
+# Then set up virtual machines for query generation (Star and Path only)
+# and let them run during holiday. Remember to time them.
+# Then next steps:
+# Pretrain on each dataset (ensure GNCE performance is about the same)
+# Train experiments (4 RL each for each pretrain experiment)
+# Save Validation set for each training run!!
+# Implement own validation runner:
+# - Run model PPO using default validation code on all validation queries at certain checkpoints.
+# - Run QR-DQN with custom variance penalized cost function
+# Implement full validation runner
+# - First enumerate join options (use existing)
+# - Write them to file divided by query
+# - Let G-Care do cardinality estimation over them
+# - Use those to make join plans (left-deep only) and get latency / cost
+# - For GNCE Use existing function, just validate its correctness, also validate why PPO goes higher reward than
+# - enumeration
+# Use hand-crafted / wikidata user queries
+# - Apply same validation
+# Metrics to use:
+# - Query cost (sum of intermediate results)
+# - Query latency (averaged over 10? runs)
+# Figures:
+# - Box plot of latency / cost per shape and combined shapes
+# - Training curves with 50 random seeds for WatDiv path / star and Wikidata path / star
+# Table showing ablation study
+# - No pretraining
+# - No fine-tuning
+# - Incase QR-DQN, no penalized variance
+
+def find_last_epoch_directory(base_model_dir):
+    epoch_dirs = [
+        d for d in os.listdir(base_model_dir)
+        if os.path.isdir(os.path.join(base_model_dir, d)) and d.startswith("epoch-")
+    ]
+
+    # Extract the numbers
+    epochs = []
+    for d in epoch_dirs:
+        m = re.match(r"epoch-(\d+)", d)
+        if m:
+            epochs.append((int(m.group(1)), d))
+
+    # Pick the max
+    if epochs:
+        last_epoch_num, last_epoch_dir = max(epochs, key=lambda x: x[0])
+        final_path = os.path.join(base_model_dir, last_epoch_dir, "model")
+        print(f"Last epoch path: {final_path}")
+    else:
+        print("No epoch directories found.")
+    return final_path
 
 
 def main_policy_rl():
@@ -30,9 +87,10 @@ def main_q_learning_rl():
     pass
 
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
-            config_name="fine_tune_3_5_stars_ppo_lstm")
+            config_name="fine_tune_3_5_stars_ppo_naive")
 def main(cfg: DictConfig):
     train_set, val_set = None, None
+    writer = None
     if "pretraining" in cfg:
         c1 = cfg.pretraining
 
@@ -58,27 +116,35 @@ def main(cfg: DictConfig):
     # One cardinality estimation model can spawn multiple RL-based fine-tuning experiments that use the same train/val
     # dataset and estimated cardinality model.
     if "rl_training" in cfg:
-        c2 = cfg.rl_training
-        if (not train_set or not val_set) and not c2.query_location_dict:
-            raise ValueError("Either train_set and val_set or query_location_dict must be specified")
-        main_rl_tuning(
-            c2.algorithm,
-            c2.extractor_type,
-            c2.n_steps,
-            c2.n_steps_fine_tune,
-            c2.n_eval_episodes,
-            c2.model_save_loc_estimated,
-            c2.model_save_loc_fine_tuned,
-            c2.net_arch,
-            c2.feature_dim,
-            c2.endpoint_location,
-            c2.model_config_location,
-            c2.model_directory,
-            train_set,
-            val_set,
-            c2.query_location_dict,
-            c2.seed
-        )
+        for name, c2 in cfg["rl_training"].items():
+            print("Experiment: {}-{}".format(c2.algorithm, c2.extractor_type))
+            if (not train_set or not val_set) and not c2.query_location_dict:
+                raise ValueError("Either train_set and val_set or query_location_dict must be specified")
+
+            if writer:
+                model_dir = find_last_epoch_directory(writer.experiment_directory)
+            elif c2.model_directory:
+                model_dir = c2.model_directory
+            else:
+                raise ValueError("Either a pretraining experiment or a model directory must be specified")
+            main_rl_tuning(
+                c2.algorithm,
+                c2.extractor_type,
+                c2.n_steps,
+                c2.n_steps_fine_tune,
+                c2.n_eval_episodes,
+                c2.model_save_loc_estimated,
+                c2.model_save_loc_fine_tuned,
+                c2.net_arch,
+                c2.feature_dim,
+                c2.endpoint_location,
+                c2.model_config_location,
+                model_dir,
+                train_set,
+                val_set,
+                c2.query_location_dict,
+                c2.seed
+            )
 
 if __name__ == "__main__":
     main()

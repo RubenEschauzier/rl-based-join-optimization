@@ -30,6 +30,7 @@ class OrderDynamicProgramming(gym.Wrapper):
         # Track the last optimal reward for info reporting
         self.last_optimal_cost = None
         self.last_optimal_reward = None
+        self.last_optimal_plan = None
 
     def reset(self, seed=None, options=None):
         """
@@ -58,6 +59,7 @@ class OrderDynamicProgramming(gym.Wrapper):
         # Update the last optimal reward
         self.last_optimal_cost = self.optimal_plans_left_deep[current_query.query].cost
         self.last_optimal_reward = self.optimal_rewards_left_deep[current_query.query]
+        self.last_optimal_plan = self.optimal_plans_left_deep[current_query.query]
         return obs, info
 
     def step(self, action):
@@ -82,12 +84,11 @@ class OrderDynamicProgramming(gym.Wrapper):
     def get_reward_left_deep_plan(self, query, optimal_plan):
         def traverse_plan(plan: JoinPlan):
             if plan.left.is_leaf and plan.right.is_leaf:
-                return [plan.left.entries.pop(), plan.right.entries.pop()]
+                return [list(plan.left.entries)[-1], list(plan.right.entries)[-1]]
             order = traverse_plan(plan.left)
-            order.append(plan.right.entries.pop())
+            order.append(list(plan.right.entries).pop())
             return order
         join_order = np.array(traverse_plan(optimal_plan))
-
         plan_reward = self.get_intermediate_cost_estimates(query, join_order)
         return plan_reward
 

@@ -84,4 +84,3 @@ class ExperimentWriter:
                 stacklevel=2
             )
             torch.save(model.state_dict(), os.path.join(epoch_dir, "model.pt"))
-

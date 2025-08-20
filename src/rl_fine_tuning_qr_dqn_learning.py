@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 from typing import Literal
 
@@ -180,9 +181,12 @@ def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, c
 
     return train_env, val_env
 
-def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost):
+def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost,
+                                shuffle_dataset=False):
     train_env = make_env_execution_cost(emb_model, train_dataset, True, query_env)
-    val_env = make_env_execution_cost(emb_model, val_dataset.shuffle(),
+    if shuffle_dataset:
+        val_dataset.shuffle()
+    val_env = make_env_execution_cost(emb_model, val_dataset,
                                       False, query_env)
     val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
 
@@ -302,8 +306,12 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
         deterministic=True,
         render=False,
     )
+    start_est = time.time()
     model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
+    end_est = time.time()
     model.save(model_save_loc_estimated)
+    with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f :
+        f.write(str(end_est-start_est))
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
@@ -324,8 +332,13 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
         deterministic=True,
         render=False,
     )
+    start_tune = time.time()
     model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
+    end_tune = time.time()
     model.save(model_save_loc_fine_tuned)
+    with open(os.path.join(model_save_loc_fine_tuned, "train_elapsed_fine_tune.txt"), 'w') as f :
+        f.write(str(end_tune-start_tune))
+
     return model
 
 def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
@@ -365,9 +378,12 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
         deterministic=True,
         render=False,
     )
-
+    start_est = time.time()
     model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
+    end_est = time.time()
     model.save(model_save_loc_estimated)
+    with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f :
+        f.write(str(end_est-start_est))
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
@@ -387,8 +403,13 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
         deterministic=True,
         render=False,
     )
+    start_tune = time.time()
     model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
+    end_tune = time.time()
     model.save(model_save_loc_fine_tuned)
+    with open(os.path.join(model_save_loc_fine_tuned, "train_elapsed_fine_tune.txt"), 'w') as f :
+        f.write(str(end_tune-start_tune))
+
     return model
 
 
@@ -434,7 +455,9 @@ def run_ppo_estimated_cardinality(n_steps, n_steps_fine_tune, n_eval_queries,
         deterministic=True,
         render=False,
     )
+    start_estimated = time.time()
     model.learn(total_timesteps=n_steps, callback=eval_callback)
+    end_estimated = time.time()
     model.save(model_save_loc_estimated)
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
@@ -613,7 +636,6 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
 
 if __name__ == "__main__":
     #TODO: Fix Tree-LSTM
-    #TODO: Make config based experiment for RL
     #TODO: Train on full queries, train on full query sets with all different shapes
     #TODO: Make functions that given trained RL model and trained pretrained model
     # - tests on full validation set.

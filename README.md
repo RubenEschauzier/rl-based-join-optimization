@@ -21,12 +21,12 @@
 - [x] Save predictions made by model in epoch (Save as: [{query, query_type, pred, actual, q-error}, ..]), seperated by train, 
 val, and test files. As we have now, save without query 
 - [x] Create code for experiment visualization, analysis etc. Violin plots, q-error plots with distribution, epoch development etc.
-- [ ] Load model weights
+- [x] Load model weights
 - [x] Use single passed around loss function defined in main pretrain function
 - [x] Test performance cardinality estimation on completely unseen benchmark queries
 - [ ] Test impact of number of queries on unseen benchmark queries
 - [x] Find number of parameters in our model
-- [ ] Use cardinality estimator for join order optimization
+- [x] Use cardinality estimator for join order optimization
 - [x] Create system for easy configs for experiment running
 - [ ] Generate LUBM benchmark data and test on that
 - [ ] Move query generation + execution to this repository and save path, subject star, object star, complex queries separately for more fine-grained analysis.

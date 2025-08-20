@@ -179,7 +179,10 @@ class JoinOrderEnumerator:
         if left_deep:
             curr_plan_left = JoinPlan(tree1, tree2, new_entries, estimate_size, True)
             curr_plan_right = JoinPlan(tree2, tree1, new_entries, estimate_size, True)
-            if len(tree1.entries) == 1:
+            if len(tree1.entries) == 1 and len(tree2.entries) == 1:
+                curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
+                             else curr_plan_left)
+            elif len(tree1.entries) == 1:
               curr_plan = curr_plan_right
             elif len(tree2.entries) == 1:
               curr_plan = curr_plan_left

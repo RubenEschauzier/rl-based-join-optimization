@@ -33,12 +33,16 @@ class QueryGymExecutionCost(QueryGymBase):
                                                                              join_order_trimmed,
                                                                              query.triple_patterns)
             # Execute query to obtain selectivity
-            env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON,
-                                                     {"explain": "True"},
-                                                     {"X-BIGDATA-MAX-QUERY-MILLIS": str(self._query_timeout+1)}
-                                                     )
+            try:
+                env_result, exec_time = self.env.run_raw(rewritten, self._query_timeout, JSON,
+                                                         {"explain": "True"},
+                                                         {"X-BIGDATA-MAX-QUERY-MILLIS": str(self._query_timeout+1)}
+                                                         )
 
-            units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
+                units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
+            except:
+                print("Fail in self.env.run_raw")
+                status = "FAIL"
 
             if status == "OK":
                 reward_per_step = QueryGymExecutionCost.query_plan_cost(units_out, counts)
@@ -88,12 +92,17 @@ class QueryGymExecutionCost(QueryGymBase):
     def execute_and_benchmark_slowdown_query(self, rewritten, join_order_trimmed):
         # Execute query to obtain selectivity
         slowed_down_query = QueryGymExecutionCost.insert_slowdown_triple(rewritten, self.query_slow_down_patterns)
-        env_result, exec_time = self.env.run_raw(slowed_down_query, self._query_timeout, JSON,
-                                                 {"explain": "True"},
-                                                 {"X-BIGDATA-MAX-QUERY-MILLIS": str(self._query_timeout + 1)}
-                                                 )
+        try:
+            env_result, exec_time = self.env.run_raw(slowed_down_query, self._query_timeout, JSON,
+                                                     {"explain": "True"},
+                                                     {"X-BIGDATA-MAX-QUERY-MILLIS": str(self._query_timeout + 1)}
+                                                     )
 
-        units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
+            units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
+        except:
+            print("Fail in self.env.run_raw slowed down query")
+            status = "FAIL"
+
         if status == "OK":
             # Remove slowdown triples from query information
             reward_per_step = QueryGymExecutionCost.query_plan_cost(

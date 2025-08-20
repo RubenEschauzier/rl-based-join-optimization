@@ -125,6 +125,7 @@ class QueryGymBase(gym.Env):
         self._joins_made += 1
 
         next_obs = self._build_obs()
+
         reward, _ = self.get_reward(self._query, self._join_order, self._joins_made)
 
         done = False
