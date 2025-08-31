@@ -1,5 +1,6 @@
-from typing import Dict, List, Set, Tuple,  Optional, Callable
+from typing import Dict, List, Set, Tuple, Optional, Callable
 import re
+
 
 class JoinPlan:
     """Represents a join plan with cost estimation"""
@@ -62,7 +63,6 @@ class JoinPlan:
         return result
 
 
-
 class JoinOrderEnumerator:
     """
     Enumerates join orders using dynamic programming with connected complement pairs (DPccp).
@@ -111,7 +111,6 @@ class JoinOrderEnumerator:
                 tree2_left_deep = best_plan_left_deep[tree2_key]
                 self.update_best_plan(tree1_left_deep, tree2_left_deep,
                                       new_entries, estimate, best_plan, best_plan_left_deep, True)
-
 
         all_entries_key = tuple(list(range(self.n_entries)))
         return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
@@ -183,9 +182,9 @@ class JoinOrderEnumerator:
                 curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
                              else curr_plan_left)
             elif len(tree1.entries) == 1:
-              curr_plan = curr_plan_right
+                curr_plan = curr_plan_right
             elif len(tree2.entries) == 1:
-              curr_plan = curr_plan_left
+                curr_plan = curr_plan_left
             else:
                 raise ValueError("Bushy plan passed to left-deep update")
             curr_plan_key = tuple(self._sort_array_asc(list(curr_plan.entries)))
@@ -236,14 +235,15 @@ class JoinOrderEnumerator:
         return min(s)
 
     @staticmethod
-    def _sort_set_desc(s: Set[int]) -> List[int]:
+    def sort_set_desc(s: Set[int]) -> List[int]:
         """Sort set in descending order"""
         return sorted(s, reverse=True)
 
     @staticmethod
-    def _sort_array_asc(arr: List[int]) -> List[int]:
+    def sort_array_asc(arr: List[int]) -> List[int]:
         """Sort array in ascending order"""
         return sorted(arr)
+
 
 def build_adj_list(query):
     # Parse each triple pattern to extract variables

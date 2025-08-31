@@ -8,12 +8,14 @@ from src.datastructures.query import Query, ProcessQuery
 
 class QueryCardinalityDataset(InMemoryDataset):
 
-    def __init__(self, root, featurizer, post_processor = None, load_mappings=True,
-                 to_load=None, transform=None, pre_transform=None, pre_filter=None ):
+    def __init__(self, root, featurizer, post_processor=None, load_mappings=True,
+                 to_load=None, file_list=None, raw_data_dir=None, transform=None, pre_transform=None, pre_filter=None):
         self.featurizer = featurizer
         self.post_processor = post_processor
         self.to_load = to_load
         self.load_mappings = load_mappings
+        self._file_list = file_list
+        self._raw_data_dir = raw_data_dir
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
         if os.path.exists(os.path.join(self.processed_dir, "node_mappings.json")) and load_mappings:
@@ -29,15 +31,21 @@ class QueryCardinalityDataset(InMemoryDataset):
         return data
 
     def raw_file_names(self):
-        return [
-            "fixed_stars_2025-03-30_18-49-33_3.json",
-            "fixed_stars_2025-03-30_19-10-42_5.json",
-            # "fixed_stars_2025-04-13_14-17-45_8.json",
-        ]
+        # If explicit list is given, use it
+        if self._file_list is not None:
+            return self._file_list
+
+        # Otherwise, discover all files in the raw directory
+        return sorted(os.listdir(self._raw_data_dir))
+        # return [
+        #     "fixed_stars_2025-03-30_18-49-33_3.json",
+        #     "fixed_stars_2025-03-30_19-10-42_5.json",
+        #     # "fixed_stars_2025-04-13_14-17-45_8.json",
+        # ]
 
     def processed_file_names(self):
         return [
-            "processed_stars.pt"
+            "processed_queries.pt"
         ]
 
     def process(self):

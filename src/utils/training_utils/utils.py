@@ -81,14 +81,16 @@ def embed_query_graphs(queries, embedding_models, training=True):
         query_graph_embeddings.append(query_emb)
     return query_graph_embeddings
 
+
 def q_error_fn(pred, true, eps=1e-7):
     return torch.max(true / (pred + eps), pred / (true + eps))
 
 
 def mixed_mae_q_error_loss(alpha, pred, true):
     mae = alpha * torch.nn.L1Loss(reduction='mean')(pred, true)
-    q_error =  (1 - alpha) * torch.mean(q_error_fn(torch.exp(pred), torch.exp(true)))
+    q_error = (1 - alpha) * torch.mean(q_error_fn(torch.exp(pred), torch.exp(true)))
     return mae + q_error
+
 
 def save_checkpoint(ckp_dir, optimizer, models, model_file_names, statistics):
     if not os.path.isdir(ckp_dir):
@@ -115,8 +117,7 @@ def register_debugging_hooks(module):
         print(f"Layer: {module}")
         print(f"Input: {input}")
         print(f"Output: {output}")
-        print("="*50)
+        print("=" * 50)
 
     # Register hook for the layer
     module.register_forward_hook(hook_fn)
-
