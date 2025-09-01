@@ -100,7 +100,8 @@ def main(cfg: DictConfig):
         writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_experiment_triple_conv",
                                   dict(c1), dict(config['model']))
         train_set, val_set = main_pretraining_dataset(
-            queries_location=c1.dataset,
+            queries_location_train=c1.dataset_train,
+            queries_location_val=c1.dataset_val,
             endpoint_location=c1.endpoint,
             rdf2vec_vector_location=c1.embeddings,
             feature_type=c1.feature_type,

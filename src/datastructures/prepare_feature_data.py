@@ -12,6 +12,8 @@ def read_queries(query_dir):
     dir_files = os.listdir(query_dir)
     queries_total = []
     for file in tqdm(dir_files):
+        if os.path.isdir(os.path.join(query_dir, file)):
+            continue
         queries = []
         path = os.path.join(query_dir, file)
         with open(path, 'r') as f:
@@ -49,16 +51,14 @@ def get_query_triple_pattern_cardinalities(queries, env):
     return triple_pattern_cardinalities
 
 if __name__ == '__main__':
-    query_location = (
-        r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data\generated_queries"
-        r"\sub_sampled_full"
-    )
-    output_location = (
-        r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data\pattern_term_cardinalities"
-        r"\full"
-    )
-    query_env = BlazeGraphQueryEnvironment("http://localhost:9999/blazegraph/namespace/watdiv/sparql")
-    loaded_queries = read_queries(query_location)
+    dataset_name = "swdf"
+    query_loc_path = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\path_{}".format(dataset_name)
+    query_loc_star = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\star_{}".format(dataset_name)
+    output_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}".format(dataset_name)
+    query_env = BlazeGraphQueryEnvironment("http://localhost:9999/blazegraph/namespace/{}/sparql".format(dataset_name))
+    loaded_queries= read_queries(query_loc_path)
+    loaded_queries_star = read_queries(query_loc_star)
+    loaded_queries.extend(loaded_queries_star)
     loaded_occurrences = get_occurrences(loaded_queries, query_env)
     loaded_tp_cardinalities = get_query_triple_pattern_cardinalities(loaded_queries, query_env)
     with open(os.path.join(output_location, 'occurrences.json'), 'w') as f0:

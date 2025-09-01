@@ -134,16 +134,17 @@ def wrap_validation_environment_with_baseline(val_env, cache_optimal_cost):
 
 
 def prepare_queries(query_env,
-                    queries_location, endpoint_location, rdf2vec_vector_location, occurrences_location,
-                    tp_cardinality_location,
-                    validation_size=.1):
-    train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
+                    queries_location_train, queries_location_val,
+                    endpoint_location, rdf2vec_vector_location, occurrences_location,
+                    tp_cardinality_location,):
+    train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
+                                                           endpoint_location,
                                                            rdf2vec_vector_location, query_env,
                                                            "predicate_edge",
-                                                           validation_size=validation_size, to_load=None,
+                                                           to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle=True)
+                                                           shuffle_train=True)
     return train_dataset, val_dataset
 
 
@@ -168,11 +169,15 @@ def prepare_embedding_model(model_config, model_directory):
     return gine_conv_model
 
 
-def prepare_experiment(endpoint_location, queries_location, rdf2vec_vector_location,
+def prepare_experiment(endpoint_location,
+                       queries_location_train, queries_location_val,
+                       rdf2vec_vector_location,
                        occurrences_location, tp_cardinality_location,
                        model_config, model_directory):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    train_dataset, val_dataset = prepare_queries(query_env, queries_location, endpoint_location,
+    train_dataset, val_dataset = prepare_queries(query_env,
+                                                 queries_location_train, queries_location_val,
+                                                 endpoint_location,
                                                  rdf2vec_vector_location, occurrences_location,
                                                  tp_cardinality_location)
     gine_conv_model = prepare_embedding_model(model_config, model_directory)
@@ -591,7 +596,8 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     if query_location_dict:
         train_dataset, val_dataset = prepare_queries(query_env,
-                                                     query_location_dict['queries'],
+                                                     query_location_dict['queries_train'],
+                                                     query_location_dict['queries_val'],
                                                      endpoint_location,
                                                      query_location_dict['rdf2vec_vectors'],
                                                      query_location_dict['occurrences'],

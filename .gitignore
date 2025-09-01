@@ -193,3 +193,7 @@ data/*
 /experiments/experiment_outputs/*
 /tensorboard_logs
 /tensorboard_logs_bak
+
+/large_data
+
+!/data/rdf2vec_embeddings/*/.keep

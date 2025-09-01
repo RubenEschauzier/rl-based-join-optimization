@@ -120,18 +120,20 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
         writer.write_epoch_to_file(val_predictions, best, per_epoch, gine_conv_model, i)
 
 
-def main_pretraining_dataset(queries_location, endpoint_location, rdf2vec_vector_location, writer,
+def main_pretraining_dataset(queries_location_train, queries_location_val,
+                             endpoint_location, rdf2vec_vector_location, writer,
                              feature_type, model_config_location, n_epoch, batch_size, lr, seed,
                              occurrences_location = None, tp_cardinality_location = None,
                              test_queries=None, test_cardinalities=None,
-                             validation_size=.2, to_load=None
+                             to_load=None
                              ):
     faulthandler.enable()
     writer.create_experiment_directory()
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    train_dataset, val_dataset = load_queries_into_dataset(queries_location, endpoint_location,
+    train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
+                                                           endpoint_location,
                                                            rdf2vec_vector_location, query_env, feature_type,
-                                                           validation_size=validation_size, to_load=to_load,
+                                                           to_load=to_load,
                                                            load_mappings=False,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location)

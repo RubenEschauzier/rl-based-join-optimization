@@ -1,0 +1,78 @@
+pretraining:
+  endpoint: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+  dataset_train: "data/generated_queries/star_lubm/dataset_train"
+  dataset_val: "data/generated_queries/star_lubm/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/lubm/rdf2vec_vectors_lubm_depth_3.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head.yaml"
+  occurrences_location: "data/term_occurrences/lubm/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/lubm/tp_cardinalities.json"
+  feature_type: "predicate_edge"
+  n_epoch: 50
+  batch_size: 32
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/lubm"
+
+rl_training:
+  # Note model directory will be determined from the pretraining experiment output and set to the
+  # last epoch checkpoint by default.
+  experiment_1:
+    algorithm: 'ppo'
+    extractor_type: 'tree_lstm'
+    n_steps: 100000
+    n_steps_fine_tune: 50000
+    n_eval_episodes: 200
+    model_save_loc_estimated: "experiments/experiment_outputs/lubm/ppo_lstm_stars_cost_est"
+    model_save_loc_fine_tuned: "experiments/experiment_outputs/lubm/ppo_lstm_stars_fine_tuned"
+    net_arch:
+      - 256
+      - 256
+    feature_dim: 200
+    endpoint_location: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    seed: 0
+  experiment_2:
+    algorithm: 'ppo'
+    extractor_type: 'naive'
+    n_steps: 100000
+    n_steps_fine_tune: 50000
+    n_eval_episodes: 200
+    model_save_loc_estimated: "experiments/experiment_outputs/lubm/ppo_naive_stars_cost_est"
+    model_save_loc_fine_tuned: "experiments/experiment_outputs/lubm/ppo_naive_stars_fine_tuned"
+    net_arch:
+      - 256
+      - 256
+    feature_dim: 200
+    endpoint_location: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    seed: 0
+  experiment_3:
+    algorithm: 'qr_dqn'
+    extractor_type: 'tree_lstm'
+    n_steps: 500000
+    n_steps_fine_tune: 50000
+    n_eval_episodes: 200
+    model_save_loc_estimated: "experiments/experiment_outputs/lubm/qr_dqn_lstm_stars_cost_est"
+    model_save_loc_fine_tuned: "experiments/experiment_outputs/lubm/qr_dqn_lstm_stars_fine_tuned"
+    net_arch:
+      - 256
+      - 256
+    feature_dim: 200
+    endpoint_location: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    seed: 0
+  experiment_4:
+    algorithm: 'qr_dqn'
+    extractor_type: 'naive'
+    n_steps: 500000
+    n_steps_fine_tune: 50000
+    n_eval_episodes: 200
+    model_save_loc_estimated: "experiments/experiment_outputs/lubm/qr_dqn_naive_stars_cost_est"
+    model_save_loc_fine_tuned: "experiments/experiment_outputs/lubm/qr_dqn_naive_stars_fine_tuned"
+    net_arch:
+      - 256
+      - 256
+    feature_dim: 200
+    endpoint_location: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    seed: 0

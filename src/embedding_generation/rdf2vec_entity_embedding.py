@@ -1,5 +1,7 @@
 import json
 import os
+from time import sleep
+import logging
 
 from rdflib.graph import Graph
 from gensim.models import Word2Vec
@@ -61,7 +63,7 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
 
         walks_predicate_tuple = [tuple(x) for x in walks_predicate]
         all_walks.update(walks_predicate_tuple)
-
+    sleep(1)
     print("Number of unique walks after adding walks starting at predicates in graph: {}".format(len(all_walks)))
 
     for subject_uri in tqdm(subjects_uri):
@@ -72,6 +74,7 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
         walks_subject_tuple = [tuple(x) for x in walks_subject]
         all_walks.update(walks_subject_tuple)
 
+    sleep(1)
     print("Number of unique walks after adding walks starting at subjects in graph: {}".format(len(all_walks)))
 
     for object_uri in tqdm(objects_uri):
@@ -82,6 +85,7 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
         walks_object_tuple = [tuple(x) for x in walks_object]
         all_walks.update(walks_object_tuple)
 
+    sleep(1)
     print("Number of unique walks after adding walks starting at objects in graph: {}".format(len(all_walks)))
     return all_walks
 
@@ -176,9 +180,13 @@ def get_average_difference_occurrences(subj_dict_walk, subj_dict, obj_dict_walk,
 
 
 def train_model(walks):
-    corpus = [[str(word) for word in walk] for walk in walks]
+    corpus = [[str(word) for word in walk] for walk in tqdm(walks)]
     vector_dim = 128
-    model = Word2Vec(corpus, min_count=1, window=5, vector_size=vector_dim, epochs=100)
+    print("Training model...")
+    # Enable logging to see progress
+    logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+
+    model = Word2Vec(corpus, min_count=1, window=5, vector_size=vector_dim, epochs=50, workers=6)
     return model
 
 
@@ -219,7 +227,6 @@ def convert_text_to_json(text_file_location, output_location):
 
 def rdf2vec_embedding(num_sim_pred, num_sim_subj, num_sim_obj, depth_walk, dataset_location, output_location,
                       save_model=True):
-    print(dataset_location)
     g = load_graph(dataset_location)
     predicates, predicates_uri, entities, all_pred_occurrences, subjects_uri, objects_uri = get_all_predicates(g)
     walks = generate_walks(g, predicates_uri, subjects_uri, objects_uri,

@@ -1,10 +1,13 @@
 import functools
 import math
+import os
 import typing
 from time import sleep
 
 import torch
 import json
+
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
@@ -37,6 +40,27 @@ def load_raw_queries(queries_location, to_load=None):
         queries.append(Query(query))
     return queries
 
+def split_raw_queries(query_dir, val_proportion, train_dir, val_dir):
+    for file in os.listdir(query_dir):
+        query_location = os.path.join(query_dir, file)
+
+        if os.path.isdir(query_location):
+            continue
+
+        with open(query_location, "r") as f:
+            data = json.load(f)
+        print(f"Total records: {len(data)}")
+
+        train, val = train_test_split(data, test_size=val_proportion, random_state=42)
+
+        print(f"Train: {len(train)}, Val: {len(val)}")
+
+        with open(os.path.join(train_dir, file), "w") as f:
+            json.dump(train, f, indent=2)
+
+        with open(os.path.join(val_dir, file), "w") as f:
+            json.dump(val, f, indent=2)
+
 
 def load_queries_and_cardinalities(queries_location, cardinalities_location=None, to_load=None):
     if cardinalities_location:
@@ -58,13 +82,13 @@ def load_queries_and_cardinalities(queries_location, cardinalities_location=None
 
     return queries, cardinalities
 
-def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vector_location,
+def load_queries_into_dataset(queries_location_train, queries_location_val,
+                              endpoint_location, rdf2vec_vector_location,
                               env,
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
-                              validation_size=.2,
                               load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,
-                              shuffle=True):
+                              shuffle_train=True, shuffle_val=False):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
 
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
@@ -72,18 +96,25 @@ def load_queries_into_dataset(queries_location, endpoint_location, rdf2vec_vecto
                                                     rdf2vec_vector_location, endpoint_location,
                                                     occurrences_location, tp_cardinality_location)
     post_processor = filter_duplicate_subject_predicate_combinations
-    dataset = QueryCardinalityDataset(root=queries_location,
+    train_dataset = QueryCardinalityDataset(root=queries_location_train,
                                       featurizer=featurizer_edge_labeled_graph,
                                       post_processor=post_processor,
                                       to_load=to_load,
                                       load_mappings=load_mappings,
                                       )
-    if shuffle:
-        dataset = dataset.shuffle()
-    train_dataset = dataset[math.floor(len(dataset)*validation_size):]
-    validation_dataset = dataset[:math.floor(len(dataset)*validation_size)]
+    val_dataset = QueryCardinalityDataset(root=queries_location_val,
+                                      featurizer=featurizer_edge_labeled_graph,
+                                      post_processor=post_processor,
+                                      to_load=to_load,
+                                      load_mappings=load_mappings,
+                                      )
 
-    return train_dataset, validation_dataset
+    if shuffle_train:
+        train_dataset = train_dataset.shuffle()
+    if shuffle_val:
+        val_dataset = val_dataset.shuffle()
+
+    return train_dataset, val_dataset
 
 def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge"],
                     vectors, query_env,
@@ -107,4 +138,11 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
     return functools.partial(query_to_graph.transform_undirected)
 
 if __name__ == '__main__':
-    load_queries_and_cardinalities(r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data\generated_queries_subsampler\stars_2.json")
+    dataset_name = "star_yago"
+    raw_queries_loc = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}".format(dataset_name)
+    train_queries_loc = \
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_train\raw".format(dataset_name)
+    val_queries_loc = \
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val\raw".format(dataset_name)
+
+    split_raw_queries(raw_queries_loc, .1, train_queries_loc, val_queries_loc)

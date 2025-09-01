@@ -15,7 +15,8 @@ rl_training:
     model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
     model_directory: "experiments/experiment_outputs/pretrain_experiment_triple_conv_l1loss_full_run-05-07-2025/epoch-49/model"
     query_location_dict:
-      queries: "data/pretrain_data/datasets/p_e_size_3_5_101"
+      queries_train: "data/pretrain_data/datasets/p_e_size_3_5_101"
+      queries_val: "data/pretrain_data/datasets/p_e_size_3_5_101"
       rdf2vec_vectors: "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
       occurrences: "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
       tp_cardinalities: "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"

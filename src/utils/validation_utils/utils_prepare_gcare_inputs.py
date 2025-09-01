@@ -1,6 +1,13 @@
+import json
+
 from src.baselines.enumeration import JoinOrderEnumerator, build_adj_list
+from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
+from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 import os
+
+from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
+from src.utils.training_utils.query_loading_utils import load_featurizer
 
 dataset_to_g_care = {
     'yago': '<http://example.com/13000179>',
@@ -84,10 +91,24 @@ def write_g_care_to_file(filename, vertex_dict, edge_list, query_idx):
             f.write("\n")
 
 
-def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, base_output_location):
+def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_id_mapping, id_to_id_mapping_predicate,
+                                      base_output_location):
     os.makedirs(os.path.join(base_output_location, dataset_name), exist_ok=True)
     file_name_to_query = {}
-    for query in torch_query_dataset:
+    query_dir_template = "query_{}"
+    query_name_template = "sub_query_{}.txt"
+    for i, query in enumerate(torch_query_dataset):
+        query_dir = query_dir_template.format(i)
+        file_name_to_query[query_dir] = query
+        with open(os.path.join(base_output_location, dataset_name, "file_name_to_query.json"), "w") as f:
+            json.dump(file_name_to_query, f, indent=2)
+        vertex_dict, edge_list = query_to_g_care(query, id_to_id_mapping, id_to_id_mapping_predicate, dataset_name)
+        sub_queries = map_query_to_sub_queries(query)
+        for j, sub_query in enumerate(sub_queries):
+            file_name_sub_query = os.path.join(base_output_location,
+                                               dataset_name, query_dir,
+                                               query_name_template.format(i))
+            # TODO: Convert subquery to a triple pattern list
         # Map file name to query in dictionary and save. Do it every iteration to ensure we can come back when fails
         # Then name all files based on keys used in enumeration, and also name the output of g-care based on the
         # keys used in enumeration. We can then import these as keys to be used in enumeration in the code, because
@@ -136,3 +157,33 @@ def find_sub_queries(n_entries, enumerator):
         sub_queries.add(estimate_key)
 
     return sub_queries
+
+if __name__ == "__main__":
+    # Helper script that converts a query to all sub_queries and converts them to the format used by G-CARE so G-CARE
+    # Can estimate cardinality for each sub-query.
+    # TEMP This should point to the processed validation queries for each dataset
+    dataset_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data/pretrain_data/datasets/p_e_size_3_5_101"
+    rdf2vec_vectors_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\input\rdf2vec_embeddings\rdf2vec_vectors_depth_2_quick.json"
+    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
+    raw_data_dir = r"C:\Users\ruben\projects\rl-based-join-optimization\data/pretrain_data/datasets/p_e_size_3_5_101/raw"
+    vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vectors_location)
+    env = BlazeGraphQueryEnvironment(endpoint_location)
+
+    # query_location_dict:
+    #   queries: "data/pretrain_data/datasets/p_e_size_3_5_101"
+    #   rdf2vec_vectors: "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
+    #   occurrences: "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
+    #   tp_cardinalities: "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
+    featurizer_edge_labeled_graph = load_featurizer("predicate_edge",
+                                                    vectors, env,
+                                                    rdf2vec_vectors_location, endpoint_location)
+    post_processor = filter_duplicate_subject_predicate_combinations
+
+    dataset = QueryCardinalityDataset(root=dataset_location,
+                                      featurizer=featurizer_edge_labeled_graph,
+                                      post_processor=post_processor,
+                                      load_mappings=True,
+                                      raw_data_dir=raw_data_dir,)
+    for data in dataset:
+        print(data)
+        break
