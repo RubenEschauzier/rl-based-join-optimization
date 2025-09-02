@@ -93,14 +93,14 @@ class JoinOrderEnumerator:
         csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
         for csg_cmp_pair in csg_cmp_pairs:
             csg, cmp = csg_cmp_pair[0], csg_cmp_pair[1]
-            tree1_key = tuple(self._sort_array_asc(list(csg)))
-            tree2_key = tuple(self._sort_array_asc(list(cmp)))
+            tree1_key = tuple(self.sort_array_asc(list(csg)))
+            tree2_key = tuple(self.sort_array_asc(list(cmp)))
 
             tree1 = best_plan[tree1_key]
             tree2 = best_plan[tree2_key]
             new_entries = tree1.entries | tree2.entries
 
-            estimate_key = tuple(self._sort_array_asc(list(new_entries)))
+            estimate_key = tuple(self.sort_array_asc(list(new_entries)))
             estimate = self.estimated_cardinality(estimate_key)
 
             self.update_best_plan(tree1, tree2, new_entries, estimate, best_plan, best_plan_left_deep, False)
@@ -148,7 +148,7 @@ class JoinOrderEnumerator:
         for vertex in x:
             neighbours.discard(vertex)
 
-        for vertex in self._sort_set_desc(neighbours):
+        for vertex in self.sort_set_desc(neighbours):
             cmps.append({vertex})
             reduced_neighbours = self._reduce_set(vertex, neighbours)
             self._enumerate_csg_recursive(
@@ -187,7 +187,7 @@ class JoinOrderEnumerator:
                 curr_plan = curr_plan_left
             else:
                 raise ValueError("Bushy plan passed to left-deep update")
-            curr_plan_key = tuple(self._sort_array_asc(list(curr_plan.entries)))
+            curr_plan_key = tuple(self.sort_array_asc(list(curr_plan.entries)))
             if (curr_plan_key not in best_plan_left_deep or
                     best_plan_left_deep[curr_plan_key].cost > curr_plan.cost):
                 best_plan_left_deep[curr_plan_key] = curr_plan
@@ -198,7 +198,7 @@ class JoinOrderEnumerator:
             curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
                          else curr_plan_left)
 
-            curr_plan_key = tuple(self._sort_array_asc(list(curr_plan.entries)))
+            curr_plan_key = tuple(self.sort_array_asc(list(curr_plan.entries)))
 
             if (curr_plan_key not in best_plan or
                     best_plan[curr_plan_key].cost > curr_plan.cost):

@@ -6,6 +6,7 @@ from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 import os
 
+from src.query_environments.gym.query_gym_estimated_cost import QueryGymEstimatedCost
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 from src.utils.training_utils.query_loading_utils import load_featurizer
 
@@ -53,7 +54,6 @@ def query_to_g_care(query, id_to_id_mapping, id_to_id_mapping_predicate, dataset
         except KeyError:
             dvid = 76711
         if vertex in vertex_labels:
-            # print('In vertex')
             try:
                 labels = [id_to_id_mapping[v] for v in vertex_labels[vertex]]
             except KeyError:
@@ -99,16 +99,24 @@ def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_i
     query_name_template = "sub_query_{}.txt"
     for i, query in enumerate(torch_query_dataset):
         query_dir = query_dir_template.format(i)
-        file_name_to_query[query_dir] = query
+        file_name_to_query[query_dir] = query.query
         with open(os.path.join(base_output_location, dataset_name, "file_name_to_query.json"), "w") as f:
             json.dump(file_name_to_query, f, indent=2)
-        vertex_dict, edge_list = query_to_g_care(query, id_to_id_mapping, id_to_id_mapping_predicate, dataset_name)
-        sub_queries = map_query_to_sub_queries(query)
-        for j, sub_query in enumerate(sub_queries):
+        os.mkdir(os.path.join(base_output_location, dataset_name, query_dir))
+
+        sub_queries, sub_query_keys = map_query_to_sub_queries(query)
+        sub_query_file_name_to_sub_query = {}
+        for j in range(len(sub_queries)):
             file_name_sub_query = os.path.join(base_output_location,
                                                dataset_name, query_dir,
-                                               query_name_template.format(i))
-            # TODO: Convert subquery to a triple pattern list
+                                               query_name_template.format(j))
+            sub_query_file_name_to_sub_query[file_name_sub_query] = sub_query_keys[j]
+
+            query_triple_patterns = [tp.strip().split(' ') for tp in sub_queries[j].triple_patterns]
+            vertex_dict, edge_list = query_to_g_care(query_triple_patterns, id_to_id_mapping,
+                                                     id_to_id_mapping_predicate, dataset_name)
+            write_g_care_to_file(file_name_sub_query, vertex_dict, edge_list, j)
+        break
         # Map file name to query in dictionary and save. Do it every iteration to ensure we can come back when fails
         # Then name all files based on keys used in enumeration, and also name the output of g-care based on the
         # keys used in enumeration. We can then import these as keys to be used in enumeration in the code, because
@@ -128,13 +136,13 @@ def map_query_to_sub_queries(query):
     enumerator = JoinOrderEnumerator(adj_list, lambda x: 1, n_entries)
     sub_queries = find_sub_queries(n_entries, enumerator)
     sub_query_strings = []
+    sub_query_keys = []
     for sub_query in sub_queries:
-        sub_query_string = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
-                                                                                list(sub_query),
-                                                                                query.triple_patterns)
-        sub_query_string.replace('hint:Query hint:optimizer "None" . \n', '')
-        sub_query_strings.append(sub_query_string)
-    return sub_query_strings
+        sub_query = list(sub_query)
+        sub_query_obj = QueryGymEstimatedCost.reduced_form_query(query, sub_query, len(sub_query))
+        sub_query_strings.append(sub_query_obj)
+        sub_query_keys.append(sub_query)
+    return sub_query_strings, sub_query_keys
 
 
 def find_sub_queries(n_entries, enumerator):
@@ -158,32 +166,48 @@ def find_sub_queries(n_entries, enumerator):
 
     return sub_queries
 
+def load_mappings(id_to_id_mapping_loc, id_to_id_mapping_predicate_loc):
+    with open(id_to_id_mapping_loc, "r") as f:
+        id_to_id_mapping = json.load(f)
+
+    with open(id_to_id_mapping_predicate_loc, "r") as f:
+        id_to_id_mapping_predicate = json.load(f)
+    return id_to_id_mapping, id_to_id_mapping_predicate
+
 if __name__ == "__main__":
     # Helper script that converts a query to all sub_queries and converts them to the format used by G-CARE so G-CARE
     # Can estimate cardinality for each sub-query.
     # TEMP This should point to the processed validation queries for each dataset
-    dataset_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data/pretrain_data/datasets/p_e_size_3_5_101"
-    rdf2vec_vectors_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\input\rdf2vec_embeddings\rdf2vec_vectors_depth_2_quick.json"
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
-    raw_data_dir = r"C:\Users\ruben\projects\rl-based-join-optimization\data/pretrain_data/datasets/p_e_size_3_5_101/raw"
+    query_type = "path_lubm"
+    dataset_name = "lubm"
+    dataset_location = \
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val".format(query_type)
+    rdf2vec_vectors_location = \
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\rdf2vec_embeddings\{}\rdf2vec_vectors_{}_depth_3.json".format(dataset_name, dataset_name)
+    occurrence_location = (
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}\occurrences.json".format(dataset_name))
+    tp_card_location = (
+        r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}\tp_cardinalities.json".format(dataset_name))
+    endpoint_location = "http://localhost:9999/blazegraph/namespace/lubm/sparql"
+    raw_data_dir = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val\raw".format(query_type)
+    id_to_id_loc = r"C:\Users\ruben\projects\rl-based-join-optimization\data\benchmark_g_care_format\{}\id_to_id_{}.json".format(dataset_name, dataset_name)
+    id_to_id_predicate_loc = r"C:\Users\ruben\projects\rl-based-join-optimization\data\benchmark_g_care_format\{}\id_to_id_predicate_{}.json".format(dataset_name, dataset_name)
+    output_dir = r"C:\Users\ruben\projects\rl-based-join-optimization\data\query_enumeration_g_care\{}".format(query_type)
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vectors_location)
     env = BlazeGraphQueryEnvironment(endpoint_location)
 
-    # query_location_dict:
-    #   queries: "data/pretrain_data/datasets/p_e_size_3_5_101"
-    #   rdf2vec_vectors: "data/input/rdf2vec_vectors_gnce/vectors_gnce.json"
-    #   occurrences: "data/pretrain_data/pattern_term_cardinalities/full/occurrences.json"
-    #   tp_cardinalities: "data/pretrain_data/pattern_term_cardinalities/full/tp_cardinalities.json"
     featurizer_edge_labeled_graph = load_featurizer("predicate_edge",
                                                     vectors, env,
-                                                    rdf2vec_vectors_location, endpoint_location)
+                                                    rdf2vec_vectors_location,
+                                                    endpoint_location,
+                                                    occurrences_location=occurrence_location,
+                                                    tp_cardinality_location=tp_card_location)
     post_processor = filter_duplicate_subject_predicate_combinations
 
     dataset = QueryCardinalityDataset(root=dataset_location,
-                                      featurizer=featurizer_edge_labeled_graph,
-                                      post_processor=post_processor,
-                                      load_mappings=True,
-                                      raw_data_dir=raw_data_dir,)
-    for data in dataset:
-        print(data)
-        break
+                                           featurizer=featurizer_edge_labeled_graph,
+                                           post_processor=post_processor,
+                                           load_mappings=True,
+                                           raw_data_dir=raw_data_dir, )
+    id_to_id, id_to_id_predicate = load_mappings(id_to_id_loc, id_to_id_predicate_loc)
+    map_dataset_to_g_care_query_files(dataset, dataset_name, id_to_id, id_to_id_predicate, output_dir)

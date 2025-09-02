@@ -6,5 +6,4 @@ def filter_duplicate_subject_predicate_combinations(query):
         subject_predicate_count[key] = subject_predicate_count.get(key, 0) + 1
     if any(count >= 2 for count in subject_predicate_count.values()):
         return None
-    print("Returning!")
     return query
