@@ -138,7 +138,7 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
     return functools.partial(query_to_graph.transform_undirected)
 
 if __name__ == '__main__':
-    dataset_name = "star_yago"
+    dataset_name = "path_watdiv"
     raw_queries_loc = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}".format(dataset_name)
     train_queries_loc = \
         r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_train\raw".format(dataset_name)

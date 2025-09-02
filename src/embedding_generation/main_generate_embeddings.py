@@ -26,3 +26,15 @@ if __name__ == "__main__":
 
         main_rdf2vec(n_sim_pred, n_sim_subj, n_sim_obj, depth_walk,
                      instantiation_benchmark_location, rdf2vec_vector_save_location)
+
+    if rdf2vec_embed and memory_save:
+        n_sim_pred = 1000
+        n_sim_subj = 100
+        n_sim_obj = 100
+        depth_walk = 3
+        rdf2vec_vector_save_location = os.path.join(project_root, "data", "rdf2vec_embeddings", dataset_name,
+                                                    "rdf2vec_vectors_{}_depth_{}.txt".format(dataset_name, depth_walk))
+        temp_save_loc_template = "walks_{}.txt"
+
+        main_rdf2vec(n_sim_pred, n_sim_subj, n_sim_obj, depth_walk,
+                     instantiation_benchmark_location, rdf2vec_vector_save_location)

@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from time import sleep
 import logging
 
@@ -54,7 +55,7 @@ def load_graph(dataset_location):
     return g
 
 
-def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, num_sim_subj, num_sim_obj, depth_walk):
+def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, num_sim_subj, num_sim_obj, depth_walk,):
     all_walks = set()
     for predicate_uri in tqdm(predicates_uri):
         triples_with_predicate = g.triples((None, predicate_uri, None))
@@ -88,6 +89,48 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
     sleep(1)
     print("Number of unique walks after adding walks starting at objects in graph: {}".format(len(all_walks)))
     return all_walks
+
+def generate_walks_to_file(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, num_sim_subj, num_sim_obj,
+                           depth_walk, save_walk_template):
+    predicate_based_walks = set()
+    for predicate_uri in tqdm(predicates_uri):
+        triples_with_predicate = g.triples((None, predicate_uri, None))
+        tp = list(triples_with_predicate)
+        walks_predicate, num_walks_predicate = generate_walks_from_start_triple(g, num_sim_pred, tp, depth_walk)
+
+        walks_predicate_tuple = [tuple(x) for x in walks_predicate]
+        predicate_based_walks.update(walks_predicate_tuple)
+
+    with open(save_walk_template.format(0), "wb") as f:
+        pickle.dump(predicate_based_walks, f)
+
+    print("Number of walks predicate tuple: {}".format(len(predicate_based_walks)))
+
+    subject_based_walks = set()
+    for subject_uri in tqdm(subjects_uri):
+        triples_with_subject = g.triples((subject_uri, None, None))
+        tp = list(triples_with_subject)
+        walks_subject, num_walks_subject = generate_walks_from_start_triple(g, num_sim_subj, tp, depth_walk)
+
+        walks_subject_tuple = [tuple(x) for x in walks_subject]
+        subject_based_walks.update(walks_subject_tuple)
+
+    with open(save_walk_template.format(1), "wb") as f:
+        pickle.dump(subject_based_walks, f)
+    print("Number of walks subject: {}".format(len(subject_based_walks)))
+
+    objects_based_walks = set()
+    for object_uri in tqdm(objects_uri):
+        triples_with_object = g.triples((None, None, object_uri))
+        tp = list(triples_with_object)
+        walks_object, num_walks_object = generate_walks_from_start_triple(g, num_sim_obj, tp, depth_walk)
+
+        walks_object_tuple = [tuple(x) for x in walks_object]
+        objects_based_walks.update(walks_object_tuple)
+
+    with open(save_walk_template.format(2), "wb") as f:
+        pickle.dump(objects_based_walks, f)
+    print("Number of walks subject: {}".format(len(objects_based_walks)))
 
 
 def generate_walks_from_start_triple(g, num_sim, tp, max_depth_walk):
@@ -232,6 +275,27 @@ def rdf2vec_embedding(num_sim_pred, num_sim_subj, num_sim_obj, depth_walk, datas
     walks = generate_walks(g, predicates_uri, subjects_uri, objects_uri,
                            num_sim_pred, num_sim_subj, num_sim_obj,
                            depth_walk)
+
+    model = train_model(walks)
+    if save_model:
+        save_rdf_predicate_model(model, predicates, output_location)
+        convert_text_to_json(output_location, output_location.replace('.txt', '.json'))
+
+# Ugly solution. Easy to fix: Use the pyrdf2vec library which uses an endpoint.
+def rdf2vec_embedding_low_memory(num_sim_pred, num_sim_subj, num_sim_obj, depth_walk, dataset_location, output_location,
+                                 walk_file_template, save_model=True):
+    g = load_graph(dataset_location)
+    predicates, predicates_uri, entities, all_pred_occurrences, subjects_uri, objects_uri = get_all_predicates(g)
+    # Separating the walk generation in parts and the model training should hopefully encourage the GC to discard
+    # previously generated walks, thus allowing memory usage to be reduced. This is only a problem for yago (possibly
+    # also wikidata). Again, for future reference, just use the library with an endpoint..
+    generate_walks_to_file(g, predicates_uri, subjects_uri, objects_uri,
+                           num_sim_pred, num_sim_subj, num_sim_obj,
+                           depth_walk, walk_file_template)
+    walks = []
+    for i in range(3):
+        with open(walk_file_template.format(i), 'rb') as f:
+            walks.extend(pickle.load(f))
 
     model = train_model(walks)
     if save_model:

@@ -51,7 +51,7 @@ def get_query_triple_pattern_cardinalities(queries, env):
     return triple_pattern_cardinalities
 
 if __name__ == '__main__':
-    dataset_name = "swdf"
+    dataset_name = "yago"
     query_loc_path = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\path_{}".format(dataset_name)
     query_loc_star = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\star_{}".format(dataset_name)
     output_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}".format(dataset_name)

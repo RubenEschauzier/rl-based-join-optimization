@@ -17,15 +17,11 @@ os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
 
 
 #TODO:
-# Take the .nt and .ttl files downloaded and convert to data graph files for G-CARE.
-# Then validate that I can use G-Care for my queries.
-# Upload to data storage in cloud.
-# Then set up virtual machines for query generation (Star and Path only)
-# and let them run during holiday. Remember to time them.
-# Then next steps:
+# Create occ and tp_occ for wikidata and yago
+# Fix path generation yago (use old version?)
+# Create rdf2vec for wikidata and yago (wip)
 # Pretrain on each dataset (ensure GNCE performance is about the same)
 # Train experiments (4 RL each for each pretrain experiment)
-# Save Validation set for each training run!!
 # Implement own validation runner:
 # - Run model PPO using default validation code on all validation queries at certain checkpoints.
 # - Run QR-DQN with custom variance penalized cost function
@@ -33,9 +29,7 @@ os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
 # - First enumerate join options (use existing)
 # - Write them to file divided by query
 # - Let G-Care do cardinality estimation over them
-# - Use those to make join plans (left-deep only) and get latency / cost
-# - For GNCE Use existing function, just validate its correctness, also validate why PPO goes higher reward than
-# - enumeration
+# - Use those to make join plans and get latency / cost
 # Use hand-crafted / wikidata user queries
 # - Apply same validation
 # Metrics to use:
@@ -43,7 +37,7 @@ os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
 # - Query latency (averaged over 10? runs)
 # Figures:
 # - Box plot of latency / cost per shape and combined shapes
-# - Training curves with 50 random seeds for WatDiv path / star and Wikidata path / star
+# - Training curves with 50 random seeds for WatDiv path / star and Wikidata path / star (or whatever is typical dataset)
 # Table showing ablation study
 # - No pretraining
 # - No fine-tuning
