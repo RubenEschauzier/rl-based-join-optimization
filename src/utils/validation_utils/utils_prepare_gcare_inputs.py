@@ -123,15 +123,6 @@ def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_i
         with open(os.path.join(base_output_location, dataset_name, query_dir, "sub_query_to_file.json"), "w") as f:
             json.dump(sub_query_file_name_to_sub_query, f, indent=2)
 
-        break
-        # Map file name to query in dictionary and save. Do it every iteration to ensure we can come back when fails
-        # Then name all files based on keys used in enumeration, and also name the output of g-care based on the
-        # keys used in enumeration. We can then import these as keys to be used in enumeration in the code, because
-        # that also uses these keys to get cardinalities
-        pass
-
-    pass
-
 
 def map_query_string_to_g_care(query_string):
     pass
@@ -185,7 +176,7 @@ if __name__ == "__main__":
     # Helper script that converts a query to all sub_queries and converts them to the format used by G-CARE so G-CARE
     # Can estimate cardinality for each sub-query.
     # TEMP This should point to the processed validation queries for each dataset
-    query_type = "path_lubm"
+    query_type = "star_lubm"
     dataset_name = "lubm"
     dataset_location = \
         r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val".format(query_type)
