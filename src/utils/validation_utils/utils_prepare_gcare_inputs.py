@@ -1,4 +1,7 @@
 import json
+import warnings
+
+from tqdm import tqdm
 
 from src.baselines.enumeration import JoinOrderEnumerator, build_adj_list
 from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
@@ -34,8 +37,8 @@ def query_to_g_care(query, id_to_id_mapping, id_to_id_mapping_predicate, dataset
 
         rdf_type_uri = dataset_to_g_care[dataset_name]
 
-        if not rdf_type_uri:
-            raise AssertionError("rdf type uri missing !")
+        if rdf_type_uri is None:
+            raise AssertionError("rdf type uri missing!")
 
         if (tp[1] == rdf_type_uri) and ('?' not in tp[2]):
 
@@ -52,6 +55,7 @@ def query_to_g_care(query, id_to_id_mapping, id_to_id_mapping_predicate, dataset
         try:
             dvid = id_to_id_mapping[vertex] if not "?" in vertex else -1
         except KeyError:
+            warnings.warn("vertex {} not found in id_to_id_mapping !".format(vertex))
             dvid = 76711
         if vertex in vertex_labels:
             try:
@@ -97,12 +101,12 @@ def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_i
     file_name_to_query = {}
     query_dir_template = "query_{}"
     query_name_template = "sub_query_{}.txt"
-    for i, query in enumerate(torch_query_dataset):
+    for i, query in tqdm(enumerate(torch_query_dataset)):
         query_dir = query_dir_template.format(i)
-        file_name_to_query[query_dir] = query.query
-        with open(os.path.join(base_output_location, dataset_name, "file_name_to_query.json"), "w") as f:
+        file_name_to_query[query.query] = query_dir
+        with open(os.path.join(base_output_location, dataset_name, "query_to_file.json"), "w") as f:
             json.dump(file_name_to_query, f, indent=2)
-        os.mkdir(os.path.join(base_output_location, dataset_name, query_dir))
+        os.makedirs(os.path.join(base_output_location, dataset_name, query_dir), exist_ok=True)
 
         sub_queries, sub_query_keys = map_query_to_sub_queries(query)
         sub_query_file_name_to_sub_query = {}
@@ -110,12 +114,15 @@ def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_i
             file_name_sub_query = os.path.join(base_output_location,
                                                dataset_name, query_dir,
                                                query_name_template.format(j))
-            sub_query_file_name_to_sub_query[file_name_sub_query] = sub_query_keys[j]
+            sub_query_file_name_to_sub_query[str(tuple(sub_query_keys[j]))] = file_name_sub_query
 
             query_triple_patterns = [tp.strip().split(' ') for tp in sub_queries[j].triple_patterns]
             vertex_dict, edge_list = query_to_g_care(query_triple_patterns, id_to_id_mapping,
                                                      id_to_id_mapping_predicate, dataset_name)
             write_g_care_to_file(file_name_sub_query, vertex_dict, edge_list, j)
+        with open(os.path.join(base_output_location, dataset_name, query_dir, "sub_query_to_file.json"), "w") as f:
+            json.dump(sub_query_file_name_to_sub_query, f, indent=2)
+
         break
         # Map file name to query in dictionary and save. Do it every iteration to ensure we can come back when fails
         # Then name all files based on keys used in enumeration, and also name the output of g-care based on the

@@ -309,3 +309,19 @@ def main_rdf2vec(num_sim_pred, num_sim_subj, num_sim_obj, depth_walk, instantiat
                       instantiation_benchmark_location,
                       vector_save_location,
                       True)
+
+if __name__ == "__main__":
+    # Testing should be removed in github :)
+    import gensim.downloader as api
+
+    # Load a small pretrained model (6 MB)
+    model = api.load("glove-wiki-gigaword-50")
+
+    print("Vocabulary size:", len(model.index_to_key))
+    print("Vector size:", model.vector_size)
+
+    # Iterate over words and vectors
+    for i, word in enumerate(model.index_to_key[:10]):
+        print(word)
+        vector = model[word]
+        print(f"{i + 1}. {word} -> {vector[:5]} ...")  # show first 5 dims
