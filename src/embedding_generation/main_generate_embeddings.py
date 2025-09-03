@@ -3,7 +3,7 @@ import os
 import pickle
 
 from onehot_entity_embedding import main_onehot_embedding
-from rdf2vec_entity_embedding import main_rdf2vec, rdf2vec_embedding_low_memory, train_model, save_rdf_predicate_model
+from rdf2vec_entity_embedding import main_rdf2vec, rdf2vec_embedding_low_memory, train_model
 
 if __name__ == "__main__":
     dataset_name = "yago"
