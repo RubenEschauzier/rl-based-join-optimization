@@ -114,7 +114,7 @@ def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_i
             file_name_sub_query = os.path.join(base_output_location,
                                                dataset_name, query_dir,
                                                query_name_template.format(j))
-            sub_query_file_name_to_sub_query[str(tuple(sub_query_keys[j]))] = file_name_sub_query
+            sub_query_file_name_to_sub_query[str(tuple(sub_query_keys[j]))] = query_name_template.format(j)
 
             query_triple_patterns = [tp.strip().split(' ') for tp in sub_queries[j].triple_patterns]
             vertex_dict, edge_list = query_to_g_care(query_triple_patterns, id_to_id_mapping,
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     # Helper script that converts a query to all sub_queries and converts them to the format used by G-CARE so G-CARE
     # Can estimate cardinality for each sub-query.
     # TEMP This should point to the processed validation queries for each dataset
-    query_type = "star_lubm"
+    query_type = "path_lubm"
     dataset_name = "lubm"
     dataset_location = \
         r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val".format(query_type)
