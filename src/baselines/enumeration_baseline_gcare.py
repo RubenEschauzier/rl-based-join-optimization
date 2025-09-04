@@ -2,13 +2,21 @@ import json
 import os
 import subprocess
 
-def main_cardinality_estimation_g_care(query_location):
+def main_cardinality_estimation_g_care(executable, method, query_location):
 
     query_to_directory = read_json_dict(os.path.join(queries_location, 'query_to_file.json'))
 
     for query, query_dir in query_to_directory.items():
         sub_query_to_file = read_json_dict(os.path.join(queries_location, query_dir, 'sub_query_to_file.json'))
-
+        for sub_query_file in sub_query_to_file.values():
+            sub_query_loc = os.path.join(query_location, query_dir, sub_query_file)
+            cmd = [
+                executable,
+                "-q",
+                "-m", method
+            ]
+            print(sub_query_loc)
+        print(sub_query_to_file)
         break
 
 
@@ -55,7 +63,7 @@ if __name__ == "__main__":
     input_location_dataset = f"{project_root}/data/benchmark_g_care_format/{dataset}/{dataset}.txt".format(dataset, dataset)
     # Template: Fill in with actual method being used
     output_location_graph_and_summary_templ = f"{project_root}/data/benchmark_g_care_format/{dataset}/{"{}"}/"
-    build_first = True
+    build_first = False
     if build_first:
         build_summary_all_methods(g_care_graph_executable, 
                                   methods_g_care_graph, 
