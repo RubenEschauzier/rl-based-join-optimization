@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import numpy as np
 import rdflib
@@ -91,16 +92,16 @@ class QueryToEdgePredicateGraph:
             if self.term_occurrences and term.n3() in self.term_occurrences:
                 term_count = self.term_occurrences[term.n3()]
             else:
-                print("Counts not exist: {}".format(term.n3()))
+                warnings.warn("Precomputed count does not exist: {}".format(term.n3()))
                 term_count = self.get_term_count(term.n3())
-                print("Term count: {}".format(term_count))
-
+                print("Actual term count: {}".format(term_count))
             if log_occurrences:
                 term_count = math.log(term_count)
             entity_embedding = [term_count]
             if self.entity_embeddings.get(str(term)):
                 entity_embedding.extend(self.entity_embeddings.get(str(term)))
             else:
+                warnings.warn("Embedding does not exist: {}".format(term.n3()))
                 entity_embedding.extend([0] * self.vector_size)
             return entity_embedding
         else:
