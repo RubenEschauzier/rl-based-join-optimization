@@ -191,11 +191,10 @@ data/*
 /outputs
 
 /experiments/experiment_outputs/*
-!/experiments/experiment_outputs/lubm/.keep
-!/experiments/experiment_outputs/watdiv/.keep
-!/experiments/experiment_outputs/swdf/.keep
-!/experiments/experiment_outputs/yago/.keep
-!/experiments/experiment_outputs/wikidata/.keep
+
+!/experiments/experiment_outputs/**/.keep
+!/experiments/experiment_outputs/**/
+
 
 
 /tensorboard_logs
