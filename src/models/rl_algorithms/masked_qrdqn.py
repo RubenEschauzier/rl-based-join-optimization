@@ -2,15 +2,9 @@
 # Observation of the environment. This is inefficient when it comes to cpu cycles for forward calls, BUT compared
 # to the cost of running the environment (join plan execution) this is very little and it saves me having to implement
 # recurrent policies
-import traceback
-from collections import OrderedDict
-
 import numpy as np
-import gymnasium as gym
 import torch
-import torch.nn as nn
 
-from gym.vector.utils import spaces
 from copy import deepcopy
 from typing import Any, ClassVar, Optional, TypeVar, Union
 from gymnasium import spaces
@@ -24,11 +18,10 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, RolloutReturn, TrainFreq, \
-    TrainFrequencyUnit, PyTorchObs
+    TrainFrequencyUnit
 from stable_baselines3.common.utils import get_linear_fn, get_parameters_by_name, polyak_update, \
     should_collect_more_steps
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from src.models.rl_algorithms.maskable_qrdqn_policy import MaskableQRDQNPolicy
 from src.models.rl_algorithms.maskable_quantile_network import MaskableQuantileNetwork
