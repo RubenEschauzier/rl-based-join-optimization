@@ -8,7 +8,6 @@ pandas==1.3.4
 pyrdf2vec==0.2.3
 pytest==8.4.0
 pytorch_tree_lstm==0.1.3
-PyYAML==6.0.1
 PyYAML==6.0.2
 rdflib==7.1.4
 Requests==2.32.5
