@@ -1,3 +1,6 @@
+##Installing requirements:
+Needs 
+
 ##TODO:
 
 - [x] Generate prepare small queries ( 20k )
