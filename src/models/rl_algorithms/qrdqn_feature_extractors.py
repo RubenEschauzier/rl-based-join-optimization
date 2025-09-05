@@ -1,6 +1,6 @@
 import math
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor

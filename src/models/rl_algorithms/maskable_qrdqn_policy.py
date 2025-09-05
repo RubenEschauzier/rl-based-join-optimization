@@ -2,7 +2,7 @@ from typing import Union, Optional
 
 import numpy as np
 import torch
-from gym.vector.utils import spaces
+from gymnasium import spaces
 from sb3_contrib.qrdqn.policies import QRDQNPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.type_aliases import Schedule, PyTorchObs
