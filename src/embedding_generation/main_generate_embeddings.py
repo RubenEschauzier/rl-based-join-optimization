@@ -6,24 +6,25 @@ from onehot_entity_embedding import main_onehot_embedding
 from rdf2vec_entity_embedding import main_rdf2vec, rdf2vec_embedding_low_memory, train_model
 
 if __name__ == "__main__":
-    dataset_name = "yago"
-    instantiation_benchmark_location = r"/users/reschauz/rl-based-join-optimization/large_data/yago.nt"
+    project_root = os.getcwd()
+    dataset_name = "lubm"
+    instantiation_benchmark_location = fr"{project_root}/large_data/lubm.nt"
     temp_save_loc_template = "walks_{}.txt"
 
     project_root = os.getcwd()
-    use_saved_walks = True
+    use_saved_walks = False
     onehot_embed = False
     rdf2vec_embed = True
-    memory_save = True
+    memory_save = False
 
     # Rdf2Vec params
     n_sim_pred = 1000
-    n_sim_subj = 20
-    n_sim_obj = 20
+    n_sim_subj = 100
+    n_sim_obj = 100
     depth_walk = 3
     rdf2vec_vector_save_location = os.path.join(project_root,
                                                 "data", "rdf2vec_embeddings", dataset_name,
-                                                "rdf2vec_vectors_{}_depth_{}.txt".format(dataset_name, depth_walk))
+                                                "rdf2vec_vectors_{}_depth_{}_test.txt".format(dataset_name, depth_walk))
 
     if use_saved_walks:
         walks = []

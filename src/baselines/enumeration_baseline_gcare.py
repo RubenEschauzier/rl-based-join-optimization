@@ -60,9 +60,9 @@ if __name__ == "__main__":
     # This assumes the script is run from the root
     project_root = os.getcwd()
     g_care_graph_executable = "/root/projects/gcare/build/gcare_graph"
-    input_location_dataset = f"{project_root}/data/benchmark_g_care_format/{dataset}/{dataset}.txt".format(dataset, dataset)
+    input_location_dataset = f"{project_root}/data/benchmark_g_care_format/{dataset}/{dataset}.txt"
     # Template: Fill in with actual method being used
-    output_location_graph_and_summary_templ = f"{project_root}/data/benchmark_g_care_format/{dataset}/{"{}"}/"
+    output_location_graph_and_summary_templ = f"{project_root}/data/benchmark_g_care_format/{dataset}/{{}}/"
     build_first = False
     if build_first:
         build_summary_all_methods(g_care_graph_executable, 

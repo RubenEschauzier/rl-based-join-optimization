@@ -63,6 +63,9 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
         walks_predicate, num_walks_predicate = generate_walks_from_start_triple(g, num_sim_pred, tp, depth_walk)
 
         walks_predicate_tuple = [tuple(x) for x in walks_predicate]
+        if len(walks_predicate_tuple) == 0:
+            print("Failed to generate walks for object {}".format(predicate_uri))
+
         all_walks.update(walks_predicate_tuple)
     sleep(1)
     print("Number of unique walks after adding walks starting at predicates in graph: {}".format(len(all_walks)))
@@ -73,6 +76,8 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
         walks_subject, num_walks_subject = generate_walks_from_start_triple(g, num_sim_subj, tp, depth_walk)
 
         walks_subject_tuple = [tuple(x) for x in walks_subject]
+        if len(walks_subject_tuple) == 0:
+            print("Failed to generate walks for subject {}".format(subject_uri))
         all_walks.update(walks_subject_tuple)
 
     sleep(1)
@@ -84,6 +89,9 @@ def generate_walks(g, predicates_uri, subjects_uri, objects_uri, num_sim_pred, n
         walks_object, num_walks_object = generate_walks_from_start_triple(g, num_sim_obj, tp, depth_walk)
 
         walks_object_tuple = [tuple(x) for x in walks_object]
+        if len(walks_object_tuple) == 0:
+            print("Failed to generate walks for object {}".format(object_uri))
+
         all_walks.update(walks_object_tuple)
 
     sleep(1)
@@ -172,7 +180,9 @@ def generate_walks_from_start_triple(g, num_sim, tp, max_depth_walk):
             # walk_in_progress.extend(list(start_triple))
             num_triples_chosen += 1
 
-        if len(walk_in_progress) == max_depth_walk * 3 + 3:
+        # Any walk with atleast a triple is valid for input
+        if len(walk_in_progress) >= 3:
+        # if len(walk_in_progress) == max_depth_walk * 3 + 3:
             # Remove the matching subject - object in walk
             last_element = walk_in_progress[-1]
             del walk_in_progress[2::3]

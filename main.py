@@ -1,10 +1,10 @@
 import os
 import re
+
 import hydra
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
-from src.policy_gradient_rl_procedure import run_training_policy_gradient
 from src.pretrain_procedure import main_pretraining_dataset
 from src.rl_fine_tuning_qr_dqn_learning import main_rl_tuning
 from src.utils.training_utils.training_tracking import ExperimentWriter
@@ -13,8 +13,9 @@ from src.utils.training_utils.training_tracking import ExperimentWriter
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
-                                               "experiments", "experiment_configs", "rl_fine_tuning_experiments")
-
+                                               "experiments", "experiment_configs", "combination_experiments")
+# Set config file name
+config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_lubm_stars"
 
 #TODO:
 # Create occ and tp_occ for wikidata and yago
@@ -43,45 +44,8 @@ os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
 # - No fine-tuning
 # - Incase QR-DQN, no penalized variance
 
-def find_last_epoch_directory(base_model_dir):
-    epoch_dirs = [
-        d for d in os.listdir(base_model_dir)
-        if os.path.isdir(os.path.join(base_model_dir, d)) and d.startswith("epoch-")
-    ]
-
-    # Extract the numbers
-    epochs = []
-    for d in epoch_dirs:
-        m = re.match(r"epoch-(\d+)", d)
-        if m:
-            epochs.append((int(m.group(1)), d))
-
-    # Pick the max
-    if epochs:
-        last_epoch_num, last_epoch_dir = max(epochs, key=lambda x: x[0])
-        final_path = os.path.join(base_model_dir, last_epoch_dir, "model")
-        print(f"Last epoch path: {final_path}")
-    else:
-        print("No epoch directories found.")
-    return final_path
-
-
-def main_policy_rl():
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv-default-instantiation/sparql"
-    query_location = "data/input/queries"
-    rdf2vec_vector_location = "data/rdf2vec_vectors/vectors_depth_1_full_entities.json"
-    n_epoch = 50
-    batch_size = 12
-    seed = 0
-    run_training_policy_gradient(query_location, rdf2vec_vector_location, endpoint_location, n_epoch, batch_size, 1e-6,
-                                 4, .99, seed)
-
-
-def main_q_learning_rl():
-    pass
-
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
-            config_name="fine_tune_3_5_stars_ppo_naive")
+            config_name=config_name)
 def main(cfg: DictConfig):
     train_set, val_set = None, None
     writer = None
@@ -91,7 +55,7 @@ def main(cfg: DictConfig):
         with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
             config = yaml.safe_load(f)
 
-        writer = ExperimentWriter(c1.experiment_root_directory, "pretrain_experiment_triple_conv",
+        writer = ExperimentWriter(c1.experiment_root_directory, config_name,
                                   dict(c1), dict(config['model']))
         train_set, val_set = main_pretraining_dataset(
             queries_location_train=c1.dataset_train,
@@ -122,6 +86,23 @@ def main(cfg: DictConfig):
                 model_dir = c2.model_directory
             else:
                 raise ValueError("Either a pretraining experiment or a model directory must be specified")
+
+            if not OmegaConf.select(c2, "query_location_dict", default=None):
+                if "pretraining" not in cfg:
+                    raise ValueError("Either a pretraining experiment or a model directory must be specified")
+                print("INFO: No query_location_dict provided, using train and validation datasets from pretraining")
+                c1 = cfg.pretraining
+                query_location_dict = {
+                    "queries_train": c1.dataset_train,
+                    "queries_val": c1.dataset_val,
+                    "endpoint_location": c1.endpoint,
+                    "rdf2vec_vectors": c1.embeddings,
+                    "occurrences": c1.occurrences_location,
+                    "tp_cardinalities": c1.tp_cardinality_location,
+                }
+            else:
+                query_location_dict = c2.query_location_dict
+
             main_rl_tuning(
                 c2.algorithm,
                 c2.extractor_type,
@@ -137,9 +118,30 @@ def main(cfg: DictConfig):
                 model_dir,
                 train_set,
                 val_set,
-                c2.query_location_dict,
+                query_location_dict,
                 c2.seed
             )
 
+def find_last_epoch_directory(base_model_dir):
+    epoch_dirs = [
+        d for d in os.listdir(base_model_dir)
+        if os.path.isdir(os.path.join(base_model_dir, d)) and d.startswith("epoch-")
+    ]
+
+    # Extract the numbers
+    epochs = []
+    for d in epoch_dirs:
+        m = re.match(r"epoch-(\d+)", d)
+        if m:
+            epochs.append((int(m.group(1)), d))
+
+    # Pick the max
+    if epochs:
+        last_epoch_num, last_epoch_dir = max(epochs, key=lambda x: x[0])
+        final_path = os.path.join(base_model_dir, last_epoch_dir, "model")
+        print(f"Last epoch path: {final_path}")
+    else:
+        print("No epoch directories found.")
+    return final_path
 if __name__ == "__main__":
     main()

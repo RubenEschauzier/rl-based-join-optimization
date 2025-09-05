@@ -9,16 +9,16 @@ from src.datastructures.query import Query, ProcessQuery
 class QueryCardinalityDataset(InMemoryDataset):
 
     def __init__(self, root, featurizer, post_processor=None, load_mappings=True,
-                 to_load=None, file_list=None, raw_data_dir=None, transform=None, pre_transform=None, pre_filter=None):
+                 to_load=None, file_list=None, transform=None, pre_transform=None, pre_filter=None):
         self.featurizer = featurizer
         self.post_processor = post_processor
         self.to_load = to_load
         self.load_mappings = load_mappings
         self._file_list = file_list
-        self._raw_data_dir = raw_data_dir
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
         if os.path.exists(os.path.join(self.processed_dir, "node_mappings.json")) and load_mappings:
+            print("Loading")
             with open(os.path.join(self.processed_dir, "node_mappings.json"), "r") as fr:
                 mappings = json.load(fr)
             self.data_mappings = mappings
@@ -36,7 +36,7 @@ class QueryCardinalityDataset(InMemoryDataset):
             return self._file_list
 
         # Otherwise, discover all files in the raw directory
-        return sorted(os.listdir(self._raw_data_dir))
+        return sorted(os.listdir(self.raw_dir))
         # return [
         #     "fixed_stars_2025-03-30_18-49-33_3.json",
         #     "fixed_stars_2025-03-30_19-10-42_5.json",
@@ -95,7 +95,9 @@ class QueryCardinalityDataset(InMemoryDataset):
         for data in data_list:
             node_mappings.append(data.id_to_term)
             del data.id_to_term
-        self.data_mappings = node_mappings
+
+        if self.load_mappings:
+            self.data_mappings = node_mappings
 
         with open(self.processed_dir + '/node_mappings.json', 'w') as fm:
             # noinspection PyTypeChecker

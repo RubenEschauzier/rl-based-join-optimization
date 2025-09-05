@@ -3,7 +3,6 @@ from abc import ABC
 import torch
 from torch import nn
 from torch_geometric.nn import MessagePassing
-from torch_scatter import scatter_add
 
 #https://github.com/pyg-team/pytorch_geometric/issues/121
 class ChildSumTreeLSTM(MessagePassing, ABC):

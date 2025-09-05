@@ -3,7 +3,7 @@ pretraining:
   dataset_train: "data/generated_queries/path_wikidata/dataset_train"
   dataset_val: "data/generated_queries/path_wikidata/dataset_val"
   embeddings: "data/rdf2vec_embeddings/wikidata/rdf2vec_vectors_wikidata_depth_3.json"
-  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head.yaml"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings.yaml"
   occurrences_location: "data/term_occurrences/wikidata/occurrences.json"
   tp_cardinality_location: "data/term_occurrences/wikidata/tp_cardinalities.json"
   feature_type: "predicate_edge"
@@ -29,7 +29,7 @@ rl_training:
       - 256
     feature_dim: 200
     endpoint_location: "http://localhost:9999/blazegraph/namespace/wikidata/sparql"
-    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
     seed: 0
   experiment_2:
     algorithm: 'ppo'
@@ -44,7 +44,7 @@ rl_training:
       - 256
     feature_dim: 200
     endpoint_location: "http://localhost:9999/blazegraph/namespace/wikidata/sparql"
-    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
     seed: 0
   experiment_3:
     algorithm: 'qr_dqn'
@@ -59,7 +59,7 @@ rl_training:
       - 256
     feature_dim: 200
     endpoint_location: "http://localhost:9999/blazegraph/namespace/wikidata/sparql"
-    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
     seed: 0
   experiment_4:
     algorithm: 'qr_dqn'
@@ -74,5 +74,5 @@ rl_training:
       - 256
     feature_dim: 200
     endpoint_location: "http://localhost:9999/blazegraph/namespace/wikidata/sparql"
-    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head.yaml"
+    model_config_location: "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
     seed: 0
