@@ -12,6 +12,9 @@ from src.models.model_layers.directional_gine_conv import DirectionalGINEConv
 from src.models.model_layers.triple_gine_conv import TripleGineConv
 from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
 
+print(torch_geometric.__version__)
+print(torch.__version__)
+
 class GINEConvModel(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
