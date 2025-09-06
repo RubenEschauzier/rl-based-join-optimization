@@ -7,3 +7,14 @@ def filter_duplicate_subject_predicate_combinations(query):
     if any(count >= 2 for count in subject_predicate_count.values()):
         return None
     return query
+
+def filter_failed_cardinality_queries(query):
+    if query.y == -1:
+        return None
+    return query
+
+def query_post_processor(query):
+    query = filter_failed_cardinality_queries(query)
+    if query is None:
+        return query
+    return filter_failed_cardinality_queries(query)
