@@ -27,7 +27,7 @@ class QueryGymExecutionCost(QueryGymBase):
         # Passing occurrence information ensures a proper slowdown triple pattern gets added.
         if tp_occurrences:
             for tp, card in tp_occurrences.items():
-                if min_card_slow_down <= card <= max_card_slow_down:
+                if min_card_slow_down <= int(card) <= max_card_slow_down:
                     self.query_slow_down_patterns = [tp]
                     break
         else:
