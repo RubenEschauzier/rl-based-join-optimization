@@ -5,6 +5,8 @@ import warnings
 from datetime import datetime
 
 import torch
+from stable_baselines3.common.callbacks import BaseCallback
+from tqdm import tqdm
 
 
 class TrainSummary:

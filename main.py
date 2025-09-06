@@ -9,15 +9,13 @@ from src.pretrain_procedure import main_pretraining_dataset
 from src.rl_fine_tuning_qr_dqn_learning import main_rl_tuning
 from src.utils.training_utils.training_tracking import ExperimentWriter
 
-import tensorboard
-print(tensorboard.__version__)
 # Root dir global for file loading
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
                                                "experiments", "experiment_configs", "combination_experiments")
 # Set config file name
-config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_lubm_stars"
+config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars"
 
 #TODO:
 # Create occ and tp_occ for wikidata and yago

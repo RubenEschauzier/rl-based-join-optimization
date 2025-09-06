@@ -9,7 +9,7 @@ from matplotlib import pyplot as plt
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from scipy.stats import linregress, stats
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, ProgressBarCallback
 from stable_baselines3.common.monitor import Monitor
 
 from src.models.model_instantiator import ModelFactory
@@ -321,7 +321,8 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
         render=False,
     )
     start_est = time.time()
-    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
+    progress_callback_pretrain = ProgressBarCallback()
+    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate, progress_callback_pretrain])
     end_est = time.time()
     model.save(model_save_loc_estimated)
     with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f:
@@ -347,7 +348,10 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
         render=False,
     )
     start_tune = time.time()
-    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
+    progress_callback_fine_tune = ProgressBarCallback()
+    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned,
+                                                             ckp_callback_fine_tuning,
+                                                             progress_callback_fine_tune])
     end_tune = time.time()
     model.save(model_save_loc_fine_tuned)
     with open(os.path.join(model_save_loc_fine_tuned, "train_elapsed_fine_tune.txt"), 'w') as f:
@@ -394,7 +398,8 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
         render=False,
     )
     start_est = time.time()
-    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate])
+    progress_callback_pretrain = ProgressBarCallback()
+    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate, progress_callback_pretrain])
     end_est = time.time()
     model.save(model_save_loc_estimated)
     with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f:
@@ -419,7 +424,10 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
         render=False,
     )
     start_tune = time.time()
-    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned, ckp_callback_fine_tuning])
+    progress_callback_fine_tune = ProgressBarCallback()
+    model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned,
+                                                             ckp_callback_fine_tuning,
+                                                             progress_callback_fine_tune])
     end_tune = time.time()
     model.save(model_save_loc_fine_tuned)
     with open(os.path.join(model_save_loc_fine_tuned, "train_elapsed_fine_tune.txt"), 'w') as f:

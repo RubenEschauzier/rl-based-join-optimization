@@ -180,7 +180,7 @@ def generate_walks_from_start_triple(g, num_sim, tp, max_depth_walk):
             # walk_in_progress.extend(list(start_triple))
             num_triples_chosen += 1
 
-        # Any walk with atleast a triple is valid for input
+        # Any walk with at least a triple is valid for input
         if len(walk_in_progress) >= 3:
         # if len(walk_in_progress) == max_depth_walk * 3 + 3:
             # Remove the matching subject - object in walk

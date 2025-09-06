@@ -192,10 +192,6 @@ data/*
 
 /experiments/experiment_outputs/*
 
-!/experiments/experiment_outputs/**/.keep
-!/experiments/experiment_outputs/**/
-
-
 
 /tensorboard_logs
 /tensorboard_logs_bak
