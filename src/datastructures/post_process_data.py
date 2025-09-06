@@ -13,6 +13,7 @@ def filter_failed_cardinality_queries(query):
         return None
     return query
 
+# TODO: This is wrong not sure why yet
 def query_post_processor(query):
     query = filter_failed_cardinality_queries(query)
     if query is None:

@@ -382,13 +382,7 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
 
     tp_cardinality = None
-    if train_dataset is not None or val_dataset is not None and query_location_dict is not None:
-        print("Getting occurrences")
-        if query_location_dict['tp_cardinalities']:
-            with open(query_location_dict['tp_cardinalities'], 'r') as f:
-                tp_cardinality = json.load(f)
-
-    elif query_location_dict:
+    if query_location_dict:
         train_dataset, val_dataset = prepare_queries(query_env,
                                                      query_location_dict['queries_train'],
                                                      query_location_dict['queries_val'],
@@ -397,7 +391,12 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
                                                      query_location_dict['occurrences'],
                                                      query_location_dict['tp_cardinalities'],
                                                      )
-    else:
+        print("Getting occurrences")
+        if query_location_dict['tp_cardinalities']:
+            with open(query_location_dict['tp_cardinalities'], 'r') as f:
+                tp_cardinality = json.load(f)
+
+    if train_dataset is None or val_dataset is None:
         raise ValueError("Either train or validation dataset was None and there is no query_location_directory given in"
                          "config")
     emb_model = prepare_embedding_model(model_config, model_directory)
