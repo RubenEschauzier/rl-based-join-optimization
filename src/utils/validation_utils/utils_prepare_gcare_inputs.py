@@ -4,7 +4,7 @@ import warnings
 from tqdm import tqdm
 
 from src.baselines.enumeration import JoinOrderEnumerator, build_adj_list
-from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
+from src.datastructures.post_process_data import filter_duplicate_subject_predicate_combinations, query_post_processor
 from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 import os
@@ -200,12 +200,12 @@ if __name__ == "__main__":
                                                     endpoint_location,
                                                     occurrences_location=occurrence_location,
                                                     tp_cardinality_location=tp_card_location)
-    post_processor = filter_duplicate_subject_predicate_combinations
+    post_processor = query_post_processor
 
     dataset = QueryCardinalityDataset(root=dataset_location,
                                            featurizer=featurizer_edge_labeled_graph,
                                            post_processor=post_processor,
                                            load_mappings=True,
-                                           raw_data_dir=raw_data_dir, )
+                                           )
     id_to_id, id_to_id_predicate = load_mappings(id_to_id_loc, id_to_id_predicate_loc)
     map_dataset_to_g_care_query_files(dataset, dataset_name, id_to_id, id_to_id_predicate, output_dir)

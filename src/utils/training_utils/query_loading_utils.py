@@ -10,7 +10,7 @@ import json
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from src.datastructures.filter_duplicate_predicate_queries import filter_duplicate_subject_predicate_combinations
+from src.datastructures.post_process_data import filter_duplicate_subject_predicate_combinations, query_post_processor
 from src.datastructures.query import Query
 from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
@@ -95,7 +95,7 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
                                                     vectors, env,
                                                     rdf2vec_vector_location, endpoint_location,
                                                     occurrences_location, tp_cardinality_location)
-    post_processor = filter_duplicate_subject_predicate_combinations
+    post_processor = query_post_processor
     train_dataset = QueryCardinalityDataset(root=queries_location_train,
                                       featurizer=featurizer_edge_labeled_graph,
                                       post_processor=post_processor,

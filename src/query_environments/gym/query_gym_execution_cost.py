@@ -15,6 +15,7 @@ class QueryGymExecutionCost(QueryGymBase):
     def __init__(self, query_timeout, query_dataset, query_embedder, env,
                  timeout_reward = -50, fast_fail_reward = -10,
                  query_slow_down_patterns = ["?z1 <http://xmlns.com/foaf/givenName> ?z0 ."],
+                 tp_occurrences=None, min_card_slow_down=100, max_card_slow_down=10000,
                  **kwargs):
         super().__init__(query_dataset, query_embedder, env, **kwargs)
         self._query_timeout = query_timeout
@@ -23,8 +24,15 @@ class QueryGymExecutionCost(QueryGymBase):
         self.min_reward = float("inf")
         self.max_reward = -float("inf")
         self.n_steps = 0
-
-        self.query_slow_down_patterns = query_slow_down_patterns
+        # Passing occurrence information ensures a proper slowdown triple pattern gets added.
+        if tp_occurrences:
+            for tp, card in tp_occurrences.items():
+                if min_card_slow_down <= card <= max_card_slow_down:
+                    self.query_slow_down_patterns = [tp]
+                    break
+        else:
+            self.query_slow_down_patterns = query_slow_down_patterns
+        print("Determined slow_down_pattern: ${}".format(self.query_slow_down_patterns))
 
     def get_reward(self, query, join_order, joins_made):
         join_order_trimmed = join_order[join_order != -1]
@@ -40,8 +48,9 @@ class QueryGymExecutionCost(QueryGymBase):
                                                          )
 
                 units_out, counts, join_ratio, status = self.env.process_output(env_result, "intermediate-results")
-            except:
+            except Exception as e:
                 print("Fail in self.env.run_raw")
+                print(e)
                 status = "FAIL"
 
             if status == "OK":
@@ -112,7 +121,7 @@ class QueryGymExecutionCost(QueryGymBase):
             final_cost_policy = -np.sum(reward_per_step)
             return final_cost_policy, reward_per_step
         else:
-            warnings.warn("WARNING: Slowed down query failed with status: {}".format(status))
+            print("Slowed down query failed with status: {}, timeout: {}".format(status, self._query_timeout+1))
             final_cost_policy = self.fast_fail_reward
             reward_per_step = [self.fast_fail_reward / join_order_trimmed.shape[0]
                                for _ in range(join_order_trimmed.shape[0])]
