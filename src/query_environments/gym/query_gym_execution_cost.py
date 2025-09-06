@@ -16,7 +16,7 @@ class QueryGymExecutionCost(QueryGymBase):
     def __init__(self, query_timeout, query_dataset, query_embedder, env,
                  timeout_reward = -50, fast_fail_reward = -10,
                  query_slow_down_patterns = ["?z1 <http://xmlns.com/foaf/givenName> ?z0 ."],
-                 tp_occurrences=None, min_card_slow_down=10000, max_card_slow_down=50000,
+                 tp_occurrences=None, min_card_slow_down=200, max_card_slow_down=1000,
                  **kwargs):
         super().__init__(query_dataset, query_embedder, env, **kwargs)
         self._query_timeout = query_timeout
