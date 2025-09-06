@@ -1,6 +1,7 @@
 import json
 import pickle
 import random
+import re
 import warnings
 
 import numpy as np
@@ -28,7 +29,8 @@ class QueryGymExecutionCost(QueryGymBase):
         if tp_occurrences:
             for tp, card in tp_occurrences.items():
                 if min_card_slow_down <= int(card) <= max_card_slow_down:
-                    self.query_slow_down_patterns = [tp]
+                    tp_non_match_var = self.replace_vars(tp)
+                    self.query_slow_down_patterns = [tp_non_match_var]
                     break
         else:
             self.query_slow_down_patterns = query_slow_down_patterns
@@ -140,5 +142,14 @@ class QueryGymExecutionCost(QueryGymBase):
             removed_bracket += "\n" + slow_down_patterns[i]
         removed_bracket += "\n}"
         return removed_bracket
+
+    @staticmethod
+    def replace_vars(triple_pattern: str) -> str:
+        counter = {"i": 0}
+        def repl(match):
+            i = counter["i"]
+            counter["i"] += 1
+            return f"?z{i}"
+        return re.sub(r"\?\w+", repl, triple_pattern)
 
 

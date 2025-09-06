@@ -98,9 +98,9 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
             loss.backward()
 
             optimizer.step()
-            if math.isinf(loss.item()):
-                print(pred.squeeze())
-                print(y)
+            # if math.isinf(loss.item()):
+            #     print(pred.squeeze())
+            #     print(y)
             train_losses.append(loss.item())
 
         # noinspection PyTypeChecker
