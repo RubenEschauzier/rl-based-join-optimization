@@ -7,7 +7,7 @@ pretraining:
   occurrences_location: "data/term_occurrences/yago/occurrences.json"
   tp_cardinality_location: "data/term_occurrences/yago/tp_cardinalities.json"
   feature_type: "predicate_edge"
-  n_epoch: 50
+  n_epoch: 10
   batch_size: 32
   seed: 0
   lr: 0.0001
@@ -19,7 +19,7 @@ rl_training:
   experiment_1:
     algorithm: 'ppo'
     extractor_type: 'tree_lstm'
-    n_steps: 100000
+    n_steps: 5000
     n_steps_fine_tune: 50000
     n_eval_episodes: 200
     model_save_loc_estimated: "experiments/experiment_outputs/yago/ppo_lstm_stars_cost_est"

@@ -1,4 +1,5 @@
 import faulthandler
+import math
 
 import numpy as np
 import torch
@@ -91,12 +92,15 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
             #                                batch = batch.batch)
             # Assume only one cardinality estimation head
             pred = pred[0]['output']
-            y = torch.log(batch.y)
+            y = torch.log(batch.y + 1)
 
             loss = loss_fn(pred.squeeze(), y)
             loss.backward()
 
             optimizer.step()
+            if math.isinf(loss.item()):
+                print(pred.squeeze())
+                print(y)
             train_losses.append(loss.item())
 
         # noinspection PyTypeChecker

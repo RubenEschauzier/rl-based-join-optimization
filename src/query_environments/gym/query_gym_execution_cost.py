@@ -15,7 +15,7 @@ class QueryGymExecutionCost(QueryGymBase):
     def __init__(self, query_timeout, query_dataset, query_embedder, env,
                  timeout_reward = -50, fast_fail_reward = -10,
                  query_slow_down_patterns = ["?z1 <http://xmlns.com/foaf/givenName> ?z0 ."],
-                 tp_occurrences=None, min_card_slow_down=100, max_card_slow_down=10000,
+                 tp_occurrences=None, min_card_slow_down=10000, max_card_slow_down=50000,
                  **kwargs):
         super().__init__(query_dataset, query_embedder, env, **kwargs)
         self._query_timeout = query_timeout
@@ -37,6 +37,7 @@ class QueryGymExecutionCost(QueryGymBase):
     def get_reward(self, query, join_order, joins_made):
         join_order_trimmed = join_order[join_order != -1]
         if len(join_order_trimmed) >= len(query.triple_patterns):
+            print(query.query)
             rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
                                                                              join_order_trimmed,
                                                                              query.triple_patterns)
@@ -54,6 +55,7 @@ class QueryGymExecutionCost(QueryGymBase):
                 status = "FAIL"
 
             if status == "OK":
+                print("Succeeded query")
                 reward_per_step = QueryGymExecutionCost.query_plan_cost(units_out, counts)
                 reward_per_step = np.log([reward + 1 for reward in reward_per_step])
                 final_cost_policy = -np.sum(reward_per_step)
@@ -101,6 +103,8 @@ class QueryGymExecutionCost(QueryGymBase):
     def execute_and_benchmark_slowdown_query(self, rewritten, join_order_trimmed):
         # Execute query to obtain selectivity
         slowed_down_query = QueryGymExecutionCost.insert_slowdown_triple(rewritten, self.query_slow_down_patterns)
+        print("Slow query:")
+        print(slowed_down_query)
         try:
             env_result, exec_time = self.env.run_raw(slowed_down_query, self._query_timeout, JSON,
                                                      {"explain": "True"},
