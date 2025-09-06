@@ -9,6 +9,8 @@ from src.pretrain_procedure import main_pretraining_dataset
 from src.rl_fine_tuning_qr_dqn_learning import main_rl_tuning
 from src.utils.training_utils.training_tracking import ExperimentWriter
 
+import tensorboard
+print(tensorboard.__version__)
 # Root dir global for file loading
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path

@@ -1,0 +1,97 @@
+{
+  "experiment_config": {
+    "batch_size": 32,
+    "dataset_train": "data/generated_queries/star_lubm/dataset_train",
+    "dataset_val": "data/generated_queries/star_lubm/dataset_val",
+    "embeddings": "data/rdf2vec_embeddings/lubm/rdf2vec_vectors_lubm_depth_3.json",
+    "endpoint": "http://localhost:9999/blazegraph/namespace/lubm/sparql",
+    "experiment_root_directory": "experiments/experiment_outputs/lubm",
+    "feature_type": "predicate_edge",
+    "lr": 0.0001,
+    "model_config": "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings.yaml",
+    "n_epoch": 50,
+    "occurrences_location": "data/term_occurrences/lubm/occurrences.json",
+    "seed": 0,
+    "tp_cardinality_location": "data/term_occurrences/lubm/tp_cardinalities.json"
+  },
+  "model_config": {
+    "embedding": {
+      "layers": [
+        {
+          "edge_dim": 129,
+          "id": "gine_1",
+          "nn": [
+            {
+              "id": "gine_nn_1_lin_1",
+              "in_features": 129,
+              "out_features": 101,
+              "type": "Linear"
+            },
+            {
+              "id": "gine_nn_1_relu_1",
+              "type": "ReLU"
+            },
+            {
+              "id": "gine_nn_1_lin_2",
+              "in_features": 101,
+              "out_features": 101,
+              "type": "Linear"
+            }
+          ],
+          "type": "TripleGINEConv"
+        },
+        {
+          "edge_dim": 129,
+          "id": "gine_2",
+          "nn": [
+            {
+              "id": "gine_nn_2_lin_1",
+              "in_features": 101,
+              "out_features": 100,
+              "type": "Linear"
+            },
+            {
+              "id": "gine_nn_2_relu_1",
+              "type": "ReLU"
+            },
+            {
+              "id": "gine_nn_2_lin_2",
+              "in_features": 100,
+              "out_features": 200,
+              "type": "Linear"
+            }
+          ],
+          "type": "TripleGINEConv"
+        },
+        {
+          "id": "sum_agg",
+          "type": "SumAggregation"
+        }
+      ]
+    },
+    "heads": [
+      {
+        "estimation_type": "cardinality",
+        "layers": [
+          {
+            "id": "card_nn_lin_1",
+            "in_features": 200,
+            "out_features": 50,
+            "type": "Linear"
+          },
+          {
+            "id": "card_nn_relu_1",
+            "type": "ReLU"
+          },
+          {
+            "id": "card_nn_lin_2",
+            "in_features": 50,
+            "out_features": 1,
+            "type": "Linear"
+          }
+        ]
+      }
+    ],
+    "type": "GINEConv"
+  }
+}
