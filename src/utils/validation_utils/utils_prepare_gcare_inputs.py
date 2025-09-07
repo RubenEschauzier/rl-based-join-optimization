@@ -97,31 +97,63 @@ def write_g_care_to_file(filename, vertex_dict, edge_list, query_idx):
 
 def map_dataset_to_g_care_query_files(torch_query_dataset, dataset_name, id_to_id_mapping, id_to_id_mapping_predicate,
                                       base_output_location):
-    os.makedirs(os.path.join(base_output_location, dataset_name), exist_ok=True)
+    os.makedirs(os.path.join(base_output_location), exist_ok=True)
     file_name_to_query = {}
     query_dir_template = "query_{}"
     query_name_template = "sub_query_{}.txt"
     for i, query in tqdm(enumerate(torch_query_dataset)):
         query_dir = query_dir_template.format(i)
         file_name_to_query[query.query] = query_dir
-        with open(os.path.join(base_output_location, dataset_name, "query_to_file.json"), "w") as f:
+        with open(os.path.join(base_output_location, "query_to_file.json"), "w") as f:
             json.dump(file_name_to_query, f, indent=2)
-        os.makedirs(os.path.join(base_output_location, dataset_name, query_dir), exist_ok=True)
+
+        sub_query_dir = os.path.join(base_output_location, query_dir, "sub_queries")
+        os.makedirs(sub_query_dir, exist_ok=True)
 
         sub_queries, sub_query_keys = map_query_to_sub_queries(query)
-        sub_query_file_name_to_sub_query = {}
+        sub_query_file_name_to_sub_query_dir = {}
         for j in range(len(sub_queries)):
-            file_name_sub_query = os.path.join(base_output_location,
-                                               dataset_name, query_dir,
-                                               query_name_template.format(j))
-            sub_query_file_name_to_sub_query[str(tuple(sub_query_keys[j]))] = query_name_template.format(j)
+            # sub_query_dir = os.path.join(base_output_location,query_dir, query_name_template.format(j))
+            # os.makedirs(sub_query_dir, exist_ok=True)
+            sub_query_file_name = query_name_template.format(j)
+            file_name_sub_query = os.path.join(sub_query_dir, sub_query_file_name)
+            sub_query_file_name_to_sub_query_dir[str(tuple(sub_query_keys[j]))] = (
+                os.path.join("sub_queries", sub_query_file_name))
 
             query_triple_patterns = [tp.strip().split(' ') for tp in sub_queries[j].triple_patterns]
             vertex_dict, edge_list = query_to_g_care(query_triple_patterns, id_to_id_mapping,
                                                      id_to_id_mapping_predicate, dataset_name)
             write_g_care_to_file(file_name_sub_query, vertex_dict, edge_list, j)
-        with open(os.path.join(base_output_location, dataset_name, query_dir, "sub_query_to_file.json"), "w") as f:
-            json.dump(sub_query_file_name_to_sub_query, f, indent=2)
+        with open(os.path.join(base_output_location, query_dir, "sub_query_to_file.json"), "w") as f:
+            json.dump(sub_query_file_name_to_sub_query_dir, f, indent=2)
+
+def map_dataset_to_g_care_query_files_fast(torch_query_dataset, dataset_name, id_to_id_mapping, id_to_id_mapping_predicate,
+                                      base_output_location):
+    os.makedirs(os.path.join(base_output_location), exist_ok=True)
+    query_to_sub_query_files = {}
+    query_dir_template = "query_{}"
+    query_name_template = "sub_query_{}.txt"
+    for i, query in tqdm(enumerate(torch_query_dataset)):
+        base_file_name = query_dir_template.format(i)
+
+        sub_queries, sub_query_keys = map_query_to_sub_queries(query)
+        sub_query_key_to_file = {}
+        for j in range(len(sub_queries)):
+            # sub_query_dir = os.path.join(base_output_location,query_dir, query_name_template.format(j))
+            # os.makedirs(sub_query_dir, exist_ok=True)
+            file_name_sub_query = base_file_name + "_" + query_name_template.format(j)
+            file_location_sub_query = os.path.join(base_output_location, file_name_sub_query)
+            sub_query_key_to_file[str(tuple(sub_query_keys[j]))] = file_name_sub_query
+
+            query_triple_patterns = [tp.strip().split(' ') for tp in sub_queries[j].triple_patterns]
+            vertex_dict, edge_list = query_to_g_care(query_triple_patterns, id_to_id_mapping,
+                                                     id_to_id_mapping_predicate, dataset_name)
+            write_g_care_to_file(file_location_sub_query,
+                                 vertex_dict, edge_list, j)
+
+        query_to_sub_query_files[query.query] = sub_query_key_to_file
+        with open(os.path.join(base_output_location, "query_to_sub_query_file.json"), "w") as f:
+            json.dump(query_to_sub_query_files, f, indent=2)
 
 
 def map_query_string_to_g_care(query_string):
@@ -208,4 +240,4 @@ if __name__ == "__main__":
                                            load_mappings=True,
                                            )
     id_to_id, id_to_id_predicate = load_mappings(id_to_id_loc, id_to_id_predicate_loc)
-    map_dataset_to_g_care_query_files(dataset, dataset_name, id_to_id, id_to_id_predicate, output_dir)
+    map_dataset_to_g_care_query_files_fast(dataset, dataset_name, id_to_id, id_to_id_predicate, output_dir)
