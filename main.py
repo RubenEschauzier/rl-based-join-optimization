@@ -18,11 +18,8 @@ os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
 config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars"
 
 #TODO:
-# Create occ and tp_occ for wikidata and yago
-# Fix path generation yago (use old version?)
-# Create rdf2vec for wikidata and yago (wip)
-# Pretrain on each dataset (ensure GNCE performance is about the same)
-# Train experiments (4 RL each for each pretrain experiment)
+# Ensure cross products get avoided; implement connected sub graphs and mask any action that is not connected to
+# current graph patterns joined together
 # Implement own validation runner:
 # - Run model PPO using default validation code on all validation queries at certain checkpoints.
 # - Run QR-DQN with custom variance penalized cost function
