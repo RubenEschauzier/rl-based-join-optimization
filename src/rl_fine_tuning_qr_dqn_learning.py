@@ -311,17 +311,18 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
 
     model = MaskableQRDQN(MaskableQRDQNPolicy,
                           train_env,
+                          batch_size=62,
                           policy_kwargs=policy_kwargs,
-                          exploration_fraction=0.2,
+                          exploration_fraction=0.3,
                           exploration_initial_eps=1,
                           exploration_final_eps=0.05,
-                          learning_starts=1000,
+                          learning_starts=2000,
                           verbose=0,
                           buffer_size=100000,
                           replay_buffer_class=MaskedDictReplayBuffer,
                           tensorboard_log="./tensorboard_logs/",
                           device='cpu',
-                          train_freq=(15, "episode"),
+                          train_freq=(1, "episode"),
                           )
     print("Validation set contains {} queries".format(len(val_dataset)))
     eval_callback = EvalWithOptimalLoggingCallback(
@@ -346,8 +347,6 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
     #     emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False, False)
 
     model.set_env(exec_train_env)
-    model.learning_rate = .1 * model.learning_rate
-    model.exploration_rate = .5
 
     eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(exec_val_env),
@@ -357,6 +356,11 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
         deterministic=True,
         render=False,
     )
+    # Reset buffer to remove old predicted rewards
+    model.reset_buffer()
+    # Lower learning rate to prevent large weight updates as we assume model weights are already pretty good
+    model.set_lr(model.learning_rate * .1)
+
     start_tune = time.time()
     progress_callback_fine_tune = ProgressBarCallback()
     model.learn(total_timesteps=n_steps_fine_tune, callback=[eval_callback_fine_tuned,

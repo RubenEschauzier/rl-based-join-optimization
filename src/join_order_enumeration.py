@@ -1,1 +1,0 @@
-# TODO: Use pretrained cardinality estimation model to make join order through left-deep join plan enumeration

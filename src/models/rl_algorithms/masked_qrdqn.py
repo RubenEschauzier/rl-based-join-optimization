@@ -20,7 +20,7 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, RolloutReturn, TrainFreq, \
     TrainFrequencyUnit
 from stable_baselines3.common.utils import get_linear_fn, get_parameters_by_name, polyak_update, \
-    should_collect_more_steps
+    should_collect_more_steps, update_learning_rate
 from stable_baselines3.common.callbacks import BaseCallback
 
 from src.models.rl_algorithms.maskable_qrdqn_policy import MaskableQRDQNPolicy
@@ -599,6 +599,13 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             progress_bar=progress_bar,
         )
 
+    def reset_buffer(self):
+        self.replay_buffer.reset()
+        print(f"Reset buffer new size: {self.replay_buffer.size}")
+
+    def set_lr(self, value):
+        self.learning_rate = value
+        update_learning_rate(self.policy.optimizer, value)
 
     def _excluded_save_params(self) -> list[str]:
         return super()._excluded_save_params() + ["quantile_net", "quantile_net_target"]  # noqa: RUF005
@@ -608,3 +615,5 @@ class MaskableQRDQN(OffPolicyAlgorithm):
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []
+
+
