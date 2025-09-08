@@ -1,5 +1,7 @@
 import os
 import re
+import argparse
+import sys
 
 import hydra
 import yaml
@@ -14,8 +16,22 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
                                                "experiments", "experiment_configs", "combination_experiments")
-# Set config file name
-config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars"
+
+def get_config_name():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars",
+        help="Optional Hydra config name"
+    )
+    args, remaining = parser.parse_known_args()
+    # Put back remaining args so Hydra still sees them
+    sys.argv = [sys.argv[0]] + remaining
+    return args.config
+
+# Get config_name before Hydra runs
+config_name = get_config_name()
 
 #TODO:
 # Ensure cross products get avoided; implement connected sub graphs and mask any action that is not connected to
@@ -44,6 +60,7 @@ config_name = "pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars"
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
             config_name=config_name)
 def main(cfg: DictConfig):
+    print(f"Loaded config: {config_name}")
     train_set, val_set = None, None
     writer = None
     if "pretraining" in cfg:
@@ -138,7 +155,8 @@ def find_last_epoch_directory(base_model_dir):
         final_path = os.path.join(base_model_dir, last_epoch_dir, "model")
         print(f"Last epoch path: {final_path}")
     else:
-        print("No epoch directories found.")
+        raise ValueError("No epoch directories found.")
     return final_path
+
 if __name__ == "__main__":
     main()
