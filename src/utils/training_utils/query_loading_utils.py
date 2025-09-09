@@ -138,11 +138,10 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
     return functools.partial(query_to_graph.transform_undirected)
 
 if __name__ == '__main__':
-    dataset_name = "star_watdiv"
-    raw_queries_loc = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}".format(dataset_name)
-    train_queries_loc = \
-        r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_train\raw".format(dataset_name)
-    val_queries_loc = \
-        r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\{}\dataset_val\raw".format(dataset_name)
+    project_root = os.getcwd()
+    dataset_name = "star_yago_gnce"
+    raw_queries_loc = os.path.join(project_root, f"/data/generated_queries/{dataset_name}")
+    train_queries_loc = os.path.join(raw_queries_loc, os.path.join("dataset_train", "raw"))
+    val_queries_loc = os.path.join(raw_queries_loc, os.path.join("dataset_val", "raw"))
 
     split_raw_queries(raw_queries_loc, .1, train_queries_loc, val_queries_loc)
