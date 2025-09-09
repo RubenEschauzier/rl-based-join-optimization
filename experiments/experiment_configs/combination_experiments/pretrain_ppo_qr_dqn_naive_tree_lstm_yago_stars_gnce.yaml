@@ -7,7 +7,7 @@ pretraining:
   occurrences_location: "data/term_occurrences/yago/occurrences.json"
   tp_cardinality_location: "data/term_occurrences/yago/tp_cardinalities.json"
   feature_type: "predicate_edge"
-  n_epoch: 10
+  n_epoch: 50
   batch_size: 32
   seed: 0
   lr: 0.0001
@@ -19,8 +19,8 @@ rl_training:
   experiment_1:
     algorithm: 'ppo'
     extractor_type: 'tree_lstm'
-    n_steps: 5000
-    n_steps_fine_tune: 50000
+    n_steps: 200000
+    n_steps_fine_tune: 100000
     n_eval_episodes: 200
     model_save_loc_estimated: "experiments/experiment_outputs/yago/ppo_lstm_stars_cost_est"
     model_save_loc_fine_tuned: "experiments/experiment_outputs/yago/ppo_lstm_stars_fine_tuned"
@@ -34,8 +34,8 @@ rl_training:
   experiment_2:
     algorithm: 'ppo'
     extractor_type: 'naive'
-    n_steps: 100000
-    n_steps_fine_tune: 50000
+    n_steps: 200000
+    n_steps_fine_tune: 100000
     n_eval_episodes: 200
     model_save_loc_estimated: "experiments/experiment_outputs/yago/ppo_naive_stars_cost_est"
     model_save_loc_fine_tuned: "experiments/experiment_outputs/yago/ppo_naive_stars_fine_tuned"
@@ -49,8 +49,8 @@ rl_training:
   experiment_3:
     algorithm: 'qr_dqn'
     extractor_type: 'tree_lstm'
-    n_steps: 500000
-    n_steps_fine_tune: 50000
+    n_steps: 1000000
+    n_steps_fine_tune: 100000
     n_eval_episodes: 200
     model_save_loc_estimated: "experiments/experiment_outputs/yago/qr_dqn_lstm_stars_cost_est"
     model_save_loc_fine_tuned: "experiments/experiment_outputs/yago/qr_dqn_lstm_stars_fine_tuned"
@@ -65,7 +65,7 @@ rl_training:
     algorithm: 'qr_dqn'
     extractor_type: 'naive'
     n_steps: 500000
-    n_steps_fine_tune: 50000
+    n_steps_fine_tune: 100000
     n_eval_episodes: 200
     model_save_loc_estimated: "experiments/experiment_outputs/yago/qr_dqn_naive_stars_cost_est"
     model_save_loc_fine_tuned: "experiments/experiment_outputs/yago/qr_dqn_naive_stars_fine_tuned"
