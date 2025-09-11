@@ -92,7 +92,7 @@ def main():
 
     # Save to JSON file
     with open(os.path.join(args.output, args.model_file_name), "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=2)
 
 
 if __name__ == "__main__":
