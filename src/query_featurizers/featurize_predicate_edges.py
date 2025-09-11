@@ -101,7 +101,8 @@ class QueryToEdgePredicateGraph:
             if self.entity_embeddings.get(str(term)):
                 entity_embedding.extend(self.entity_embeddings.get(str(term)))
             else:
-                warnings.warn("Embedding does not exist: {}".format(term.n3()))
+                if type(term) == rdflib.term.URIRef:
+                    warnings.warn("Embedding does not exist: {}".format(term.n3()))
                 entity_embedding.extend([0] * self.vector_size)
             return entity_embedding
         else:

@@ -1,7 +1,7 @@
 pretraining:
   endpoint: "http://localhost:9999/blazegraph/namespace/yago/sparql"
   dataset_train: "data/generated_queries/star_yago_gnce/dataset_train"
-  dataset_val: "data/generated_queries/star_yago_gnce_gnce/dataset_val"
+  dataset_val: "data/generated_queries/star_yago_gnce/dataset_val"
   embeddings: "data/rdf2vec_embeddings/yago_gnce/model.json"
   model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings.yaml"
   occurrences_location: "data/term_occurrences/yago_gnce/occurrences.json"
