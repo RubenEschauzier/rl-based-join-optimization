@@ -91,7 +91,7 @@ def main():
     data = {key: model.wv[key].tolist() for key in model.wv.key_to_index}
 
     # Save to JSON file
-    with open(os.path.join(args.output, "model.json"), "w") as f:
+    with open(os.path.join(args.output, args.model_file_name), "w") as f:
         json.dump(data, f)
 
 
