@@ -3,7 +3,6 @@ import os
 import json
 import glob
 
-from pyrdf2vec import RDF2VecTransformer
 from pyrdf2vec.graphs import KG
 from pyrdf2vec.walkers import RandomWalker
 from gensim.models import Word2Vec as GensimWord2Vec
@@ -11,7 +10,6 @@ from rdflib import URIRef
 from tqdm import tqdm
 
 from src.datastructures.query import ProcessQuery
-from src.utils.training_utils.query_loading_utils import load_raw_queries
 
 
 class WalksCorpus:
@@ -33,11 +31,15 @@ def main():
                         nargs="+",
                         help="File location of queries to embed entities of.")
     parser.add_argument("--output", required=True, help="Output folder for walks and model.")
+    parser.add_argument("--model_file_name", type=str, default="model.json",
+                        help="File to where the model should be written")
     parser.add_argument("--num_walks", type=int, default=100, help="Number of walks per entity.")
     parser.add_argument("--depth", type=int, default=4, help="Depth of walks.")
     parser.add_argument("--dimensions", type=int, default=128, help="Embedding size.")
     parser.add_argument("--window", type=int, default=5, help="Word2Vec window size.")
     parser.add_argument("--epochs", type=int, default=5, help="Word2Vec epochs.")
+    parser.add_argument("--workers", type=int, default=4, help="Word2Vec epochs.")
+
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -80,16 +82,21 @@ def main():
         vector_size=args.dimensions,
         window=args.window,
         sg=1,
-        workers=4,
+        workers=args.workers,
         epochs=args.epochs,
     )
 
     model.save(os.path.join(args.output, "embeddings.model"))
     print(f"Model saved to {os.path.join(args.output, 'embeddings.model')}")
+    data = {key: model.wv[key].tolist() for key in model.wv.key_to_index}
+
+    # Save to JSON file
+    with open("model.json", "w") as f:
+        json.dump(data, f)
 
 
 if __name__ == "__main__":
     # Example: python rdf2vec_disk_test --endpoint http://localhost:9999/blazegraph/namespace/yago/sparql
     # --output walks_temp/ --queries_to_embed .\data\generated_queries\star_yago_gnce\Joined_Queries.json
-    # --epochs 50 --num_walks 10
+    # --epochs 50 --num_walks 10 --workers 5
     main()
