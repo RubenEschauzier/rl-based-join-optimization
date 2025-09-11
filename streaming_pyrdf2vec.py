@@ -87,11 +87,11 @@ def main():
     )
 
     model.save(os.path.join(args.output, "embeddings.model"))
-    print(f"Model saved to {os.path.join(args.output, 'embeddings.model')}")
+    print(f"Model saved to {os.path.join(args.output, 'model.json')}")
     data = {key: model.wv[key].tolist() for key in model.wv.key_to_index}
 
     # Save to JSON file
-    with open("model.json", "w") as f:
+    with open(os.path.join(args.output, "model.json"), "w") as f:
         json.dump(data, f)
 
 

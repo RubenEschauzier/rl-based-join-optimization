@@ -1,4 +1,5 @@
 pretraining:
+  post_processors: [],
   endpoint: "http://localhost:9999/blazegraph/namespace/lubm/sparql"
   dataset_train: "data/generated_queries/path_lubm/dataset_train"
   dataset_val: "data/generated_queries/path_lubm/dataset_val"
