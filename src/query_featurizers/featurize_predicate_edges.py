@@ -113,6 +113,8 @@ class QueryToEdgePredicateGraph:
                     self.embedding_stats["fail"] += 1
                     warnings.warn("Embedding for URI does not exist: {}".format(term.n3()))
                 entity_embedding.extend([0] * self.vector_size)
+            print(self.occurrences_stats)
+            print(self.embedding_stats)
             return entity_embedding
         else:
             raise NotImplementedError("Entities other than Variables, URIRefs, or Literals are not yet "
