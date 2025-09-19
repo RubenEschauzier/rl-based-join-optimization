@@ -22,6 +22,29 @@ class WalksCorpus:
             for line in f:
                 yield line.strip().split()
 
+def validate_completeness_embeddings(model, entities):
+    missing_entities = 0
+    for entity in entities:
+        if entity not in model.wv:
+            missing_entities += 1
+    return missing_entities
+
+def validate_completeness_walks(walk_corpus, entities, min_count):
+    missing_entities = 0
+    insufficient_occurrences_entities = 0
+    entity_counts = {}
+    for walk in walk_corpus:
+        for entity in walk:
+            if entity not in entity_counts:
+                entity_counts[entity] = 0
+            entity_counts[entity] += 1
+    for entity_to_embed in entities:
+        if entity_to_embed not in entity_counts:
+            missing_entities += 1
+        else:
+            if entity_counts[entity_to_embed] < min_count:
+                insufficient_occurrences_entities += 1
+    return missing_entities, insufficient_occurrences_entities
 
 def main():
     parser = argparse.ArgumentParser(description="Train pyrdf2vec using disk-based walk storage with a SPARQL endpoint.")
@@ -37,6 +60,7 @@ def main():
     parser.add_argument("--depth", type=int, default=4, help="Depth of walks.")
     parser.add_argument("--dimensions", type=int, default=128, help="Embedding size.")
     parser.add_argument("--window", type=int, default=5, help="Word2Vec window size.")
+    parser.add_argument("--min_count", type=int, default=5, help="Word2Vec min count")
     parser.add_argument("--epochs", type=int, default=5, help="Word2Vec epochs.")
     parser.add_argument("--workers", type=int, default=4, help="Word2Vec epochs.")
 
@@ -64,7 +88,7 @@ def main():
 
 
     entities = list(entities)
-
+    
     print("Generating walks from SPARQL endpoint...")
     with open(walks_file, "w") as f:
         for entity in tqdm(entities):
@@ -72,11 +96,18 @@ def main():
                 walks = walker.extract(kg, [entity])[0]
                 for walk in walks:
                     f.write(" ".join(walk) + "\n")
+                if len(walks) < args.min_count:
+                    print(f"Only found {len(walks)} walks for {entity}")
             except Exception as e:
                 print(f"Failed to generate walks for {entity}: {e}")
 
     print("Training Word2Vec on walks...")
     sentences = WalksCorpus(walks_file)
+    missing_entities_walk, insufficient_entities_walk = (
+        validate_completeness_walks(sentences, entities, args.min_count))
+    print(f"Missing entities from walks: {missing_entities_walk} out of {len(entities)}")
+    print(f"Entities with insufficient occurrences: {insufficient_entities_walk} out of {len(entities)}")
+
     model = GensimWord2Vec(
         sentences=sentences,
         vector_size=args.dimensions,
@@ -89,7 +120,8 @@ def main():
     model.save(os.path.join(args.output, "embeddings.model"))
     print(f"Model saved to {os.path.join(args.output, 'model.json')}")
     data = {key: model.wv[key].tolist() for key in model.wv.key_to_index}
-
+    missing_entities = validate_completeness_embeddings(model, entities)
+    print(f"Missing {missing_entities} entities out of {len(entities)} entities")
     # Save to JSON file
     with open(os.path.join(args.output, args.model_file_name), "w") as f:
         json.dump(data, f, indent=2)

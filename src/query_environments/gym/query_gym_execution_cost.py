@@ -15,8 +15,9 @@ from src.query_environments.gym.query_gym_base import QueryGymBase
 class QueryGymExecutionCost(QueryGymBase):
     def __init__(self, query_timeout, query_dataset, query_embedder, env,
                  timeout_reward = -50, fast_fail_reward = -10,
-                 query_slow_down_patterns = ["?z1 <http://xmlns.com/foaf/givenName> ?z0 ."],
-                 tp_occurrences=None, min_card_slow_down=200, max_card_slow_down=1000,
+                 query_slow_down_patterns = "?z1 <http://xmlns.com/foaf/givenName> ?z0 .",
+                 tp_occurrences=None,
+                 slow_down_index_increment=5,
                  **kwargs):
         super().__init__(query_dataset, query_embedder, env, **kwargs)
         self._query_timeout = query_timeout
@@ -25,16 +26,22 @@ class QueryGymExecutionCost(QueryGymBase):
         self.min_reward = float("inf")
         self.max_reward = -float("inf")
         self.n_steps = 0
-        # Passing occurrence information ensures a proper slowdown triple pattern gets added.
+        # Passing occurrence information ensures a proper slowdown triple pattern gets added. We sort
+        # the occurrences and then whenever a query is too fast, we add a slowdown triple in ascending order of
+        # cardinality. This way we get the minimal cardinality needed to slow down the query sufficiently
         if tp_occurrences:
-            for tp, card in tp_occurrences.items():
-                if min_card_slow_down <= int(card) <= max_card_slow_down:
-                    tp_non_match_var = self.replace_vars(tp)
-                    self.query_slow_down_patterns = [tp_non_match_var]
-                    break
+            self.sorted_tps = sorted(tp_occurrences.items(), key=lambda x: x[1])
+            self.slow_down_index = 0
+            self.slow_down_index_increment = slow_down_index_increment
+            self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
+            # for tp, card in tp_occurrences.items():
+            #     if min_card_slow_down <= int(card) <= max_card_slow_down:
+            #         tp_non_match_var = self.replace_vars(tp)
+            #         self.query_slow_down_patterns = [tp_non_match_var]
+            #         break
         else:
-            self.query_slow_down_patterns = query_slow_down_patterns
-        print("Determined slow_down_pattern: ${}".format(self.query_slow_down_patterns))
+            self.query_slow_down_pattern = query_slow_down_patterns
+        print("Determined slow_down_pattern: ${}".format(self.query_slow_down_pattern))
 
     def get_reward(self, query, join_order, joins_made):
         join_order_trimmed = join_order[join_order != -1]
@@ -104,9 +111,32 @@ class QueryGymExecutionCost(QueryGymBase):
 
     def execute_and_benchmark_slowdown_query(self, rewritten, join_order_trimmed):
         # Execute query to obtain selectivity
-        slowed_down_query = QueryGymExecutionCost.insert_slowdown_triple(rewritten, self.query_slow_down_patterns)
-        print("Slow query:")
-        print(slowed_down_query)
+        status, units_out, counts = self.execute_slow_down_query(rewritten)
+        if status == "OK":
+            return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
+        elif status == "FAIL_FAST_QUERY_NO_STATS" and self.sorted_tps:
+            while True:
+                self.slow_down_index += self.slow_down_index_increment
+                self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
+                status, units_out, counts = self.execute_slow_down_query(rewritten)
+                if status == "OK":
+                    return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
+                elif status == "FAIL_FAST_QUERY_NO_STATS":
+                    continue
+                else:
+                    raise ValueError(f"Unexpected error executing slow down query {rewritten}, with "
+                                     f"triple pattern {self.query_slow_down_pattern} and status {status}")
+        elif status == "FAIL_FAST_QUERY_NO_STATS":
+            final_cost_policy = self.fast_fail_reward
+            reward_per_step = [self.fast_fail_reward / join_order_trimmed.shape[0]
+                               for _ in range(join_order_trimmed.shape[0])]
+            return final_cost_policy, reward_per_step
+        else:
+            raise ValueError(f"Unexpected error executing slow down query {rewritten}, with "
+                             f"triple pattern {self.query_slow_down_pattern} and status {status}")
+
+    def execute_slow_down_query(self, rewritten):
+        slowed_down_query = QueryGymExecutionCost.insert_slowdown_triple(rewritten, [self.query_slow_down_pattern])
         try:
             env_result, exec_time = self.env.run_raw(slowed_down_query, self._query_timeout, JSON,
                                                      {"explain": "True"},
@@ -117,21 +147,19 @@ class QueryGymExecutionCost(QueryGymBase):
         except:
             print("Fail in self.env.run_raw slowed down query")
             status = "FAIL"
+            units_out = []
+            counts = []
 
-        if status == "OK":
-            # Remove slowdown triples from query information
-            reward_per_step = QueryGymExecutionCost.query_plan_cost(
-                units_out[:len(join_order_trimmed)]+1,
-                counts[:len(join_order_trimmed)]+1)
-            reward_per_step = np.log(reward_per_step)
-            final_cost_policy = -np.sum(reward_per_step)
-            return final_cost_policy, reward_per_step
-        else:
-            print("Slowed down query failed with status: {}, timeout: {}".format(status, self._query_timeout+1))
-            final_cost_policy = self.fast_fail_reward
-            reward_per_step = [self.fast_fail_reward / join_order_trimmed.shape[0]
-                               for _ in range(join_order_trimmed.shape[0])]
-            return final_cost_policy, reward_per_step
+        return status, units_out, counts
+
+    @staticmethod
+    def get_successful_execution_reward(units_out, counts, join_order_trimmed):
+        reward_per_step = QueryGymExecutionCost.query_plan_cost(
+            units_out[:len(join_order_trimmed)] + 1,
+            counts[:len(join_order_trimmed)] + 1)
+        reward_per_step = np.log(reward_per_step)
+        final_cost_policy = -np.sum(reward_per_step)
+        return final_cost_policy, reward_per_step
 
 
     @staticmethod

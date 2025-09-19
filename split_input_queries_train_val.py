@@ -17,9 +17,6 @@ if __name__ == "__main__":
         default=0.1,
         help="Proportion of queries to use for validation (default: 0.1)."
     )
-    parser.add_argument(
-        ""
-    )
     args = parser.parse_args()
 
     project_root = os.getcwd()
