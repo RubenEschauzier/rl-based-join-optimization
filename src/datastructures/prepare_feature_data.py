@@ -29,6 +29,7 @@ def read_queries(query_dir):
         queries_total.extend(queries)
     return queries_total
 
+
 def get_occurrences(queries, env):
     occurrences = {}
     for query in tqdm(queries):
@@ -40,6 +41,7 @@ def get_occurrences(queries, env):
     return occurrences
     pass
 
+
 # Encodes dict {tp_str: cardinality}
 def get_query_triple_pattern_cardinalities(queries, env):
     triple_pattern_cardinalities = {}
@@ -50,13 +52,17 @@ def get_query_triple_pattern_cardinalities(queries, env):
                 triple_pattern_cardinalities[tp_str] = tp_cardinality
     return triple_pattern_cardinalities
 
+
 if __name__ == '__main__':
     dataset_name = "yago"
-    query_loc_path = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\path_{}".format(dataset_name)
-    query_loc_star = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\star_{}".format(dataset_name)
-    output_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}".format(dataset_name)
+    query_loc_path = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\path_{}".format(
+        dataset_name)
+    query_loc_star = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\star_{}".format(
+        dataset_name)
+    output_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}".format(
+        dataset_name)
     query_env = BlazeGraphQueryEnvironment("http://localhost:9999/blazegraph/namespace/{}/sparql".format(dataset_name))
-    loaded_queries= read_queries(query_loc_path)
+    loaded_queries = read_queries(query_loc_path)
     loaded_queries_star = read_queries(query_loc_star)
     loaded_queries.extend(loaded_queries_star)
     loaded_occurrences = get_occurrences(loaded_queries, query_env)

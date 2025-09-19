@@ -14,6 +14,7 @@ from src.datastructures.query import ProcessQuery
 
 class WalksCorpus:
     """Stream walks from a file line by line for gensim Word2Vec."""
+
     def __init__(self, filepath):
         self.filepath = filepath
 
@@ -47,7 +48,8 @@ def validate_completeness_walks(walk_corpus, entities, min_count):
     return missing_entities, insufficient_occurrences_entities
 
 def main():
-    parser = argparse.ArgumentParser(description="Train pyrdf2vec using disk-based walk storage with a SPARQL endpoint.")
+    parser = argparse.ArgumentParser(
+        description="Train pyrdf2vec using disk-based walk storage with a SPARQL endpoint.")
     parser.add_argument("--endpoint", required=True, help="SPARQL endpoint URL.")
     parser.add_argument("--queries_to_embed",
                         required=True,
@@ -84,8 +86,7 @@ def main():
             for tp in tp_rdflib:
                 for entity in tp:
                     if isinstance(entity, URIRef):
-                        entities.add(entity.n3().replace('<', '').replace('>', ''))
-
+                        entities.add(str(entity))
 
     entities = list(entities)
     

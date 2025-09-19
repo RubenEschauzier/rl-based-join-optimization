@@ -7,9 +7,7 @@ import torch
 import torch_geometric
 from torch_geometric.data import Data
 
-# TODO Make it undirected edge graph (Also for the edge labeled graph as this should work better).
-# TODO Add -1 to end of edge feature if its a feature not in the original query graph 1 else. (So the extra edges added
-# TODO to make it an undirected graph
+
 class QueryToEdgePredicateGraph:
     def __init__(self, entity_embeddings, env, add_direction=False, term_occurrences=None):
         self.entity_embeddings = entity_embeddings
@@ -17,7 +15,14 @@ class QueryToEdgePredicateGraph:
         self.env = env
         self.vector_size = len(entity_embeddings[next(iter(entity_embeddings))])
         self.add_direction_feature = add_direction
-
+        self.embedding_stats = {
+            "fail": 0,
+            "succeed": 0
+        }
+        self.occurrences_stats =  {
+            "fail": 0,
+            "succeed": 0
+        }
     def transform(self, json_query):
 
         edge_index = [[], []]
@@ -83,15 +88,17 @@ class QueryToEdgePredicateGraph:
                     processed.add(term)
         return torch.tensor(node_features)
 
-    def term_to_embedding(self, term, term_to_id, log_occurrences = True):
+    def term_to_embedding(self, term, term_to_id, log_occurrences=True):
         if type(term) == rdflib.term.Variable:
             var_embedding = [term_to_id[term]]
             var_embedding.extend([1] * self.vector_size)
             return var_embedding
         if type(term) == rdflib.term.URIRef or type(term) == rdflib.term.Literal:
             if self.term_occurrences and term.n3() in self.term_occurrences:
+                self.occurrences_stats["succeed"] += 1
                 term_count = self.term_occurrences[term.n3()]
             else:
+                self.occurrences_stats["fail"] += 1
                 warnings.warn("Precomputed count does not exist: {}".format(term.n3()))
                 term_count = self.get_term_count(term.n3())
                 print("Actual term count: {}".format(term_count))
@@ -99,11 +106,15 @@ class QueryToEdgePredicateGraph:
                 term_count = math.log(term_count)
             entity_embedding = [term_count]
             if self.entity_embeddings.get(str(term)):
+                self.embedding_stats["succeed"] += 1
                 entity_embedding.extend(self.entity_embeddings.get(str(term)))
             else:
                 if type(term) == rdflib.term.URIRef:
-                    warnings.warn("Embedding does not exist: {}".format(term.n3()))
+                    self.embedding_stats["fail"] += 1
+                    warnings.warn("Embedding for URI does not exist: {}".format(term.n3()))
                 entity_embedding.extend([0] * self.vector_size)
+            print(self.occurrences_stats)
+            print(self.embedding_stats)
             return entity_embedding
         else:
             raise NotImplementedError("Entities other than Variables, URIRefs, or Literals are not yet "
@@ -124,7 +135,6 @@ class QueryToEdgePredicateGraph:
                     term_id += 1
         return term_to_id
 
-
     def map_variables_to_ids(self, rdflib_tp):
         var_to_id = {}
         var_id = 0
@@ -144,4 +154,3 @@ class QueryToTermGraph:
 
     def transform(self, json_query):
         pass
-
