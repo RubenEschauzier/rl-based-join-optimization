@@ -30,7 +30,7 @@ class QueryGymExecutionCost(QueryGymBase):
         # the occurrences and then whenever a query is too fast, we add a slowdown triple in ascending order of
         # cardinality. This way we get the minimal cardinality needed to slow down the query sufficiently
         if tp_occurrences:
-            self.sorted_tps = sorted(tp_occurrences.items(), key=lambda x: x[1])
+            self.sorted_tps = sorted(tp_occurrences.items(), key=lambda x: int(x[1]))
             self.slow_down_index = 0
             self.slow_down_index_increment = slow_down_index_increment
             self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
@@ -46,7 +46,6 @@ class QueryGymExecutionCost(QueryGymBase):
     def get_reward(self, query, join_order, joins_made):
         join_order_trimmed = join_order[join_order != -1]
         if len(join_order_trimmed) >= len(query.triple_patterns):
-            print(query.query)
             rewritten = BlazeGraphQueryEnvironment.set_join_order_json_query(query.query,
                                                                              join_order_trimmed,
                                                                              query.triple_patterns)
@@ -80,6 +79,7 @@ class QueryGymExecutionCost(QueryGymBase):
                 return final_cost_policy, reward_per_step
             else:
                 if status == "FAIL_FAST_QUERY_NO_STATS":
+                    print("Starting slow down query")
                     final_cost_policy, reward_per_step = (
                         self.execute_and_benchmark_slowdown_query(rewritten, join_order_trimmed))
                 else:
@@ -113,9 +113,11 @@ class QueryGymExecutionCost(QueryGymBase):
         # Execute query to obtain selectivity
         status, units_out, counts = self.execute_slow_down_query(rewritten)
         if status == "OK":
+            print("Successful slowdown query")
             return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
         elif status == "FAIL_FAST_QUERY_NO_STATS" and self.sorted_tps:
             while True:
+                print("Incrementing slow_down index")
                 self.slow_down_index += self.slow_down_index_increment
                 self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
                 status, units_out, counts = self.execute_slow_down_query(rewritten)

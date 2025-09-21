@@ -137,10 +137,88 @@ class QueryGymBase(gym.Env):
         return next_obs, reward, done, False, infos
 
     def action_masks(self):
-        return self._joined
+        """
+        Function to get action masks for QR-DQN implementation. It uses 1 = mask (True = mask) so here we OR the
+        masks. Note that I should unify the behavior of my own MaskableQR-DQN and MaskablePPO, but that is extra work
+        so we have this abomination
+        :return:
+        """
+        mask = self._joined
+        if self._joins_made == 0:
+            return mask
+        join_mask = self.build_join_masks_heuristic()
+        combined_mask = self._joined | join_mask
+        return combined_mask
 
     def action_masks_ppo(self):
-        return (1 - self._joined).astype(bool)
+        """
+        Function to get action masks for MaskablePPO. This uses False = mask so we use an and to get the combined mask.
+        :return:
+        """
+        test = self._query
+        mask = (1 - self._joined).astype(bool)
+        if self._joins_made == 0:
+            return mask
+        join_mask = self.build_join_masks_heuristic()
+        if np.sum(join_mask) != 0:
+            testerdetest = 5
+        combined_mask = mask & ~join_mask
+        return combined_mask
+
+    def build_join_masks_heuristic(self):
+        """
+        Builds a mask deprioritizing
+        1. Cartesian joins
+        2. Self-joins
+        :return: Mask with True meaning it should be masked out
+        """
+        tp_array = np.array(self.query.triple_patterns)
+        joined_triple_patterns = tp_array[self._joined.astype(bool)[:tp_array.shape[0]]]
+        joined_variables = set()
+        joined_subj_pred_combinations = set()
+        for triple_pattern in joined_triple_patterns:
+            for element in triple_pattern:
+                if element.startswith('?'):
+                    joined_variables.add(element)
+            if triple_pattern[0].startswith('?') and triple_pattern[2].startswith('?'):
+                joined_subj_pred_combinations.add((triple_pattern[0], triple_pattern[1]))
+        # The mask will be 1 if it is a cartesian join
+        cart_join_mask = np.zeros_like(self._joined)
+        # The mask will be 1 if it is a self join. Note that only self joins with variable objects are excluded
+        self_join_mask = np.zeros_like(self._joined)
+        for i, triple_pattern in enumerate(tp_array):
+            if self._joined[i] == 0:
+                # Determine cartesian join
+                variables_in_tp = set()
+                for element in triple_pattern:
+                    if element.startswith('?'):
+                        variables_in_tp.add(element)
+                if len(variables_in_tp.intersection(joined_variables)) == 0:
+                    cart_join_mask[i] = 1
+                # Determine self join
+                if triple_pattern[0].startswith('?') and triple_pattern[2].startswith('?'):
+                    sub_pred_key = (triple_pattern[0], triple_pattern[1])
+                    if sub_pred_key in joined_subj_pred_combinations:
+                        self_join_mask[i] = 1
+        cart_join_mask = cart_join_mask.astype(bool)
+        self_join_mask = self_join_mask.astype(bool)
+        boolean_joined_mask = self._joined.astype(bool)
+        full_mask = cart_join_mask | self_join_mask | boolean_joined_mask
+
+        if np.sum(full_mask) != full_mask.shape[0]:
+            return cart_join_mask | self_join_mask
+        elif np.sum(cart_join_mask | boolean_joined_mask) != full_mask.shape[0]:
+            return cart_join_mask
+        elif np.sum(self_join_mask | boolean_joined_mask) != full_mask.shape[0]:
+            return self_join_mask
+        else:
+            return np.zeros_like(self._joined).astype(bool)
+
+    def build_cartesian_join_mask(self):
+        pass
+
+    def build_self_join_mask(self):
+        pass
 
     def _build_obs(self):
         self._build_tree_input()
