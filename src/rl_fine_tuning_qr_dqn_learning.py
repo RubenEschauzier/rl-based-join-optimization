@@ -222,7 +222,8 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
             query_env,
             extractor_class, extractor_kwargs, net_arch,
             ckp_callback_estimate, ckp_callback_fine_tuning,
-            occurrences=None):
+            occurrences=None,
+            model_ckp_fine_tune=None):
     train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
@@ -236,29 +237,34 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
     train_env = ActionMasker(train_env, mask_fn)
     val_env = ActionMasker(val_env, mask_fn)
 
-    model = MaskablePPO(MaskableActorCriticPolicyCustomPreprocessing,
-                        train_env,
-                        policy_kwargs=policy_kwargs,
-                        device='cpu',
-                        tensorboard_log="./tensorboard_logs/",
-                        verbose=0
-                        )
-    print("Validation environment contains {} queries".format(len(val_dataset)))
-    eval_callback = EvalWithOptimalLoggingCallback(
-        eval_env=Monitor(val_env),
-        use_masking=True,
-        n_eval_episodes=len(val_dataset),
-        eval_freq=5000,
-        deterministic=True,
-        render=False,
-    )
-    start_est = time.time()
-    progress_callback_pretrain = ProgressBarCallback()
-    model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate, progress_callback_pretrain])
-    end_est = time.time()
-    model.save(model_save_loc_estimated)
-    with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f:
-        f.write(str(end_est - start_est))
+    if model_ckp_fine_tune:
+        model = MaskablePPO.load(ckp_callback_fine_tuning,
+                                 tensorboard_log="./tensorboard_logs/",
+                                 verbose=0)
+    else:
+        model = MaskablePPO(MaskableActorCriticPolicyCustomPreprocessing,
+                            train_env,
+                            policy_kwargs=policy_kwargs,
+                            device='cpu',
+                            tensorboard_log="./tensorboard_logs/",
+                            verbose=0
+                            )
+        print("Validation environment contains {} queries".format(len(val_dataset)))
+        eval_callback = EvalWithOptimalLoggingCallback(
+            eval_env=Monitor(val_env),
+            use_masking=True,
+            n_eval_episodes=len(val_dataset),
+            eval_freq=5000,
+            deterministic=True,
+            render=False,
+        )
+        start_est = time.time()
+        progress_callback_pretrain = ProgressBarCallback()
+        model.learn(total_timesteps=n_steps, callback=[eval_callback, ckp_callback_estimate, progress_callback_pretrain])
+        end_est = time.time()
+        model.save(model_save_loc_estimated)
+        with open(os.path.join(model_save_loc_estimated, "train_elapsed_estimated.txt"), 'w') as f:
+            f.write(str(end_est - start_est))
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
@@ -269,9 +275,10 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
     exec_val_env = ActionMasker(exec_val_env, mask_fn)
     print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_episodes])))
     model.set_env(exec_train_env)
-    # Ensure critic is reset due to change in reward function
-    reset_value_head_only(model)
-    model.learning_rate = .1 * model.learning_rate
+    if not model_ckp_fine_tune:
+        # Ensure critic is reset due to change in reward function
+        reset_value_head_only(model)
+        model.learning_rate = .1 * model.learning_rate
     eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(exec_val_env),
         use_masking=True,
@@ -381,6 +388,7 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
                    endpoint_location, model_config, model_directory,
                    train_dataset=None, val_dataset=None,
                    query_location_dict=None,
+                   model_ckp_fine_tune = None,
                    seed=0):
     torch.manual_seed(seed)
     query_env = BlazeGraphQueryEnvironment(endpoint_location)

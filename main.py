@@ -133,7 +133,8 @@ def main(cfg: DictConfig):
                 train_set,
                 val_set,
                 query_location_dict,
-                c2.seed
+                model_ckp_fine_tune=OmegaConf.select(c2, "model_ckp", default=None),
+                seed=c2.seed
             )
 
 def find_last_epoch_directory(base_model_dir):
