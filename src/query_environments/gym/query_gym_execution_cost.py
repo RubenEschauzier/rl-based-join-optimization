@@ -1,4 +1,5 @@
 import json
+import math
 import pickle
 import random
 import re
@@ -63,10 +64,9 @@ class QueryGymExecutionCost(QueryGymBase):
                 status = "FAIL"
 
             if status == "OK":
-                print("Succeeded query")
-                reward_per_step = QueryGymExecutionCost.query_plan_cost(units_out, counts)
-                reward_per_step = np.log([reward + 1 for reward in reward_per_step])
-                final_cost_policy = -np.sum(reward_per_step)
+                final_cost_policy, reward_per_step = self.get_successful_execution_reward(
+                    units_out, counts, join_order_trimmed
+                )
                 if final_cost_policy < self.min_reward:
                     self.min_reward = final_cost_policy
                     if self.n_steps > 500:
@@ -115,19 +115,32 @@ class QueryGymExecutionCost(QueryGymBase):
         if status == "OK":
             print("Successful slowdown query")
             return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
-        elif status == "FAIL_FAST_QUERY_NO_STATS" and self.sorted_tps:
+        elif status == "FAIL_FAST_QUERY_NO_STATS" or status == "TIME_OUT" and self.sorted_tps:
+            if status == "FAIL_FAST_QUERY_NO_STATS":
+                sign = 1
+            else:
+                # Time out hit so we decrement our triple pattern cardinality to a faster one.
+                sign = -1
             while True:
-                print("Incrementing slow_down index")
-                self.slow_down_index += self.slow_down_index_increment
+                print(f"Incrementing slow_down index with sign {sign}...")
+                self.slow_down_index += math.ceil(sign * self.slow_down_index_increment)
+                print(f"New index: ${self.slow_down_index}...")
                 self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
                 status, units_out, counts = self.execute_slow_down_query(rewritten)
                 if status == "OK":
                     return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
                 elif status == "FAIL_FAST_QUERY_NO_STATS":
                     continue
+                elif status == "TIME_OUT":
+                    print(f"Time out in slow_down index: {self.slow_down_index}")
+                    # We decrement by 1 to ensure when we overshoot we slowly get back to a triple pattern that does
+                    # work. This is to prevent trashing when the window for successful query execution is small.
+                    sign = -(1/self.slow_down_index_increment)
+                    continue
                 else:
                     raise ValueError(f"Unexpected error executing slow down query {rewritten}, with "
                                      f"triple pattern {self.query_slow_down_pattern} and status {status}")
+
         elif status == "FAIL_FAST_QUERY_NO_STATS":
             final_cost_policy = self.fast_fail_reward
             reward_per_step = [self.fast_fail_reward / join_order_trimmed.shape[0]
@@ -156,6 +169,7 @@ class QueryGymExecutionCost(QueryGymBase):
 
     @staticmethod
     def get_successful_execution_reward(units_out, counts, join_order_trimmed):
+        print("Succeeded query...")
         reward_per_step = QueryGymExecutionCost.query_plan_cost(
             units_out[:len(join_order_trimmed)] + 1,
             counts[:len(join_order_trimmed)] + 1)
