@@ -1,7 +1,9 @@
+import json
 import os
 import re
 import argparse
 import sys
+from pathlib import Path
 
 import hydra
 import yaml
@@ -63,9 +65,11 @@ def main(cfg: DictConfig):
     print(f"Loaded config: {config_name}")
     train_set, val_set = None, None
     writer = None
-    if "pretraining" in cfg:
-        c1 = cfg.pretraining
+    rl_configs = OmegaConf.select(cfg, "rl_training", default=None)
+    skip_pretraining = OmegaConf.select(list(rl_configs.values())[0], "model_directory", default=None)
 
+    if "pretraining" in cfg and not skip_pretraining:
+        c1 = cfg.pretraining
         with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
             config = yaml.safe_load(f)
 
@@ -91,15 +95,14 @@ def main(cfg: DictConfig):
     if "rl_training" in cfg:
         for name, c2 in cfg["rl_training"].items():
             print("Experiment: {}-{}".format(c2.algorithm, c2.extractor_type))
-            if (not train_set or not val_set) and not c2.query_location_dict:
-                raise ValueError("Either train_set and val_set or query_location_dict must be specified")
 
-            if writer:
-                model_dir = find_last_epoch_directory(writer.experiment_directory)
-            elif c2.model_directory:
+            if OmegaConf.select(c2, "model_directory", default=None):
                 model_dir = c2.model_directory
+            elif writer:
+                model_dir = find_best_epoch_directory(writer.experiment_directory, "val_q_error")
             else:
                 raise ValueError("Either a pretraining experiment or a model directory must be specified")
+            print(f"Determined model directory: {model_dir}")
 
             if not OmegaConf.select(c2, "query_location_dict", default=None):
                 if "pretraining" not in cfg:
@@ -133,7 +136,7 @@ def main(cfg: DictConfig):
                 train_set,
                 val_set,
                 query_location_dict,
-                model_ckp_fine_tune=OmegaConf.select(c2, "model_ckp", default=None),
+                model_ckp_fine_tune=OmegaConf.select(c2, "model_ckp_fine_tune", default=None),
                 seed=c2.seed
             )
 
@@ -158,6 +161,22 @@ def find_last_epoch_directory(base_model_dir):
     else:
         raise ValueError("No epoch directories found.")
     return final_path
+
+def find_best_epoch_directory(base_model_dir, values_key):
+    last_epoch_model_dir = find_last_epoch_directory(base_model_dir)
+    last_epoch_dir = os.path.dirname(last_epoch_model_dir)
+    with open(os.path.join(last_epoch_dir, "best_values.json"), "r") as f:
+        best_values_dict = json.load(f)
+        best_values = best_values_dict[values_key]
+        best_epoch = best_values["epoch"]
+    path = Path(last_epoch_model_dir)
+
+    # Replace last epoch with best epoch
+    parts = list(path.parts)
+    new_parts = [p if not p.startswith("epoch-") else f"epoch-{best_epoch}" for p in parts]
+    best_epoch_model_dir = Path(*new_parts)
+
+    return best_epoch_model_dir
 
 if __name__ == "__main__":
     main()

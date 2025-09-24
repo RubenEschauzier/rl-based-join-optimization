@@ -79,7 +79,7 @@ class QueryGymExecutionCost(QueryGymBase):
                 return final_cost_policy, reward_per_step
             else:
                 if status == "FAIL_FAST_QUERY_NO_STATS":
-                    print("Starting slow down query")
+                    print("Starting slow down query...")
                     final_cost_policy, reward_per_step = (
                         self.execute_and_benchmark_slowdown_query(rewritten, join_order_trimmed))
                 else:
@@ -113,7 +113,6 @@ class QueryGymExecutionCost(QueryGymBase):
         # Execute query to obtain selectivity
         status, units_out, counts = self.execute_slow_down_query(rewritten)
         if status == "OK":
-            print("Successful slowdown query")
             return self.get_successful_execution_reward(units_out, counts, join_order_trimmed)
         elif status == "FAIL_FAST_QUERY_NO_STATS" or status == "TIME_OUT" and self.sorted_tps:
             if status == "FAIL_FAST_QUERY_NO_STATS":
@@ -124,7 +123,7 @@ class QueryGymExecutionCost(QueryGymBase):
             while True:
                 print(f"Incrementing slow_down index with sign {sign}...")
                 self.slow_down_index += math.ceil(sign * self.slow_down_index_increment)
-                print(f"New index: ${self.slow_down_index}...")
+                print(f"New index: {self.slow_down_index}...")
                 self.query_slow_down_pattern = self.replace_vars(self.sorted_tps[self.slow_down_index][0])
                 status, units_out, counts = self.execute_slow_down_query(rewritten)
                 if status == "OK":
@@ -135,7 +134,7 @@ class QueryGymExecutionCost(QueryGymBase):
                     print(f"Time out in slow_down index: {self.slow_down_index}")
                     # We decrement by 1 to ensure when we overshoot we slowly get back to a triple pattern that does
                     # work. This is to prevent trashing when the window for successful query execution is small.
-                    sign = -(1/self.slow_down_index_increment)
+                    sign = -(1 / self.slow_down_index_increment)
                     continue
                 else:
                     raise ValueError(f"Unexpected error executing slow down query {rewritten}, with "

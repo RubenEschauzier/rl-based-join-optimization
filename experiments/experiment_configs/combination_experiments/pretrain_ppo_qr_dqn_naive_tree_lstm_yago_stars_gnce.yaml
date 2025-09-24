@@ -22,8 +22,8 @@ rl_training:
     n_steps: 200000
     n_steps_fine_tune: 100000
     n_eval_episodes: 200
-    model_save_loc_estimated: "experiments/experiment_outputs/yago/ppo_lstm_stars_cost_est"
-    model_save_loc_fine_tuned: "experiments/experiment_outputs/yago/ppo_lstm_stars_fine_tuned"
+    model_save_loc_estimated: "experiments/experiment_outputs/yago_gnce/ppo_lstm_stars_cost_est"
+    model_save_loc_fine_tuned: "experiments/experiment_outputs/yago_gnce/ppo_lstm_stars_fine_tuned"
     net_arch:
       - 256
       - 256
