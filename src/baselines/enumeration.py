@@ -37,6 +37,23 @@ class JoinPlan:
             # join_cost = (self.left.estimated_size * self.right.estimated_size) + self.estimated_size
             # return join_cost + self.left.cost + self.right.cost
 
+    def get_order(self) -> list[int]:
+        """
+        Return a list of entry indices in the order they are joined (left-deep plan).
+        """
+        if self.is_leaf:
+            # Leaf node: just return its entries
+            return list(self.entries)
+
+        if self.left_deep:
+            # Left-deep: get order from left subtree, then append right leaf
+            order = self.left.get_order() if self.left else []
+            if self.right:
+                order += list(self.right.entries)
+            return order
+        else:
+            raise ValueError("Get order not defined for non-left deep")
+
     def __str__(self) -> str:
         return self._build_tree_string()
 
@@ -113,6 +130,40 @@ class JoinOrderEnumerator:
                                       new_entries, estimate, best_plan, best_plan_left_deep, True)
 
         all_entries_key = tuple(list(range(self.n_entries)))
+        return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
+
+    def search_store(self):
+        """Main search method that returns an array of evaluated plans"""
+        best_plan: Dict[tuple, JoinPlan] = {}
+        best_plan_left_deep: Dict[tuple, JoinPlan] = {}
+        all_plans = {}
+
+        # Initialize singleton plans
+        for i in range(self.n_entries):
+            singleton = {i}
+            singleton_key = (i,)
+            estimated_cardinality = self.estimated_cardinality(singleton_key)
+            best_plan[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, False)
+            best_plan_left_deep[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, True)
+
+        # Enumerate all connected subgraph-complement pairs
+        csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
+        for csg_cmp_pair in csg_cmp_pairs:
+            csg, cmp = csg_cmp_pair[0], csg_cmp_pair[1]
+            tree1_key = tuple(self.sort_array_asc(list(csg)))
+            tree2_key = tuple(self.sort_array_asc(list(cmp)))
+
+            tree1 = best_plan[tree1_key]
+            tree2 = best_plan[tree2_key]
+            new_entries = tree1.entries | tree2.entries
+
+            estimate_key = tuple(self.sort_array_asc(list(new_entries)))
+            estimate = self.estimated_cardinality(estimate_key)
+
+            self.store_plan(tree1, tree2, new_entries, estimate, best_plan, best_plan_left_deep, True, all_plans)
+
+        all_entries_key = tuple(list(range(self.n_entries)))
+
         return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
 
     def enumerate_csg_cmp_pairs(self, n_tps: int) -> List[Tuple[Set[int], Set[int]]]:
@@ -203,7 +254,21 @@ class JoinOrderEnumerator:
             if (curr_plan_key not in best_plan or
                     best_plan[curr_plan_key].cost > curr_plan.cost):
                 best_plan[curr_plan_key] = curr_plan
-        return
+        return curr_plan, curr_plan_key
+
+    def store_plan(self, tree1, tree2, new_entries, estimate_size,
+                         best_plan, best_plan_left_deep,
+                         left_deep: bool,
+                         stored_plans):
+        new_plan, plan_key = self.update_best_plan(
+            tree1, tree2, new_entries, estimate_size, best_plan, best_plan_left_deep, left_deep
+        )
+        if len(plan_key) == self.n_entries:
+            print(new_plan)
+            print(new_plan.get_order())
+            # Complete plan so we can store it
+            stored_plans[new_plan.get_order()] = new_plan
+        return new_plan, plan_key
 
     def _get_neighbours(self, s: Set[int]) -> Set[int]:
         """Get all neighbours of vertices in set S"""
