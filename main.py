@@ -19,6 +19,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
                                                "experiments", "experiment_configs", "combination_experiments")
 
+
 def get_config_name():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -32,10 +33,12 @@ def get_config_name():
     sys.argv = [sys.argv[0]] + remaining
     return args.config
 
+
 # Get config_name before Hydra runs
 config_name = get_config_name()
 
-#TODO:
+
+# TODO:
 # Ensure cross products get avoided; implement connected sub graphs and mask any action that is not connected to
 # current graph patterns joined together
 # Implement own validation runner:
@@ -70,7 +73,7 @@ def main(cfg: DictConfig):
 
     if "pretraining" in cfg and not skip_pretraining:
         c1 = cfg.pretraining
-        with open(os.path.join(ROOT_DIR,c1.model_config), "r") as f:
+        with open(os.path.join(ROOT_DIR, c1.model_config), "r") as f:
             config = yaml.safe_load(f)
 
         writer = ExperimentWriter(c1.experiment_root_directory, config_name,
@@ -140,6 +143,7 @@ def main(cfg: DictConfig):
                 seed=c2.seed
             )
 
+
 def find_last_epoch_directory(base_model_dir):
     epoch_dirs = [
         d for d in os.listdir(base_model_dir)
@@ -162,6 +166,7 @@ def find_last_epoch_directory(base_model_dir):
         raise ValueError("No epoch directories found.")
     return final_path
 
+
 def find_best_epoch_directory(base_model_dir, values_key):
     last_epoch_model_dir = find_last_epoch_directory(base_model_dir)
     last_epoch_dir = os.path.dirname(last_epoch_model_dir)
@@ -177,6 +182,7 @@ def find_best_epoch_directory(base_model_dir, values_key):
     best_epoch_model_dir = Path(*new_parts)
 
     return best_epoch_model_dir
+
 
 if __name__ == "__main__":
     main()
