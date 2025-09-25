@@ -42,7 +42,19 @@ class QueryGymExecutionCost(QueryGymBase):
             #         break
         else:
             self.query_slow_down_pattern = query_slow_down_patterns
+
+        self.executions_cache = {}
         print("Determined slow_down_pattern: ${}".format(self.query_slow_down_pattern))
+
+    def get_reward_cached(self, query, join_order, joins_made):
+        if (query, join_order) not in self.executions_cache:
+            final_cost, reward_per_step = self.get_reward(query, join_order, joins_made)
+            if final_cost != self.timeout_reward:
+                self.executions_cache[(query, join_order)] = final_cost, reward_per_step
+            return final_cost, reward_per_step
+        else:
+            print("Cache hit...")
+            return self.executions_cache[(query, join_order)]
 
     def get_reward(self, query, join_order, joins_made):
         join_order_trimmed = join_order[join_order != -1]

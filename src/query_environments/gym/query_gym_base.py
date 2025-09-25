@@ -114,7 +114,6 @@ class QueryGymBase(gym.Env):
 
         return self._build_obs(), {}
 
-
     def step(self, action):
         if action >= self._n_triples_query or self._joined[action] == 1:
             raise ValueError("Invalid action")
@@ -126,7 +125,7 @@ class QueryGymBase(gym.Env):
 
         next_obs = self._build_obs()
 
-        reward, _ = self.get_reward(self._query, self._join_order, self._joins_made)
+        reward, _ = self.get_reward_cached(self._query, self._join_order, self._joins_made)
 
         done = False
         if self._joins_made >= self._n_triples_query:
@@ -264,43 +263,14 @@ class QueryGymBase(gym.Env):
             # Unmask this order
             self._lstm_order_mask[self._joins_made - 2] = 1
 
-    # First join
-        # if self._joins_made == 2:
-        #     # First join is a special case
-        #     self._join_graph[0][0] = self._join_order[0]
-        #     self._join_graph[1][0] = self._n_triples_query
-        #     self._join_graph[0][1] = self._join_order[1]
-        #     self._join_graph[1][1] = self._n_triples_query
-        #     # First order mask set join node to 1 to represent it should get its hidden state computed
-        #     self._lstm_order[0][self._n_triples_query] = 1
-        #     # Unmask the order we just made to show model that this is a valid order entry
-        #     self._lstm_order_mask[0] = 1
-        #
-        # # Subsequent joins
-        # elif self._joins_made > 2:
-        #     n_triple_patterns = self._n_triples_query
-        #
-        #     # First two edges are added when join count = 2, then subsequent joins add two edges.
-        #     index_to_add_edge = 2 + (self._joins_made - 3)*2
-        #     self._join_graph[0][index_to_add_edge] = self._join_order[self._joins_made-1]
-        #     # The index representing the join increments by one for each join, starting from n_tps - 1
-        #     # The first two join counts increment it by 1, so subtract 1.
-        #     self._join_graph[1][index_to_add_edge] = n_triple_patterns - 1 + self._joins_made - 1
-        #     # The previous join is always included in the next (left-deep)
-        #     self._join_graph[0][index_to_add_edge+1] = n_triple_patterns - 1 + self._joins_made - 1 - 1
-        #     self._join_graph[1][index_to_add_edge+1] = n_triple_patterns - 1 + self._joins_made - 1
-        #
-        #     # Set the order array for the new join node
-        #     self._lstm_order[self._joins_made - 2][self._n_triples_query+(self._joins_made-2)] = 1
-        #
-        #     # Unmask this order
-        #     self._lstm_order_mask[self._joins_made - 2] = 1
-
     def _build_infos(self, done: bool):
         return {}
 
+    def get_reward_cached(self, query, join_order, joins_made):
+        return self.get_reward(query, join_order, joins_made)
+
     @abstractmethod
-    def  get_reward(self, query, join_order, joins_made):
+    def get_reward(self, query, join_order, joins_made):
         pass
 
     @property
