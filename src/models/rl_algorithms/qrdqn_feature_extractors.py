@@ -125,10 +125,7 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
         # (B, max_triples, feature_dim)
         result_embeddings = observations["result_embeddings"]
         join_graphs = observations["join_graph"]
-        lstm_order = observations["lstm_order"]
-        lstm_order_mask = observations["lstm_order_mask"]
         joined = observations["joined"]
-        joins_made = observations["joins_made"]
         n_triples_obs = observations["n_triples"]
         # Observations are batched, so we need to do forward passes on a per-batch basis
         # Furthermore, observations also requires a 'graph' to be constructed of edge_indexes and an 'order'

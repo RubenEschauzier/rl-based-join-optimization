@@ -132,39 +132,44 @@ class JoinOrderEnumerator:
         all_entries_key = tuple(list(range(self.n_entries)))
         return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
 
-    def search_store(self):
-        """Main search method that returns an array of evaluated plans"""
-        best_plan: Dict[tuple, JoinPlan] = {}
-        best_plan_left_deep: Dict[tuple, JoinPlan] = {}
-        all_plans = {}
 
-        # Initialize singleton plans
+    def enumerate_left_deep_plans(self):
+        cardinality_cache = {}
         for i in range(self.n_entries):
-            singleton = {i}
-            singleton_key = (i,)
-            estimated_cardinality = self.estimated_cardinality(singleton_key)
-            best_plan[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, False)
-            best_plan_left_deep[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, True)
+            cardinality_cache[(i,)] = self.estimated_cardinality((i,))
+        plans = []
+        for j in range(self.n_entries):
+            singleton_plan = JoinPlan(None, None, {j}, cardinality_cache[(j,)], True)
+            self.recurse_left_deep(plans, [j], singleton_plan, cardinality_cache, self.n_entries)
+        return plans
 
-        # Enumerate all connected subgraph-complement pairs
-        csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
-        for csg_cmp_pair in csg_cmp_pairs:
-            csg, cmp = csg_cmp_pair[0], csg_cmp_pair[1]
-            tree1_key = tuple(self.sort_array_asc(list(csg)))
-            tree2_key = tuple(self.sort_array_asc(list(cmp)))
 
-            tree1 = best_plan[tree1_key]
-            tree2 = best_plan[tree2_key]
-            new_entries = tree1.entries | tree2.entries
+    def recurse_left_deep(self, plans, current_order, current_plan: JoinPlan, cardinality_cache, total_entries):
+        current_entries = current_plan.entries
+        if len(current_entries) == total_entries:
+            plans.append(current_plan)
+        neighbours = self._get_neighbours(current_entries)
+        for neighbour in neighbours:
+            if neighbour not in current_entries:
+                estimated_cardinality_singleton = cardinality_cache[(neighbour,)]
+                right_leave_plan = JoinPlan(None, None, {neighbour}, estimated_cardinality_singleton, True)
+                new_entries = current_entries | {neighbour}
 
-            estimate_key = tuple(self.sort_array_asc(list(new_entries)))
-            estimate = self.estimated_cardinality(estimate_key)
+                estimate_key = tuple(self.sort_array_asc(list(new_entries)))
 
-            self.store_plan(tree1, tree2, new_entries, estimate, best_plan, best_plan_left_deep, True, all_plans)
+                # Use cached cardinality for sub queries as the same sub query can occur in different plans.
+                if estimate_key not in cardinality_cache:
+                    estimate_new_plan = self.estimated_cardinality(estimate_key)
+                    cardinality_cache[estimate_key] = estimate_new_plan
+                else:
+                    estimate_new_plan = cardinality_cache[estimate_key]
 
-        all_entries_key = tuple(list(range(self.n_entries)))
+                new_plan = JoinPlan(current_plan, right_leave_plan,
+                                    new_entries,
+                                    estimate_new_plan, True)
+                self.recurse_left_deep(plans, current_order + [neighbour], new_plan, cardinality_cache,
+                                       total_entries)
 
-        return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
 
     def enumerate_csg_cmp_pairs(self, n_tps: int) -> List[Tuple[Set[int], Set[int]]]:
         """Enumerate all connected subgraph-complement pairs"""
@@ -256,19 +261,15 @@ class JoinOrderEnumerator:
                 best_plan[curr_plan_key] = curr_plan
         return curr_plan, curr_plan_key
 
-    def store_plan(self, tree1, tree2, new_entries, estimate_size,
-                         best_plan, best_plan_left_deep,
-                         left_deep: bool,
-                         stored_plans):
-        new_plan, plan_key = self.update_best_plan(
-            tree1, tree2, new_entries, estimate_size, best_plan, best_plan_left_deep, left_deep
-        )
-        if len(plan_key) == self.n_entries:
-            print(new_plan)
-            print(new_plan.get_order())
-            # Complete plan so we can store it
-            stored_plans[new_plan.get_order()] = new_plan
-        return new_plan, plan_key
+    def store_plan(self, trees1, trees2, new_entries, plan_key, estimate_size, stored_plans):
+        for tree1 in trees1:
+            for tree2 in trees2:
+                left_plan = JoinPlan(tree1, tree2, new_entries, estimate_size, False)
+                right_plan = JoinPlan(tree2, tree1, new_entries, estimate_size, False)
+                if plan_key not in stored_plans:
+                    stored_plans[plan_key] = []
+                stored_plans[plan_key].append(left_plan)
+                stored_plans[plan_key].append(right_plan)
 
     def _get_neighbours(self, s: Set[int]) -> Set[int]:
         """Get all neighbours of vertices in set S"""
