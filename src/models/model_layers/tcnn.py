@@ -23,7 +23,8 @@ import torch.nn as nn
 
 from src.utils.tree_conv_utils import prepare_trees
 
-
+#TODO: Change this binary tree conv to take a batch of features (b, n, feature_dim) and batch of orders (b, 1(list))
+# Batchwise converts this to a convable index and does batchwise conv
 class BinaryTreeConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(BinaryTreeConv, self).__init__()
@@ -72,6 +73,10 @@ class DynamicPooling(nn.Module):
 
 
 def build_t_cnn_tree_from_order(join_order: list[int], features: torch.Tensor):
+    #TODO: This needs to be a function that efficiently moves features to the correct location in the tree, possibly
+    # batched, the problem is this needs to be repeated for each query, so needs to use efficient pytorch code
+    # something like using stacked features output from batch from cardinality estimation and stacked join orders
+    # Then doing stacked gather and select or something
     if len(join_order) < 2:
         raise ValueError("Insufficient joins selected, can't apply tree convolution")
     start_tuple = (

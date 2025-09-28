@@ -14,9 +14,9 @@
 from collections import defaultdict
 from functools import partial
 
+from tqdm import tqdm
 from torch_geometric.data import DataLoader
 import numpy as np
-from torch import nn
 
 from main import find_best_epoch_directory
 from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
@@ -32,7 +32,6 @@ def prepare_data(endpoint_location,
                  rdf2vec_vector_location,
                  occurrences_location, tp_cardinality_location):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    print(rdf2vec_vector_location)
     train_dataset, val_dataset = prepare_queries(query_env,
                                                  queries_location_train, queries_location_val,
                                                  endpoint_location,
@@ -67,27 +66,41 @@ def enumerate_orders(query, model):
 
 
 def prepare_simulated_dataset(train_dataset, model):
-    data = {}
+    # Dataset consists of tuples: (query, plan, order, estimated_cost)
+    data = []
     loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
-    for query in loader:
+    for query in tqdm(loader):
         plans = enumerate_orders(query[0], model)
         orders = [plan.get_order() for plan in plans]
 
         # Find best cost per sub plan, starting cost is infinity
         best_cost_per_sub_plan = defaultdict(lambda: float('inf'))
         for k, order in enumerate(orders):
-            for i in range(1,len(order)):
+            for i in range(1, len(order)):
                 sub_order = order[:i]
                 # If the parent cost is better than any before seen, we update the sub plan cost to that value
                 if plans[k].cost < best_cost_per_sub_plan[tuple(sub_order)]:
                     best_cost_per_sub_plan[tuple(sub_order)] = plans[k].cost
-        pass
-        break
+
+        for order in best_cost_per_sub_plan.keys():
+            data.append((query, order, best_cost_per_sub_plan[order]))
+
+        for full_plan in plans:
+            data.append((query, full_plan.get_order(), full_plan.cost))
+    return data
+
+
+def train(data, model):
     pass
 
 
-def main_simulated_training(train_dataset, val_dataset, model):
-    prepare_simulated_dataset(train_dataset, model)
+def main_simulated_training(train_dataset, val_dataset, model,
+                            save_simulated_dataset=None):
+    data = prepare_simulated_dataset(train_dataset, model)
+    if save_simulated_dataset:
+        # TODO Serialize this data.
+        pass
+
     pass
 
 
@@ -111,13 +124,12 @@ if __name__ == "__main__":
     occurrences_location = "data/term_occurrences/yago_gnce/occurrences.json"
     tp_cardinality_location = "data/term_occurrences/yago_gnce/tp_cardinalities.json"
     model_config = "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings.yaml"
-    experiment_dir =  "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce-24-09-2025-11-41-58"
+    experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce-24-09-2025-11-41-58"
     model_dir = find_best_epoch_directory(experiment_dir, "val_q_error")
 
     main_supervised_value_estimation(endpoint_location, queries_location_train, queries_location_val,
                                      rdf2vec_vector_location, occurrences_location, tp_cardinality_location,
                                      model_config, model_dir)
-
 
     # First tree:
     #               (0, 1)
@@ -141,8 +153,8 @@ if __name__ == "__main__":
         ((2, 9),)
     )
 
-
     trees = [tree1, tree2]
+
 
     # function to extract the left child of a node
     def left_child(x):
@@ -152,6 +164,7 @@ if __name__ == "__main__":
             return None
         return x[1]
 
+
     # function to extract the right child of node
     def right_child(x):
         assert isinstance(x, tuple)
@@ -159,6 +172,7 @@ if __name__ == "__main__":
             # leaf.
             return None
         return x[2]
+
 
     # function to transform a node into a (feature) vector,
     # should be a numpy array.
