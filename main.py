@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import hydra
+import torch
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
@@ -78,6 +79,7 @@ def main(cfg: DictConfig):
 
         writer = ExperimentWriter(c1.experiment_root_directory, config_name,
                                   dict(c1), dict(config['model']))
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         train_set, val_set = main_pretraining_dataset(
             queries_location_train=c1.dataset_train,
             queries_location_val=c1.dataset_val,
@@ -92,7 +94,7 @@ def main(cfg: DictConfig):
             batch_size=c1.batch_size,
             seed=c1.seed,
             lr=c1.lr,
-            device="cuda"
+            device=device
         )
     # One cardinality estimation model can spawn multiple RL-based fine-tuning experiments that use the same train/val
     # dataset and estimated cardinality model.
