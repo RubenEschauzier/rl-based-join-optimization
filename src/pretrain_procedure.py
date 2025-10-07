@@ -47,7 +47,6 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
             "q_error": float(q_error.item()),
             "type": val_batch.type
         })
-        break
     return np.mean(losses), np.mean(maes), np.mean(q_errors), val_predictions
 
 def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
