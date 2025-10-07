@@ -71,24 +71,55 @@ class DynamicPooling(nn.Module):
     def forward(self, x):
         return torch.max(x[0], dim=2).values
 
+def build_t_cnn_trees(join_orders: list[list[int]], features: torch.Tensor):
+    # Input is [full_plan_order, smallest_sub_order, larger.. , ]
+    if len(join_orders) == 1:
+        smallest_sub_order = len(join_orders[0])
+    else:
+        smallest_sub_order = len(join_orders[1])
+    full_order = join_orders[0]
+    start_tuple = (
+        torch.zeros_like(features[0]),
+        (features[full_order[0]],),
+        (features[full_order[1]],),
+    )
+    sub_plan_trees = []
+    tuples_in_order = [start_tuple]
+    # First tuple encodes two triple patterns joined together, every new tuple encodes a single triple pattern
+    if smallest_sub_order <= 2:
+        sub_plan_trees.append(tuples_in_order[-1])
+    for i, additional_relation in enumerate(full_order[2:]):
+        # added to the plan
+        new_tuple = (
+            # Zero vector to represent join relation
+            torch.zeros_like(features[0]),
+            # Previous tuple is the left node of new 'root'
+            tuples_in_order[i],
+            # Right tuple is the feature of additional relation joined
+            (features[additional_relation],)
+        )
+        tuples_in_order.append(new_tuple)
+        if smallest_sub_order <= i + 3:
+            sub_plan_trees.append(tuples_in_order[-1])
+
+    return sub_plan_trees
 
 def build_t_cnn_tree_from_order(join_order: list[int], features: torch.Tensor):
-    #TODO: This needs to be a function that efficiently moves features to the correct location in the tree, possibly
-    # batched, the problem is this needs to be repeated for each query, so needs to use efficient pytorch code
-    # something like using stacked features output from batch from cardinality estimation and stacked join orders
-    # Then doing stacked gather and select or something
+    #TODO: This can and needs to be sped up
     if len(join_order) < 2:
         raise ValueError("Insufficient joins selected, can't apply tree convolution")
     start_tuple = (
-        torch.mean(features[join_order[:2]], dim=0),
+        torch.zeros_like(features[0]),
         (features[join_order[0]],),
         (features[join_order[1]],),
     )
     tuples_in_order = [start_tuple]
     for i, additional_relation in enumerate(join_order[2:]):
+        if len(join_order) == 2:
+            raise ValueError("THIS SHOULDNT BE ITERATING")
         new_tuple = (
-            # Average the previous 'root' node representation and new relation
-            torch.mean(torch.stack([tuples_in_order[i][0], features[additional_relation]],dim=0),dim=0),
+            # Zero vector to represent join relation
+            torch.zeros_like(features[0]),
             # Previous tuple is the left node of new 'root'
             tuples_in_order[i],
             # Right tuple is the feature of additional relation joined
@@ -119,6 +150,7 @@ def transformer(x):
     return np.array(x[0])
 
 if __name__ == "__main__":
+    pass
     # Example: left-deep join order for your tree structure
     # Tree:   8
     #       7   4
@@ -126,28 +158,29 @@ if __name__ == "__main__":
     #   5   2
     # 0   1
 
-    join_order = [0, 1, 2, 3, 4]  # Bottom-up, left-to-right traversal
-
-    # Create example features tensor (7 relations, 2 features each)
-    features = torch.tensor([
-        [1.0, 2.0],  # relation 0
-        [3.0, 4.0],  # relation 1
-        [5.0, 6.0],  # relation 2
-        [7.0, 8.0],  # relation 3
-        [9.0, 10.0],  # relation 4
-    ])
-
-    # Convert to nested tuple format
-    tree_structure_1 = build_t_cnn_tree_from_order(join_order, features)
-
-    features = torch.tensor([
-        [5.0,3.0],
-        [2.0,6.0],
-        [2.0,9.0]
-    ])
-    tree_structure_2 = build_t_cnn_tree_from_order([0,1,2], features)
-    trees = [tree_structure_2]
-    # this call to `prepare_trees` will create the correct input for
-    # a `tcnn.BinaryTreeConv` operator.
-    prepared_trees = prepare_trees(trees, transformer, left_child, right_child)
-    print(prepared_trees)
+    # join_order = [0, 1, 2, 3, 4]  # Bottom-up, left-to-right traversal
+    #
+    # # Create example features tensor (7 relations, 2 features each)
+    # features = torch.tensor([
+    #     [1.0, 2.0],  # relation 0
+    #     [3.0, 4.0],  # relation 1
+    #     [5.0, 6.0],  # relation 2
+    #     [7.0, 8.0],  # relation 3
+    #     [9.0, 10.0],  # relation 4
+    # ])
+    #
+    # # Convert to nested tuple format
+    # tree_structure_1 = build_t_cnn_tree_from_order(join_order, features)
+    #
+    # features = torch.tensor([
+    #     [5.0,3.0],
+    #     [2.0,6.0],
+    #     [2.0,9.0]
+    # ])
+    # print(features.shape)
+    # tree_structure_2 = build_t_cnn_tree_from_order([0,1,2], features)
+    # trees = [tree_structure_2]
+    # # this call to `prepare_trees` will create the correct input for
+    # # a `tcnn.BinaryTreeConv` operator.
+    # prepared_trees = prepare_trees(trees, transformer, left_child, right_child)
+    # print(prepared_trees)

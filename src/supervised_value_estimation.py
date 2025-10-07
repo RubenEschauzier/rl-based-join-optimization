@@ -11,9 +11,19 @@
 #   - Track execution times found for normalization between 0 and 1
 #   - Augment data for sub plans, but ensure the best plan is used for reward of that sub plan
 #   - Do adaptive timeouts by tracking execution times per query
+
+# IDEAS:
+# - Train a model using a large teacher model. Furthermore, make training be a binary classification model for which
+#   plan is better and a value estimation task (two separate heads).
+# - In finetuning make few separate plans, execute them then determine binary classification problem again. Use the
+# paper as inspiration for fine-tuning approach.
+# - Plan is made by comparing for each step different orders, can be efficient as if starting left to right you keep
+# switching the current plan to the better predicted. However, how would you use the estimation uncertainty?
 from collections import defaultdict
 from functools import partial
+import random
 
+import torch
 from tqdm import tqdm
 from torch_geometric.data import DataLoader
 import numpy as np
@@ -21,6 +31,8 @@ import numpy as np
 from main import find_best_epoch_directory
 from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.models.model_instantiator import ModelFactory
+from src.models.model_layers.tcnn import build_t_cnn_tree_from_order, transformer, left_child, right_child, \
+    build_t_cnn_trees
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
 from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining, prepare_queries
@@ -65,30 +77,59 @@ def enumerate_orders(query, model):
     return JoinOrderEnumerator(adjacency_list, bound_predict, len(query.triple_patterns)).enumerate_left_deep_plans()
 
 
-def prepare_simulated_dataset(train_dataset, model):
-    # Dataset consists of tuples: (query, plan, order, estimated_cost)
+def prepare_simulated_dataset(train_dataset, oracle_model, max_plans_per_query=2500):
+    # Dataset contains: (Query, order, plan representation, estimated_cost)
+    # Use different model for estimating cost and estimating plan (plan estimation smaller, big model can act as oracle)
     data = []
     loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+    j = 0
     for query in tqdm(loader):
-        plans = enumerate_orders(query[0], model)
+        print(query)
+        # encoded_query = oracle_model.forward(x=query.x,
+        #                                      edge_index=query.edge_index,
+        #                                      edge_attr=query.edge_attr,
+        #                                      batch=query.batch)
+        # # Get the embedding head from the model
+        # embedded = next(head_output['output']
+        #                 for head_output in encoded_query if head_output['output_type'] == 'triple_embedding')
+        # # Freeze the layers only for pretraining
+        # embedded = embedded.detach()
+
+        #TODO: In case of split model for cost and training we should:
+        # Return the sub query, as that will be stored in the dataset
+        # Set all cardinality estimation functionality to zero, as this will be done at the end when iterating over
+        # plans
+        # In case of combinatorial explosion, we subsample the plans
+        plans = enumerate_orders(query[0], oracle_model)
+        random.shuffle(plans)
+        plans = plans[:max_plans_per_query]
         orders = [plan.get_order() for plan in plans]
 
-        # Find best cost per sub plan, starting cost is infinity
-        best_cost_per_sub_plan = defaultdict(lambda: float('inf'))
+        best_plan_per_sub_plan = {}
+
         for k, order in enumerate(orders):
-            for i in range(1, len(order)):
-                sub_order = order[:i]
-                # If the parent cost is better than any before seen, we update the sub plan cost to that value
-                if plans[k].cost < best_cost_per_sub_plan[tuple(sub_order)]:
-                    best_cost_per_sub_plan[tuple(sub_order)] = plans[k].cost
+            cost = plans[k].cost
+            # Build tuple incrementally (no slicing)
+            sub = []
+            for step in order[:-1]:
+                sub.append(step)
+                if len(sub) < 2:
+                    continue
+                sub_order = tuple(sub)
+                prev = best_plan_per_sub_plan.get(sub_order)
+                if prev is None or cost < prev[0]:
+                    best_plan_per_sub_plan[sub_order] = (cost, k)
 
-        for order in best_cost_per_sub_plan.keys():
-            data.append((query, order, best_cost_per_sub_plan[order]))
+        # Group sub plans under their best full plan
+        plan_to_sub_plans = [([plan.get_order()], plan.cost) for plan in plans]
+        for sub_order, (_, k) in best_plan_per_sub_plan.items():
+            plan_to_sub_plans[k][0].append(sub_order)
 
-        for full_plan in plans:
-            data.append((query, full_plan.get_order(), full_plan.cost))
+        # for plan_sub_plan in plan_to_sub_plans:
+        #     trees = build_t_cnn_trees(plan_sub_plan[0], embedded)
+        #     t_cnn_input = prepare_trees(trees, transformer, left_child, right_child)
+        #     data.append((t_cnn_input, torch.full([t_cnn_input[0].shape[0],1], plan_sub_plan[1])))
     return data
-
 
 def train(data, model):
     pass
@@ -123,65 +164,10 @@ if __name__ == "__main__":
     rdf2vec_vector_location = "data/rdf2vec_embeddings/yago_gnce/model.json"
     occurrences_location = "data/term_occurrences/yago_gnce/occurrences.json"
     tp_cardinality_location = "data/term_occurrences/yago_gnce/tp_cardinalities.json"
-    model_config = "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings.yaml"
-    experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce-24-09-2025-11-41-58"
+    model_config = "experiments/model_configs/pretrain_model/t_cv_repr_huge.yaml"
+    experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce_large_pretrain-05-10-2025-18-13-40"
     model_dir = find_best_epoch_directory(experiment_dir, "val_q_error")
 
     main_supervised_value_estimation(endpoint_location, queries_location_train, queries_location_val,
                                      rdf2vec_vector_location, occurrences_location, tp_cardinality_location,
                                      model_config, model_dir)
-
-    # First tree:
-    #               (0, 1)
-    #       (1, 2)        (-3, 0)
-    #   (0, 1) (-1, 0)  (2, 3) (1, 2)
-
-    tree1 = (
-        (0, 1),
-        ((1, 2), ((0, 1),), ((-1, 0),)),
-        ((-3, 0), ((2, 3),), ((1, 2),))
-    )
-
-    # Second tree:
-    #               (16, 3)
-    #       (0, 1)         (2, 9)
-    #   (5, 3)  (2, 6)
-
-    tree2 = (
-        (16, 3),
-        ((0, 1), ((5, 3),), ((2, 6),)),
-        ((2, 9),)
-    )
-
-    trees = [tree1, tree2]
-
-
-    # function to extract the left child of a node
-    def left_child(x):
-        assert isinstance(x, tuple)
-        if len(x) == 1:
-            # leaf.
-            return None
-        return x[1]
-
-
-    # function to extract the right child of node
-    def right_child(x):
-        assert isinstance(x, tuple)
-        if len(x) == 1:
-            # leaf.
-            return None
-        return x[2]
-
-
-    # function to transform a node into a (feature) vector,
-    # should be a numpy array.
-    def transformer(x):
-        return np.array(x[0])
-
-
-    # this call to `prepare_trees` will create the correct input for
-    # a `tcnn.BinaryTreeConv` operator.
-    prepared_trees = prepare_trees(trees, transformer, left_child, right_child)
-    print(prepared_trees)
-    test = 5

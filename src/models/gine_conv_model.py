@@ -12,8 +12,6 @@ from src.models.model_layers.directional_gine_conv import DirectionalGINEConv
 from src.models.model_layers.triple_gine_conv import TripleGineConv
 from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
 
-print(torch_geometric.__version__)
-print(torch.__version__)
 
 class GINEConvModel(torch.nn.Module):
     def __init__(self, *args, **kwargs):
@@ -21,7 +19,7 @@ class GINEConvModel(torch.nn.Module):
         self.embedding_model = None
         self.heads = torch.nn.ModuleList()
         self.head_types = []
-        self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus']
+        self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus', 'LayerNorm']
         self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
         self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'DirectionalGINEConv']
 
@@ -97,7 +95,10 @@ class GINEConvModel(torch.nn.Module):
                 nn_class = getattr(torch.nn, layer['type'])
                 layer_params = self.__filter_parameters(layer, ['type', 'id'])
                 nn_layers[layer_id] = nn_class(**layer_params)
+
             nn = torch.nn.Sequential(nn_layers)
+            print("Here in build layer:")
+            print(nn)
 
             gine_params = self.__filter_parameters(layer_config, ['type', 'nn', 'id'])
             layer_class_map = {

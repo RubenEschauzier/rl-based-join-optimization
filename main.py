@@ -91,7 +91,8 @@ def main(cfg: DictConfig):
             n_epoch=c1.n_epoch,
             batch_size=c1.batch_size,
             seed=c1.seed,
-            lr=c1.lr
+            lr=c1.lr,
+            device="cuda"
         )
     # One cardinality estimation model can spawn multiple RL-based fine-tuning experiments that use the same train/val
     # dataset and estimated cardinality model.

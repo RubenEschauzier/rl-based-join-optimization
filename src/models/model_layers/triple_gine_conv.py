@@ -86,9 +86,13 @@ class TripleGineConv(MessagePassing, ABC):
                 raise ValueError("Could not infer input channels from `nn`.")
             # Bug fix from original, they use 3 * edge_dim, however when hs feature size > edge_dim this fails
             self.lin = Linear(edge_dim + 2*in_channels, in_channels)
+            print("Made:")
+            print(self.nn)
+            print("DONE")
 
         else:
             self.lin = None
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -114,6 +118,7 @@ class TripleGineConv(MessagePassing, ABC):
 
     def message(self, x_i, x_j, edge_attr: Tensor) -> Tensor:
         # Switch i and j based on direction of triple:
+        test = self.lin
         reverse = edge_attr[:, -1] == -1
 
         if self.DIRECTIONAL:
