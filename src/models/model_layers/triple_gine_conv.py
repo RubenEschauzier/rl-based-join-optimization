@@ -86,10 +86,6 @@ class TripleGineConv(MessagePassing, ABC):
                 raise ValueError("Could not infer input channels from `nn`.")
             # Bug fix from original, they use 3 * edge_dim, however when hs feature size > edge_dim this fails
             self.lin = Linear(edge_dim + 2*in_channels, in_channels)
-            print("Made:")
-            print(self.nn)
-            print("DONE")
-
         else:
             self.lin = None
 

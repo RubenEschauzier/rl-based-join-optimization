@@ -18,7 +18,7 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
     model.eval()
     losses, maes, q_errors = [], [], []
     val_predictions = []
-    for val_batch in tqdm(val_dataset_loader):
+    for val_batch in val_dataset_loader:
         with torch.no_grad():
             # pred = model.forward(x=val_batch.x.double(),
             #                      edge_index=val_batch.edge_index,
@@ -59,7 +59,7 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
     gine_conv_model.to(device)
 
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_data_loader = DataLoader(validation_dataset, batch_size=4, shuffle=False)
+    val_data_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False)
 
     train_summary = TrainSummary([("train_loss", "min"), ("val_loss", "min"),
                                   ("val_mae", "min"), ("val_q_error", "min")])
@@ -81,7 +81,7 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
 
         train_losses = []
         # noinspection PyTypeChecker
-        for batch in tqdm(train_data_loader, total=len(train_data_loader)):
+        for batch in train_data_loader:
             optimizer.zero_grad()
             pred = gine_conv_model.forward(x=batch.x.to(device),
                                            edge_index=batch.edge_index.to(device),
