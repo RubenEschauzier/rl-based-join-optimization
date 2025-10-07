@@ -112,8 +112,6 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
 
     def forward(self, observations):
         """
-        Something is wrong: when using this extractor, the model learns to always do the same action / prediction.
-        Possible avenues of fixing: Maybe the model is unaware of what is joined and isn't?
         observations:
             - result_embeddings: (batch_size, max_triples, feature_dim)
             - join_embedding: (batch_size, feature_dim)
@@ -161,41 +159,9 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
             node_order, edge_order = treelstm.calculate_evaluation_orders(edge_index_join_forest,
                                                                           n_intermediate_join_nodes+n_triples+1)
 
-            # state_shapes = (n_nodes_join_tree+1, x.shape[1])
-            # h = torch.zeros(state_shapes)
-            # c = torch.zeros(state_shapes)
-
-            # X is already padded with zero rows, so just slice out unneeded ones
             x_input = x[:n_nodes_join_tree+1]
 
             h_final_lstm, c_final_lstm = self.tree_lstm_final(x_input, node_order, edge_index_join_forest, edge_order)
-            # order_mask = lstm_order[i][lstm_order_mask[i].bool()].bool()
-
-            # Build intermediate join result representation ( OWN IMPLEMENTATION
-            # h_lstm, c_lstm = self.child_sum_tree_lstm_intermediate(x_input, edge_index, h, c, order_mask)
-
-            # Build intermediate join result representation using package implementation
-            # h_lstm, c_lstm = self.tree_lstm_intermediate(x_input, node_order, edge_index_join_tree, edge_order)
-
-            # # Zero embedding tensor
-            # zero_embedding = torch.zeros(x[0].shape).unsqueeze(dim=0)
-            #
-            # # Create final input to tree-lstm that will create the state representation by simply adding a
-            # # parent node connected to both un-joined triple pattern representations and the hidden and cell state
-            # # output by the previous step
-            # state_selection_mask = self.get_final_input_state_mask(joined[i], h_lstm)
-            #
-            # h_final = torch.cat((h_lstm[state_selection_mask], zero_embedding), dim=0)
-            # c_final = torch.cat((c_lstm[state_selection_mask], zero_embedding), dim=0)
-            # x_final = torch.cat(
-            #     (result_embeddings_un_joined, zero_embedding, zero_embedding), dim=0
-            # )
-            # # Build join graph and order (which is just simply only True for the new 'parent' node rest False)
-            # edge_index_state, order_state = self.get_join_state_graph(x_final, device)
-            #
-            # # Pass un-joined triple pattern representations, join representation through Tree-LSTM final layer.
-            # h_state, c_state = self.child_sum_tree_lstm.forward(
-            #     x_final, edge_index_state, h_final, c_final, order_state)
             state_embeddings.append(h_final_lstm[-1])
 
         mask_emb = self.mask_embedder(joined)

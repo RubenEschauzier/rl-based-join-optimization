@@ -97,9 +97,6 @@ class GINEConvModel(torch.nn.Module):
                 nn_layers[layer_id] = nn_class(**layer_params)
 
             nn = torch.nn.Sequential(nn_layers)
-            print("Here in build layer:")
-            print(nn)
-
             gine_params = self.__filter_parameters(layer_config, ['type', 'nn', 'id'])
             layer_class_map = {
                 'GINEConv': GINEConv,
