@@ -55,7 +55,6 @@ class QueryPlansPredictionModel(nn.Module):
         self.query_plan_model = query_plan_model
         self.emb_dim = emb_dim
         self.device = device
-        pass
 
     def embed_query_batched(self, queries):
         """
@@ -78,29 +77,15 @@ class QueryPlansPredictionModel(nn.Module):
         embedded = torch.vsplit(embedded_combined, selection_index)
         return embedded
 
-    def prepare_plans(self, plans, embedded):
-        # Take each plan, the plan is already in shape (n_plans, max_nodes, dim), but should be transposed to
-        # (n_plans, dim, max_nodes)
+    def estimate_cost(self, plans, embedded_query, precomputed_indexes):
+        prepared_trees, prepared_indexes = build_trees_and_indexes(
+            [[plan[0] for plan in plans]], [embedded_query],
+            precomputed_indexes
+        )
+        prepared_trees.to(self.device)
+        [prepared_index.to(self.device) for prepared_index in prepared_indexes]
 
-        filled_in_trees = []
-        indexes = []
-        for jo, cost, tree, index, n_nodes_set in plans:
-            tree_filled = torch.zeros_like(tree)
-            for i in range(n_nodes_set):
-                idx = tree[i][0]
-                tree_filled[i] = embedded[idx]
-                #TODO: set row i of tensor tree to value embedded[i] I would prefer to do this vectorized and to create
-                # a new tensor
-                # tree is (n_nodes_padded, dim) and embedded is (n_nodes_padded, dim)
-            tree_filled.transpose(1, 0)
-            filled_in_trees.append(tree_filled)
-            indexes.append(index)
-        return filled_in_trees, indexes
-
-    def estimate_cost(self):
-        pass
-
-
+        return self.query_plan_model.forward(prepared_trees, prepared_indexes[0])
 
 
 
@@ -179,6 +164,7 @@ class EpistemicNetwork(nn.Module):
                  epi_index_dim, prior_config,
                  device=torch.device('cpu')):
         # We use an ensemble of tiny gine_conv as priors
+        # TODO: Make combined network here in loop. Define the config etc
         model_factory_gine_conv = ModelFactory(prior_config)
         ensemble_gnn = [model_factory_gine_conv.load_gine_conv() for i in range(epi_index_dim)]
 
@@ -350,78 +336,25 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
 
     return data
 
-def prepare_plan_data_structures(queries, query_plans, precomputed_indexes, output_shelve_file, embedding_size=200):
-    queries_loader = DataLoader(queries, batch_size=1, shuffle=False)
-    #TODO Use dummy embeddings with their respective index in the plan, so a 0 in the order
-    # becomes a zero vector in the plan tree. 1 becomes 1 vector etc.
-    # Then use the first element of each vector in plan tree to access the actual embedding
-    # Figure out how to handle padding, because that is a zero vector too. Prob use something like the number of
-    # elements in a order
-    # Also allow multiple sizes of embeddings, to facilitate ENNs as the small GNNs will output a MUCH smaller emb
-    # dimension
-    # Query plans: {query: list[tuple(order, cost)]
-    # Should become query: list[tuple(order, cost, tree_rep, index)]
-    # When iterating over this just use `for order, cost, tree_rep, index in list[tuple(...)]`
-    with shelve.open(output_shelve_file) as db:
-        for query in tqdm(queries_loader):
-            plans_augmented = []
-            plans = query_plans[query.query[0]]
-
-            node_ids = torch.arange(query.x.shape[0], device=query.x.device).unsqueeze(1)
-            embedded = node_ids.repeat(1, embedding_size)
-
-            prepared_trees, prepared_indexes = build_trees_and_indexes(
-                [[plan[0] for plan in plans]], [embedded],
-                precomputed_indexes
-            )
-            # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
-            # This will be undone when actually the embedding vectors are filled in
-            prepared_trees = prepared_trees.transpose(1, 2)
-
-
-            for i, plan in enumerate(plans):
-                # Augment the original plans with their tree structures and the number of nodes set in the tree.
-                # Note that the trees are shape: (n_plans, n_dim, max_nodes_plan),
-                # so will need some post-processing (reshaping) to fill in with embedding
-                set_nodes_in_plan = 2 * len(plan[0]) - 1
-                plans_augmented.append((plan[0], plan[1], prepared_trees[i], prepared_indexes[0][i], set_nodes_in_plan))
-            db[query.query[0]] = plans_augmented
-
-
 def validate(queries_val, query_plans_val,
              precomputed_indexes, min_cost, max_cost,
              train_loss,
-             model_query, model_plan, device):
+             model_query, model_plan, combined_model,
+             device):
     query_to_val = {}
     mape = MeanAbsolutePercentageError()
     mape.to(device)
     val_loader = DataLoader(queries_val, batch_size=1, shuffle=False)
     for queries in tqdm(val_loader, total=len(val_loader)):
         with torch.no_grad():
-            embedded = model_query.forward(x=queries.x.to(device),
-                                           edge_index=queries.edge_index.to(device),
-                                           edge_attr=queries.edge_attr.to(device),
-                                           batch=queries.batch.to(device))
-            # Get the embedding head from the model
-            embedded_combined, edge_batch = next(head_output['output']
-                                                 for head_output in embedded if
-                                                 head_output['output_type'] == 'triple_embedding')
-            n_nodes_in_batch = nn.functional.one_hot(edge_batch).sum(dim=0)
-            selection_index = list(torch.cumsum(n_nodes_in_batch, dim=0))[:-1]
-
-            # List of tensors for each query with embedded triple patterns
-            embedded = torch.vsplit(embedded_combined, selection_index)
+            embedded= combined_model.embed_query_batched(queries)
 
             plans = query_plans_val[queries.query[0]]
-            prepared_trees, prepared_indexes = build_trees_and_indexes(
-                [[plan[0] for plan in plans]], [embedded[0]],
-                precomputed_indexes
-            )
-            prepared_trees.to(device)
-            [prepared_index.to(device) for prepared_index in prepared_indexes]
-
             target = torch.tensor([plan[1] for plan in plans], device=device)
-            output, _ = model_plan(prepared_trees, prepared_indexes[0]).squeeze()
+
+            output, _ = combined_model.estimate_cost(plans, embedded[0], precomputed_indexes)
+            output = output.squeeze()
+
             original_cost = output * (max_cost - min_cost) + min_cost
 
             mape_val = mape(original_cost, target)
@@ -430,47 +363,46 @@ def validate(queries_val, query_plans_val,
             query_to_val[queries.query[0]] = {"loss": query_loss.cpu().item(), "mape": mape_val.cpu().item()}
     return query_to_val
 
-def train_simulated_combined(queries_train, query_plans_train, min_val_train, max_val_train,
-                             precomputed_indexes,
-                             queries_val, query_plans_val,
-                             combined_model, device, query_batch_size):
+
+def train_simulated(queries_train, query_plans_train,
+                    queries_val, query_plans_val, model_query, model_plan,
+                    combined_model, device, query_batch_size, train_batch_size):
     combined_model.to(device)
+
+    precomputed_indexes = precompute_left_deep_tree_conv_index(100, device)
     loader = DataLoader(queries_train, batch_size=query_batch_size, shuffle=True)
 
-    # Training hyperparameters, no tuning done
+    query_plans_train = flatten_plans(query_plans_train)
+    query_plans_train, min_val, max_val = min_max_scale_plans(query_plans_train)
+
+    query_plans_val = flatten_plans(query_plans_val)
+
+    # --- 1. Define Hyperparameters ---
     lr = 1e-4
     n_epochs = 10
-    # TODO: Check if all parameters are in
+
+    # TODO: Check if this works (gets all parameters)
     params = chain(combined_model.parameters())
+    
     optimizer = torch.optim.AdamW(
         params,
         lr=lr,
-        weight_decay=0.01
+        weight_decay=0.01  # Standard L2 regularization for AdamW
     )
+
     loss = torch.nn.MSELoss(reduction='mean')
-    #TODO: IDEA: PREMAKE THE PLAN STRUCTURES AND THEN HAVE A MAPPING THAT MAPS INDEX OF GNN TO INDEX IN THE TREE.
-    # THIS WILL PREVENT DOUBLE WORK ESPECIALLY IN EPISTEMIC NN
     for epoch in range(n_epochs):
         query_loss_epoch = []
         for k, queries in tqdm(enumerate(loader), total=len(loader)):
             optimizer.zero_grad()
             embedded = combined_model.embed_query_batched(queries)
-
             total_loss_tensor = torch.tensor(0.0, device=device)
             for i in range(len(queries.query)):
+
                 plans = query_plans_train[queries.query[i]]
-                combined_model.prepare_plans(plans, embedded[i])
-
-                prepared_trees, prepared_indexes = build_trees_and_indexes(
-                    [[plan[0] for plan in plans]], [embedded[i]],
-                    precomputed_indexes
-                )
-                prepared_trees.to(device)
-                [prepared_index.to(device) for prepared_index in prepared_indexes]
-
                 target = torch.tensor([plan[1] for plan in plans], device=device)
-                # output = model_plan((prepared_trees, prepared_indexes[0]))
-                output, _ = model_plan.forward(prepared_trees, prepared_indexes[0])
+
+                output, _ = combined_model.estimate_cost(plans, embedded[i], precomputed_indexes)
 
                 query_loss = loss(output.squeeze(), target)
                 query_loss_epoch.append(query_loss.detach().cpu().item())
@@ -479,204 +411,69 @@ def train_simulated_combined(queries_train, query_plans_train, min_val_train, ma
             total_loss_tensor.backward()
 
             optimizer.step()
+            break
 
-        # query_to_val = validate(queries_val, query_plans_val,
-        #                          precomputed_indexes,
-        #                          min_val_train, max_val_train,
-        #                          loss,
-        #                          model_query, model_plan,
-        #                          device)
-        # val_losses = [val_output["loss"] for val_output in query_to_val.values()]
-        # val_mape = [val_output["mape"] for val_output in query_to_val.values()]
-        #
-        # print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
-        # print(f"Validation loss: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
+        query_to_val = validate(queries_val, query_plans_val,
+                                 precomputed_indexes,
+                                 min_val, max_val,
+                                 loss,
+                                 model_query, model_plan,
+                                 combined_model,
+                                 device)
+        val_losses = [val_output["loss"] for val_output in query_to_val.values()]
+        val_mape = [val_output["mape"] for val_output in query_to_val.values()]
 
-
-# def train_simulated(queries_train, query_plans_train,
-#                     queries_val, query_plans_val,
-#                     model_query, model_plan, device, query_batch_size, train_batch_size):
-#     model_plan.to(device)
-#     model_query.to(device)
-#
-#     precomputed_indexes = precompute_left_deep_tree_conv_index(100, device)
-#     loader = DataLoader(queries_train, batch_size=query_batch_size, shuffle=True)
-#
-#     query_plans_train = flatten_plans(query_plans_train)
-#     query_plans_train, min_val, max_val = min_max_scale_plans(query_plans_train)
-#     # query_plans_train_augmented = prepare_plan_data_structures(queries_train, query_plans_train, precomputed_indexes)
-#
-#     query_plans_val = flatten_plans(query_plans_val)
-#
-#     # --- 1. Define Hyperparameters ---
-#     lr = 1e-4
-#     n_epochs = 10
-#
-#     # --- 2. Instantiate Model and Optimizer (AdamW) ---
-#     params = chain(model_query.parameters(), model_plan.parameters())
-#     optimizer = torch.optim.AdamW(
-#         params,
-#         lr=lr,
-#         weight_decay=0.01  # Standard L2 regularization for AdamW
-#     )
-#
-#     loss = torch.nn.MSELoss(reduction='mean')
-#     #TODO: IDEA: PREMAKE THE PLAN STRUCTURES AND THEN HAVE A MAPPING THAT MAPS INDEX OF GNN TO INDEX IN THE TREE.
-#     # THIS WILL PREVENT DOUBLE WORK ESPECIALLY IN EPISTEMIC NN
-#     for epoch in range(n_epochs):
-#         query_loss_epoch = []
-#         for k, queries in tqdm(enumerate(loader), total=len(loader)):
-#             optimizer.zero_grad()
-#             embedded = model_query.forward(x=queries.x.to(device),
-#                                            edge_index=queries.edge_index.to(device),
-#                                            edge_attr=queries.edge_attr.to(device),
-#                                            batch=queries.batch.to(device))
-#             # Get the embedding head from the model
-#             embedded_combined, edge_batch = next(head_output['output']
-#                             for head_output in embedded if head_output['output_type'] == 'triple_embedding')
-#             n_nodes_in_batch = nn.functional.one_hot(edge_batch).sum(dim=0)
-#             selection_index = list(torch.cumsum(n_nodes_in_batch, dim=0))[:-1]
-#
-#             # List of tensors for each query with embedded triple patterns
-#             embedded = torch.vsplit(embedded_combined, selection_index)
-#
-#             total_loss_tensor = torch.tensor(0.0, device=device)
-#             for i in range(len(queries.query)):
-#
-#                 plans = query_plans_train[queries.query[i]]
-#                 prepared_trees, prepared_indexes = build_trees_and_indexes(
-#                     [[plan[0] for plan in plans]], [embedded[i]],
-#                     precomputed_indexes
-#                 )
-#                 prepared_trees.to(device)
-#                 [prepared_index.to(device) for prepared_index in prepared_indexes]
-#
-#                 target = torch.tensor([plan[1] for plan in plans], device=device)
-#                 # output = model_plan((prepared_trees, prepared_indexes[0]))
-#                 output, _ = model_plan.forward(prepared_trees, prepared_indexes[0])
-#
-#                 query_loss = loss(output.squeeze(), target)
-#                 query_loss_epoch.append(query_loss.detach().cpu().item())
-#                 total_loss_tensor += query_loss
-#
-#             total_loss_tensor.backward()
-#
-#             optimizer.step()
-#
-#         query_to_val = validate(queries_val, query_plans_val,
-#                                  precomputed_indexes,
-#                                  min_val, max_val,
-#                                  loss,
-#                                  model_query, model_plan,
-#                                  device)
-#         val_losses = [val_output["loss"] for val_output in query_to_val.values()]
-#         val_mape = [val_output["mape"] for val_output in query_to_val.values()]
-#
-#         print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
-#         print(f"Validation loss: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
+        print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
+        print(f"Validation loss: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
 
 
-# def main_simulated_training(train_dataset, val_dataset,
-#                             oracle_model, embedding_model, cost_model,
-#                             device, query_batch_size, train_batch_size,
-#                             save_loc_simulated_dataset, save_loc_simulated_dataset_val):
-#     oracle_model = oracle_model.to(device)
-#     data = prepare_simulated_dataset(train_dataset, oracle_model, device, save_loc_simulated_dataset)
-#     query_plans_dict = {k: v for d in data for k, v in d.items()}
-#
-#     val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, save_loc_simulated_dataset_val)
-#     query_plan_dict_val = {k: v for d in val_data for k, v in d.items()}
-#     # TODO: Separate oracle model (large training guide) and query embedding model (light weight embedder)
-#     train_simulated(queries_train=train_dataset, query_plans_train=query_plans_dict,
-#                     queries_val=val_dataset, query_plans_val=query_plan_dict_val,
-#                     model_query=embedding_model, model_plan=cost_model,
-#                     device=device,
-#                     query_batch_size=query_batch_size,
-#                     train_batch_size=train_batch_size
-#                     )
-#
-#     pass
-def main_simulated_training_combined(train_dataset, val_dataset,
-                            oracle_model, combined_model,
+def main_simulated_training(train_dataset, val_dataset,
+                            oracle_model, model_query, model_plan,
+                            combined_model,
                             device, query_batch_size, train_batch_size,
-                            save_loc_simulated_dataset, save_loc_simulated_dataset_val,
-                                     save_loc_sim_data_augmented, save_loc_sim_data_augmented_val,):
+                            save_loc_simulated_dataset, save_loc_simulated_dataset_val):
     oracle_model = oracle_model.to(device)
     data = prepare_simulated_dataset(train_dataset, oracle_model, device, save_loc_simulated_dataset)
-    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, save_loc_simulated_dataset_val)
-
     query_plans_dict = {k: v for d in data for k, v in d.items()}
+
+    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, save_loc_simulated_dataset_val)
     query_plan_dict_val = {k: v for d in val_data for k, v in d.items()}
-
-    precomputed_indexes = precompute_left_deep_tree_conv_index(100, device)
-
-    query_plans_train = flatten_plans(query_plans_dict)
-    query_plans_train, min_val, max_val = min_max_scale_plans(query_plans_train)
-    prepare_plan_data_structures(train_dataset, query_plans_train, precomputed_indexes, save_loc_sim_data_augmented)
-    query_plans_val = flatten_plans(query_plan_dict_val)
-    prepare_plan_data_structures(val_dataset, query_plans_val, precomputed_indexes, save_loc_sim_data_augmented_val)
-
-    # TODO: Separate oracle model (large training guide) and query embedding model (light weight embedder)
-    train_simulated_combined(queries_train=train_dataset, query_plans_train=query_plans_dict,
-                    min_val_train=min_val, max_val_train = max_val,
-                    precomputed_indexes=precomputed_indexes,
+    train_simulated(queries_train=train_dataset, query_plans_train=query_plans_dict,
                     queries_val=val_dataset, query_plans_val=query_plan_dict_val,
-                    combined_model = combined_model,
+                    model_query=model_query, model_plan=model_plan,
+                    combined_model=combined_model,
                     device=device,
                     query_batch_size=query_batch_size,
+                    train_batch_size=train_batch_size
                     )
 
-    pass
-
-def main_supervised_value_estimation_combined(endpoint_location,
-                                              queries_location_train, queries_location_val,
-                                              rdf2vec_vector_location,
-                                              save_loc_simulated_dataset, save_loc_simulated_val,
-                                              save_loc_simulated_dataset_aug, save_loc_simulated_val_aug,
-                                              occurrences_location, tp_cardinality_location,
-                                              model_config_oracle, model_directory_oracle,
-                                              model_config_embedder):
+def main_supervised_value_estimation(endpoint_location,
+                                     queries_location_train, queries_location_val,
+                                     rdf2vec_vector_location,
+                                     save_loc_simulated_dataset, save_loc_simulated_val,
+                                     occurrences_location, tp_cardinality_location,
+                                     model_config_oracle, model_directory_oracle,
+                                     model_config_embedder
+                                     ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
                                               rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
-    oracle_model = prepare_cardinality_estimator(model_config=model_config_oracle,
-                                                                        model_directory=model_directory_oracle)
+    oracle_model = prepare_cardinality_estimator(
+        model_config=model_config_oracle,model_directory=model_directory_oracle
+    )
 
     cost_net_attention_pooling = PyGCardinalityHead(256)
     embedding_model = prepare_cardinality_estimator(model_config=model_config_embedder)
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, 200, device)
 
-    main_simulated_training_combined(train_dataset, val_dataset,
-                            oracle_model, combined_model,
+    main_simulated_training(train_dataset, val_dataset,
+                            oracle_model, embedding_model, cost_net_attention_pooling,
+                            combined_model,
                             device,
                             6, 128,
-                            save_loc_simulated_dataset, save_loc_simulated_val,
-                            save_loc_simulated_dataset_aug, save_loc_simulated_val_aug,)
-
-# def main_supervised_value_estimation(endpoint_location,
-#                                      queries_location_train, queries_location_val,
-#                                      rdf2vec_vector_location,
-#                                      save_loc_simulated_dataset, save_loc_simulated_val,
-#                                      occurrences_location, tp_cardinality_location,
-#                                      model_config_oracle, model_directory_oracle,
-#                                      model_config_embedder
-#                                      ):
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     cost_net_attention_pooling = PyGCardinalityHead(256)
-#
-#     train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
-#                                               rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
-#     oracle_model = prepare_cardinality_estimator(model_config=model_config_oracle,
-#                                                                         model_directory=model_directory_oracle)
-#     embedding_model = prepare_cardinality_estimator(model_config=model_config_embedder)
-#     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, 200, device)
-#     main_simulated_training(train_dataset, val_dataset,
-#                             oracle_model, embedding_model,
-#                             cost_net_attention_pooling,
-#                             device,
-#                             6, 128,
-#                             save_loc_simulated_dataset, save_loc_simulated_val,)
+                            save_loc_simulated_dataset, save_loc_simulated_val,)
 
 
 if __name__ == "__main__":
@@ -691,16 +488,13 @@ if __name__ == "__main__":
     experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce_large_pretrain-05-10-2025-18-13-40"
     save_loc_simulated = "data/simulated_query_plan_data/star_yago_gnce/data"
     save_loc_simulated_val = "data/simulated_query_plan_data/star_yago_gnce/val_data"
-    save_loc_simulated_aug = "data/simulated_query_plan_data/star_yago_gnce/data_aug"
-    save_loc_simulated_val_aug = "data/simulated_query_plan_data/star_yago_gnce/val_data_aug"
 
 
     model_dir_oracle = find_best_epoch_directory(experiment_dir, "val_q_error")
 
-    main_supervised_value_estimation_combined(endpoint_location, queries_location_train, queries_location_val,
+    main_supervised_value_estimation(endpoint_location, queries_location_train, queries_location_val,
                                      rdf2vec_vector_location,
                                      save_loc_simulated, save_loc_simulated_val,
-                                     save_loc_simulated_aug, save_loc_simulated_val_aug,
                                      occurrences_location, tp_cardinality_location,
                                      model_config_oracle, model_dir_oracle,
                                      model_config_emb
