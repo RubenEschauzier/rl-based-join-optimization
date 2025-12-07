@@ -276,25 +276,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
             # Only stop training if return value is False, not when it is None.
             if not callback.on_step():
                 return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
-            # if self.delayed_rewards:
-            #     self._update_info_buffer(infos, dones)
-            #     for i in range(self.n_envs):
-            #         # Retrieve reward and episode length if using Monitor wrapper
-            #
-            #         single_new_obs = OrderedDict()
-            #         for key, value in new_obs.items():
-            #             single_new_obs[key] = np.array([value[i]])
-            #
-            #         episode_buffer[i].append({
-            #             "buffer_action": np.array([buffer_actions[i]]),
-            #             "new_ob": single_new_obs,
-            #             "done": np.array([dones[i]]),
-            #             "info": np.array([infos[i]]),
-            #             "action_mask": np.array([action_masks[i]]) if action_masks is not None else None,
-            #         })
-            #
-            #         self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
-            # else:
             # Retrieve reward and episode length if using Monitor wrapper
             self._update_info_buffer(infos, dones)
 
@@ -312,30 +293,6 @@ class MaskableQRDQN(OffPolicyAlgorithm):
 
             for idx, done in enumerate(dones):
                 if done:
-                    # if self.delayed_rewards:
-                    #     # 1. Compute true rewards for this episode
-                    #     transitions = episode_buffer[idx]
-                    #     step_rewards = infos[idx]['reward_per_step']
-                    #
-                    #     # 2. Store them step-by-step
-                    #     for j, step in enumerate(transitions):
-                    #         self._store_transition(
-                    #             replay_buffer,
-                    #             buffer_actions, new_obs, rewards, dones, infos,
-                    #                                action_masks=action_masks)
-                    #         self._store_transition(
-                    #             replay_buffer,
-                    #             step["buffer_action"],
-                    #             step["new_ob"],
-                    #             step_rewards[j],
-                    #             step["done"],
-                    #             step["info"],
-                    #             action_masks=step["action_mask"] if step["action_mask"] is not None else None,
-                    #         )
-                    #
-                    #     # 3. Clear buffer
-                    #     episode_buffer[idx] = []
-                    #
                     # Update stats
                     num_collected_episodes += 1
                     self._episode_num += 1

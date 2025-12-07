@@ -72,17 +72,19 @@ class QueryGymBase(gym.Env):
         except StopIteration:
             self.query_loader = iter(DataLoader(self.query_dataset, batch_size=1, shuffle=self.train_mode)) # type: ignore
             query = next(self.query_loader)[0]
-        embedded = self._query_embedder.forward(x=query.x,
+        embedded_output = self._query_embedder.forward(x=query.x,
                                                 edge_index=query.edge_index,
                                                 edge_attr=query.edge_attr,
                                                 batch=query.batch)
         # Get the embedding head from the model
-        embedded = next(head_output['output']
-                        for head_output in embedded if head_output['output_type'] == 'triple_embedding')
+        embedded, batch = next(head_output['output']
+                        for head_output in embedded_output if head_output['output_type'] == 'triple_embedding')
+
 
         # Query graphs are with two edges to make undirected. These are simply duplicate embeddings so remove them
+        # NO LONGER NEEDED DUE TO UPDATE TO TRIPLE PATTERN POOL
         # (n_triple_patterns, emb_size)
-        embedded = embedded[::2]
+        # embedded = embedded[::2]
         # Pad until max_triples + possible joins (# of actual triples patterns - 1)
         self._result_embeddings = torch.nn.functional.pad(
             embedded,
@@ -142,6 +144,7 @@ class QueryGymBase(gym.Env):
         so we have this abomination
         :return:
         """
+        print("Getting QR-DQN action masks")
         mask = self._joined
         if self._joins_made == 0:
             return mask
@@ -154,13 +157,10 @@ class QueryGymBase(gym.Env):
         Function to get action masks for MaskablePPO. This uses False = mask so we use an and to get the combined mask.
         :return:
         """
-        test = self._query
         mask = (1 - self._joined).astype(bool)
         if self._joins_made == 0:
             return mask
         join_mask = self.build_join_masks_heuristic()
-        if np.sum(join_mask) != 0:
-            testerdetest = 5
         combined_mask = mask & ~join_mask
         return combined_mask
 

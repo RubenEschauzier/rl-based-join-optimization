@@ -100,7 +100,6 @@ def cardinality_query(endpoint_url, query, query_timeout, default_graph_uri=None
         return datapoint
     else:
         print(rn)
-        print("TEST!")
 
 
 def deconstruct_to_triple_patterns(query):
@@ -146,7 +145,6 @@ def query_exhaustively(endpoint_url, default_graph_uri, query_string, limit):
                                  'default-graph-uri': default_graph_uri}
                          )
         if r.status_code == 503:
-            print(r)
             print("WARNING: 503 status code found")
         try:
             if len(r.json()['results']['bindings']) == 0:
@@ -248,7 +246,6 @@ def query_triple(endpoint_url,
     # Sometimes gives error (service unavailable etc) if that is the case we have to retry the query
     if r.status_code == 503:
         print(r)
-        print("503 found!!!!")
     res = r.json()["results"]["bindings"]
 
     # Get bindings from results, if any of the queried triple terms is not a variable we repeat the term in the

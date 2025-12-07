@@ -114,7 +114,6 @@ class TripleGineConv(MessagePassing, ABC):
 
     def message(self, x_i, x_j, edge_attr: Tensor) -> Tensor:
         # Switch i and j based on direction of triple:
-        test = self.lin
         reverse = edge_attr[:, -1] == -1
 
         if self.DIRECTIONAL:

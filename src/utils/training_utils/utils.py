@@ -110,14 +110,3 @@ def reset_value_head_only(model):
     if isinstance(value_head, torch.nn.Linear):
         torch.nn.init.orthogonal_(value_head.weight, gain=1)
         torch.nn.init.constant_(value_head.bias, 0)
-
-
-def register_debugging_hooks(module):
-    def hook_fn(module, input, output):
-        print(f"Layer: {module}")
-        print(f"Input: {input}")
-        print(f"Output: {output}")
-        print("=" * 50)
-
-    # Register hook for the layer
-    module.register_forward_hook(hook_fn)

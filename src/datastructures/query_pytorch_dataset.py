@@ -18,7 +18,6 @@ class QueryCardinalityDataset(InMemoryDataset):
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
         if os.path.exists(os.path.join(self.processed_dir, "node_mappings.json")) and load_mappings:
-            print("Loading")
             with open(os.path.join(self.processed_dir, "node_mappings.json"), "r") as fr:
                 mappings = json.load(fr)
             self.data_mappings = mappings

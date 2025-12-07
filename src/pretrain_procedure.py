@@ -142,7 +142,7 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                                                            load_mappings=False,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location)
-    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location,device, n_epoch, batch_size, lr,
+    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
                             seed, test_queries=test_queries, test_cardinalities=test_cardinalities)
     return train_dataset, val_dataset
 

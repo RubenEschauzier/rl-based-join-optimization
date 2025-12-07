@@ -1,3 +1,5 @@
+import math
+import random
 from typing import Dict, List, Set, Tuple, Optional, Callable
 import re
 
@@ -148,7 +150,7 @@ class JoinOrderEnumerator:
         current_entries = current_plan.entries
         if len(current_entries) == total_entries:
             plans.append(current_plan)
-        neighbours = self._get_neighbours(current_entries)
+        neighbours = list(self._get_neighbours(current_entries))
         for neighbour in neighbours:
             if neighbour not in current_entries:
                 estimated_cardinality_singleton = cardinality_cache[(neighbour,)]
@@ -170,6 +172,82 @@ class JoinOrderEnumerator:
                 self.recurse_left_deep(plans, current_order + [neighbour], new_plan, cardinality_cache,
                                        total_entries)
 
+    def sample_left_deep_plans(
+        self,
+        max_samples_per_start_relation,
+    ):
+        """
+        Depth-first sampling of left-deep plans.
+
+        Args:
+            :param max_samples_per_start_relation: Number of samples to get for each start relation (triple)
+        """
+        max_samples = min(math.factorial(self.n_entries-1), max_samples_per_start_relation)
+        cardinality_cache = {}
+        for i in range(self.n_entries):
+            cardinality_cache[(i,)] = self.estimated_cardinality((i,))
+        plans = []
+        for j in range(self.n_entries):
+            # self.recurse_left_deep(plans, [j], singleton_plan, cardinality_cache, self.n_entries)
+
+            plans.extend(self._sample_plans(j, cardinality_cache, self.n_entries,
+                               max_samples))
+        return plans
+
+    def _sample_plans(self, start_entry, cardinality_cache, total_entries, max_samples):
+        """
+        Randomly generate up to max_samples left-deep join plans.
+
+        Args:
+            start_entry: base relation ID to start from
+            cardinality_cache: dict for caching subplan cardinalities
+            total_entries: total number of base relations
+            max_samples: number of random plans to produce
+        """
+        plans = []
+
+        for _ in range(max_samples):
+            # Start a new plan from the same root each time
+            start_key = (start_entry,)
+            if start_key not in cardinality_cache:
+                cardinality_cache[start_key] = self.estimated_cardinality(start_key)
+            start_card = cardinality_cache[start_key]
+
+            current_plan = JoinPlan(None, None, {start_entry}, start_card, True)
+            current_entries = {start_entry}
+
+            # Build one complete plan
+            while len(current_entries) < total_entries:
+                neighbours = list(self._get_neighbours(current_entries))
+                # Filter out neighbours already in the plan
+                available = [n for n in neighbours if n not in current_entries]
+
+                if not available:
+                    # Dead-end — restart this plan attempt
+                    break
+
+                next_neighbour = random.choice(available)
+                right_key = (next_neighbour,)
+
+                if right_key not in cardinality_cache:
+                    cardinality_cache[right_key] = self.estimated_cardinality(right_key)
+                right_card = cardinality_cache[right_key]
+
+                right_leaf = JoinPlan(None, None, {next_neighbour}, right_card, True)
+                new_entries = current_entries | {next_neighbour}
+
+                estimate_key = tuple(self.sort_array_asc(list(new_entries)))
+                if estimate_key not in cardinality_cache:
+                    cardinality_cache[estimate_key] = self.estimated_cardinality(estimate_key)
+                new_card = cardinality_cache[estimate_key]
+
+                current_plan = JoinPlan(current_plan, right_leaf, new_entries, new_card, True)
+                current_entries = new_entries
+
+            if len(current_entries) == total_entries:
+                plans.append(current_plan)
+
+        return plans
 
     def enumerate_csg_cmp_pairs(self, n_tps: int) -> List[Tuple[Set[int], Set[int]]]:
         """Enumerate all connected subgraph-complement pairs"""

@@ -12,7 +12,7 @@ class OrderDynamicProgramming(gym.Wrapper):
     to a custom gymnasium environment.
     """
 
-    def __init__(self, env: QueryGymBase, cache_optimal_cost=True):
+    def __init__(self, env: QueryGymBase, device, cache_optimal_cost=True):
         """
         Initialize the wrapper.
 
@@ -31,6 +31,7 @@ class OrderDynamicProgramming(gym.Wrapper):
         self.last_optimal_cost = None
         self.last_optimal_reward = None
         self.last_optimal_plan = None
+        self.device = device
 
     def reset(self, seed=None, options=None):
         """
@@ -110,7 +111,8 @@ class OrderDynamicProgramming(gym.Wrapper):
         return JoinOrderEnumerator(adjacency_list, self.bound_predict, len(query.triple_patterns)).search()
 
     def bound_predict(self, join_order):
-        return self.predict_cardinality(self.env.query_embedder, self.env.query, list(join_order), len(join_order))
+        return self.predict_cardinality(self.env.query_embedder, self.env.query, list(join_order), len(join_order),
+                                        self.device)
 
     def action_masks(self):
         return self.env.action_masks()
@@ -119,8 +121,8 @@ class OrderDynamicProgramming(gym.Wrapper):
         return self.env.action_masks_ppo()
 
     @staticmethod
-    def predict_cardinality(model, query, join_order, join_count):
-        query_to_estimate = QueryGymEstimatedCost.reduced_form_query(query, join_order, join_count)
+    def predict_cardinality(model, query, join_order, join_count, device):
+        query_to_estimate = QueryGymEstimatedCost.reduced_form_query(query, join_order, join_count, device)
         with torch.no_grad():
             output = model.forward(x=query_to_estimate.x,
                                    edge_index=query_to_estimate.edge_index,

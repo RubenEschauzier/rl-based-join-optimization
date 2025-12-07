@@ -82,13 +82,6 @@ class GINEConvModel(torch.nn.Module):
             )
 
         if layer_type in self.supported_gnn_layers:
-            # Build MLP for GNN
-            # nn_layers = []
-            # for layer in layer_config['nn']:
-            #     nn_class = getattr(torch.nn, layer['type'])
-            #     layer_params = self.__filter_parameters(layer, ['type', 'id'])
-            #     nn_layers.append(nn_class(**layer_params))
-            # nn = torch.nn.Sequential(*nn_layers)
             nn_layers = OrderedDict()
             for layer in layer_config['nn']:
                 layer_id = layer['id']
@@ -111,7 +104,7 @@ class GINEConvModel(torch.nn.Module):
         elif layer_type in self.supported_pooling:
             pool_params = self.__filter_parameters(layer_config, ['type', 'id'])
             if layer_type == 'TriplePatternPooling':
-                embedding_layers[layer_id] = (TriplePatternPooling(), 'x, edge_index -> x')
+                embedding_layers[layer_id] = (TriplePatternPooling(), 'x, edge_index, batch -> x, edge_batch')
             else:
                 pool_class = getattr(torch_geometric.nn.aggr.basic, layer_type)
                 embedding_layers[layer_id] = (pool_class(**pool_params), 'x, batch -> x')

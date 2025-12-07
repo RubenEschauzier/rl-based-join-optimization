@@ -1,0 +1,144 @@
+model:
+  type: GINEConv
+  embedding:
+    layers:
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 129
+            out_features: 512
+            id: gine_nn_1_lin_1
+
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_1_ln_1
+
+          - type: ReLU
+            id: gine_nn_1_relu_1
+
+          - type: Linear
+            in_features: 512
+            out_features: 1024
+            id: gine_nn_1_lin_2
+
+          - type: LayerNorm
+            normalized_shape: 1024
+            id: gine_nn_1_ln_2
+
+          - type: ReLU
+            id: gine_nn_1_relu_2
+
+        edge_dim: 129
+        id: gine_1
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 1024
+            out_features: 2048
+            id: gine_nn_2_lin_1
+
+          - type: LayerNorm
+            normalized_shape: 2048
+            id: gine_nn_2_ln_1
+
+          - type: ReLU
+            id: gine_nn_2_relu_1
+
+          - type: Linear
+            in_features: 2048
+            out_features: 2048
+            id: gine_nn_2_lin_2
+
+          - type: LayerNorm
+            normalized_shape: 2048
+            id: gine_nn_2_ln_2
+
+          - type: ReLU
+            id: gine_nn_2_relu_2
+
+        edge_dim: 129
+        id: gine_2
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 2048
+            out_features: 4096
+            id: gine_nn_3_lin_1
+
+          - type: LayerNorm
+            normalized_shape: 4096
+            id: gine_nn_3_ln_1
+
+          - type: ReLU
+            id: gine_nn_3_relu_1
+
+          - type: Linear
+            in_features: 4096
+            out_features: 4096
+            id: gine_nn_3_lin_2
+
+          - type: LayerNorm
+            normalized_shape: 4096
+            id: gine_nn_3_ln_2
+
+          - type: ReLU
+            id: gine_nn_3_relu_2
+
+          - type: Dropout
+            p: 0.2
+            id: gine_nn_3_dropout_1
+
+        edge_dim: 129
+        id: gine_3
+
+  heads:
+    - estimation_type: cardinality
+      layers:
+        - type: SumAggregation
+          id: sum_agg
+
+        - type: Linear
+          in_features: 4096
+          out_features: 1024
+          id: card_nn_lin_1
+
+        - type: LayerNorm
+          normalized_shape: 1024
+          id: card_nn_ln_1
+
+        - type: ReLU
+          id: card_nn_relu_1
+
+        - type: Dropout
+          p: 0.2
+          id: card_nn_dropout_1
+
+        - type: Linear
+          in_features: 1024
+          out_features: 256
+          id: card_nn_lin_2
+
+        - type: LayerNorm
+          normalized_shape: 256
+          id: card_nn_ln_2
+
+        - type: ReLU
+          id: card_nn_relu_2
+
+        - type: Linear
+          in_features: 256
+          out_features: 1
+          id: card_nn_lin_3
+    - estimation_type: triple_embedding
+      layers:
+        - type: TriplePatternPooling
+          id: tp_encoding
+
+
+weight_location:
+  directory: ""
+  chkp: true
+
+

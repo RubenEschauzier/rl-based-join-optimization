@@ -108,7 +108,7 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
                                       featurizer=featurizer_edge_labeled_graph,
                                       post_processor=post_processor,
                                       to_load=to_load,
-                                      load_mappings=load_mappings,
+                                      load_mappings=True,
                                       )
 
     if shuffle_train:

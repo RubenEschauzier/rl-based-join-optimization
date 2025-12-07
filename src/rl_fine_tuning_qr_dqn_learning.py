@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import torch.nn
 from matplotlib import pyplot as plt
 from sb3_contrib import MaskablePPO
@@ -13,6 +14,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from scipy.stats import linregress
 from stable_baselines3.common.callbacks import CheckpointCallback, ProgressBarCallback
 from stable_baselines3.common.monitor import Monitor
+from torch.utils.data import Subset
 
 from src.models.model_instantiator import ModelFactory
 from src.models.rl_algorithms.custom_callbacks import EvalWithOptimalLoggingCallback
@@ -23,6 +25,7 @@ from src.models.rl_algorithms.qrdqn_feature_extractors import QRDQNFeatureExtrac
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_estimated_cost import QueryGymEstimatedCost
 from src.query_environments.gym.query_gym_execution_cost import QueryGymExecutionCost
+from src.query_environments.gym.query_gym_execution_cost_async import AsyncBatchQueryEnv
 from src.query_environments.gym.query_gym_execution_latency import QueryGymExecutionLatency
 from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
@@ -127,6 +130,24 @@ def make_env_execution_cost(embedding_cardinality_model, dataset, train_mode, en
                                  train_mode=train_mode,
                                  tp_occurrences=occurrences)
 
+def execution_cost_env_factory(
+        embedding_cardinality_model, query_env, query_dataset, query_timeout, occurrences, mask_fn
+):
+    """Factory returning a function that builds a single environment instance."""
+
+    def _init():
+        env = QueryGymExecutionCost(
+            query_timeout=query_timeout,
+            query_dataset=query_dataset,  # single query or subset
+            query_embedder=embedding_cardinality_model,
+            env=query_env,
+            tp_occurrences=occurrences,
+            train_mode=True,
+        )
+        env = ActionMasker(env, mask_fn)
+        return env
+
+    return _init
 
 def make_env_execution_latency(embedding_cardinality_model, dataset, train_mode, env, curriculum):
     return QueryGymExecutionLatency(query_timeout=30000,
@@ -139,8 +160,8 @@ def make_env_execution_latency(embedding_cardinality_model, dataset, train_mode,
                                     curriculum=curriculum)
 
 
-def wrap_validation_environment_with_baseline(val_env, cache_optimal_cost):
-    return OrderDynamicProgramming(val_env, cache_optimal_cost)
+def wrap_validation_environment_with_baseline(val_env, cache_optimal_cost, device):
+    return OrderDynamicProgramming(val_env, device, cache_optimal_cost)
 
 
 def prepare_queries(query_env,
@@ -194,32 +215,37 @@ def prepare_experiment(endpoint_location,
     return gine_conv_model, train_dataset, val_dataset, query_env
 
 
-def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost):
+def prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost, device,
+                             wrap_baseline = True):
     train_env = make_env_estimated_cost(emb_model, train_dataset, True, query_env)
     val_env = make_env_estimated_cost(emb_model, val_dataset.shuffle(),
                                       False, query_env)
-    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
+    if wrap_baseline:
+        val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost, device)
 
     return train_env, val_env
 
 
-def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost,
-                                shuffle_dataset=False, occurrences=None):
+def prepare_execution_cost_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost, device,
+                                shuffle_dataset=False, occurrences=None, wrap_baseline=True):
     train_env = make_env_execution_cost(emb_model, train_dataset, True, query_env, occurrences=occurrences)
     if shuffle_dataset:
         val_dataset.shuffle()
     val_env = make_env_execution_cost(emb_model, val_dataset,
                                       False, query_env, occurrences=occurrences)
-    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
+    if wrap_baseline:
+        val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost, device)
 
     return train_env, val_env
 
 
-def prepare_execution_latency_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost, curriculum):
+def prepare_execution_latency_envs(emb_model, train_dataset, val_dataset, query_env, cache_optimal_cost, curriculum,
+                                   device, wrap_baseline=True):
     train_env = make_env_execution_latency(emb_model, train_dataset, True, query_env, curriculum)
     val_env = make_env_execution_latency(emb_model, val_dataset.shuffle(),
                                          False, query_env, curriculum)
-    val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost)
+    if wrap_baseline:
+        val_env = wrap_validation_environment_with_baseline(val_env, cache_optimal_cost, device)
     return train_env, val_env
 
 
@@ -232,7 +258,8 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
             ckp_callback_estimate, ckp_callback_fine_tuning,
             occurrences=None,
             model_ckp_fine_tune=None):
-    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True,
+                                                  device='cpu')
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -277,19 +304,43 @@ def run_ppo(n_steps, n_steps_fine_tune, n_eval_episodes,
             f.write(str(end_est - start_est))
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
-    exec_train_env, exec_val_env = prepare_execution_cost_envs(
+    _, exec_val_env = prepare_execution_cost_envs(
         emb_model, train_dataset, val_dataset[:n_eval_episodes], query_env, False,
-        occurrences=occurrences)
+        occurrences=occurrences, device='cpu', wrap_baseline=False)
 
-    exec_train_env = ActionMasker(exec_train_env, mask_fn)
+    # exec_train_env = ActionMasker(exec_train_env, mask_fn)
     exec_val_env = ActionMasker(exec_val_env, mask_fn)
+
+    num_envs = min(64, len(train_dataset))
+    indices = np.arange(len(train_dataset))
+    splits = np.array_split(indices, num_envs)
+
+    print("Starting execution train environments")
+    environments = [
+        execution_cost_env_factory(
+            emb_model, query_env, Subset(train_dataset, split),
+            query_timeout=60000,  # or whatever you use
+            occurrences=occurrences,
+            mask_fn=mask_fn
+        )() for split in splits
+    ]
+    exec_train_env = AsyncBatchQueryEnv(environments)
+
     print("Fine tune environment contains {} queries".format(len(val_dataset[:n_eval_episodes])))
-    model.set_env(exec_train_env)
     if not model_ckp_fine_tune:
+        # Have to load the pretrained model and set env directly as the finetune environment is vectorized
+        model = MaskablePPO.load(
+            model_save_loc_estimated.with_suffix('.zip'),
+            env = exec_train_env,
+            learning_rate = .1 * model.learning_rate,
+            clip_range=0.1,
+            device='cpu'
+        )
         # Ensure critic is reset due to change in reward function
         reset_value_head_only(model)
+    else:
+        model.set_env(exec_train_env)
 
-        model.learning_rate = .1 * model.learning_rate
     eval_callback_fine_tuned = EvalWithOptimalLoggingCallback(
         eval_env=Monitor(exec_val_env),
         use_masking=True,
@@ -321,7 +372,8 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
                occurrences=None,
                model_ckp_fine_tune=None
                ):
-    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True)
+    train_env, val_env = prepare_cardinality_envs(emb_model, train_dataset, val_dataset, query_env, True,
+                                                  device='cpu')
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
@@ -365,7 +417,8 @@ def run_qr_dqn(n_steps, n_steps_fine_tune, n_eval_episodes,
 
     # Finetune based on query execution. This is with fewer steps due to cost of executing queries
     exec_train_env, exec_val_env = prepare_execution_cost_envs(
-        emb_model, train_dataset, val_dataset[:n_eval_episodes], query_env, False, occurrences)
+        emb_model, train_dataset, val_dataset[:n_eval_episodes], query_env, False, device='cpu',
+        occurrences=occurrences)
     # exec_train_env, exec_val_env = prepare_execution_latency_envs(
     #     emb_model, train_dataset, val_dataset[:n_eval_queries], query_env, False, False)
 
@@ -408,8 +461,6 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
                    seed=0):
     model_save_loc_estimated = append_current_time_to_dir(model_save_loc_estimated)
     model_save_loc_fine_tuned = append_current_time_to_dir(model_save_loc_fine_tuned)
-    print(model_save_loc_estimated)
-    print(model_save_loc_fine_tuned)
 
     torch.manual_seed(seed)
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
@@ -433,6 +484,7 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
         raise ValueError("Either train or validation dataset was None and there is no query_location_directory given in"
                          "config")
     emb_model = prepare_embedding_model(model_config, model_directory)
+    emb_model = emb_model.to('cpu')
     extractor_type_to_class = {
         "naive": QRDQNFeatureExtractor,
         "tree_lstm": QRDQNFeatureExtractorTreeLSTM
@@ -483,12 +535,8 @@ def main_rl_tuning(rl_algorithm, extractor_type: Literal["tree_lstm", "naive"],
 
 
 if __name__ == "__main__":
-    # TODO: Fix Tree-LSTM
-    # TODO: Train on full queries, train on full query sets with all different shapes
-    # TODO: Make functions that given trained RL model and trained pretrained model
+    #TODO: Make functions that given trained RL model and trained pretrained model
     # - tests on full validation set.
     # - test on watdiv queries
     # - test the variability in performance
-    # TODO: Ensure that pretraining train and validation sets are separated and are the same separation for RL training
-    # TODO: Check validity baseline
     torch.manual_seed(0)

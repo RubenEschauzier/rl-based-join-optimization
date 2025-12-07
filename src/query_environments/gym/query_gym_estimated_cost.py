@@ -24,11 +24,10 @@ class QueryGymEstimatedCost(QueryGymBase):
 
 
     @staticmethod
-    def reduced_form_query(query, join_order, join_count):
+    def reduced_form_query(query, join_order, join_count, device=torch.device('cpu')):
         # Only get set join_order, slice out all unset 0 padding entries of join order array
         triple_indexes_to_include = join_order[:join_count]
         reduced_triple_patterns = np.array(query.triple_patterns)[triple_indexes_to_include]
-
         (sub_sampled_term_attributes,
          old_to_new_id) = QueryGymEstimatedCost.sub_sample_term_features(query.x,
                                                                     query.triple_patterns,
@@ -42,6 +41,25 @@ class QueryGymEstimatedCost(QueryGymBase):
 
         reduced_query_string = QueryGymEstimatedCost.triple_patterns_to_query(reduced_triple_patterns)
         # Don't need y as this query will only be used for prediction target in RL training
+        # active_terms = set()
+        # for tp in reduced_triple_patterns:
+        #     terms = tp.split(" ")[:-1]
+        #     for term in terms:
+        #         active_terms.add(term)
+        #
+        # # active_terms = set([tp.split(" ") for tp in reduced_triple_patterns].flatten())
+        #
+        # reduced_term_to_id = {
+        #     term: old_to_new_id[idx.cpu().item()]
+        #     for term, idx in query.term_to_id.items()
+        #     if term in active_terms
+        # }
+        num_new_nodes = sub_sampled_term_attributes.shape[0]
+
+        # Create a new batch tensor of zeros matching the new node count
+        # We use the device of the subsampled attributes to ensure compatibility before the final move
+        new_batch = torch.zeros(num_new_nodes, dtype=torch.long, device=sub_sampled_term_attributes.device)
+
         reduced_query_data = Data(
             x=sub_sampled_term_attributes,
             edge_index=sub_sampled_edge_index,
@@ -50,8 +68,8 @@ class QueryGymEstimatedCost(QueryGymBase):
             query = reduced_query_string,
             triple_patterns=reduced_triple_patterns,
             type=query.type,
-            batch=query.batch)
-        return reduced_query_data
+            batch=new_batch)
+        return reduced_query_data.to(device)
 
 
     @staticmethod

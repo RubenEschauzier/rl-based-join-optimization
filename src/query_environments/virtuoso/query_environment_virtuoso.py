@@ -10,9 +10,6 @@ class VirtuosoQueryEnvironment:
     def run(self, query: Query, join_order, timeout: int, additional_params):
         rewritten_query = self.set_join_order(query, join_order)
         result = self.query_runner.run_query(rewritten_query, timeout)
-        print(result)
-        for r in result["results"]["bindings"]:
-            print(r)
 
     """
     Set left-deep join order for virtuoso. Input is order in which triple patterns should be joined together.

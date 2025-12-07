@@ -121,6 +121,7 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
             - lstm_order_mask (batch_size, max_triples-1)
         """
         # (B, max_triples, feature_dim)
+
         result_embeddings = observations["result_embeddings"]
         join_graphs = observations["join_graph"]
         joined = observations["joined"]
@@ -129,10 +130,10 @@ class QRDQNFeatureExtractorTreeLSTM(BaseFeaturesExtractor):
         # Furthermore, observations also requires a 'graph' to be constructed of edge_indexes and an 'order'
         # which is how we execute our n_ary_tree_lstm recursively. On the other hand, h, c can be zero tensors with the
         # right shape
-        device = result_embeddings.device
         state_embeddings = []
         for i in range(result_embeddings.shape[0]):
             n_triples = n_triples_obs[i][0]
+
             x = result_embeddings[i]
 
             # Construct edge index in format of package with all padding edges removed (This can be done faster)
