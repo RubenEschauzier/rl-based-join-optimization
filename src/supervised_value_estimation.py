@@ -156,7 +156,7 @@ class PlanCostEstimatorTiny(BasePlanCostEstimator):
         gate_nn = nn.Sequential(
             nn.Linear(feature_dim, 5),
             nn.ReLU(),
-            nn.Linear(feature_dim // 2, 1)
+            nn.Linear(5, 1)
         ).to(device)
         plan_embedding_nn = nn.Sequential(
             BinaryTreeConv(10, 10),
@@ -180,15 +180,16 @@ class PlanCostEstimatorTiny(BasePlanCostEstimator):
 class EpistemicNetwork(nn.Module):
     def __init__(self,
                  epi_index_dim, prior_config,
-                 cost_estimation_model: PlanCostEstimatorFull,
+                 cost_estimation_model: QueryPlansPredictionModel,
                  device=torch.device('cpu')):
         super().__init__()
         self.epi_index_dim = epi_index_dim
         self.cost_estimation_model = cost_estimation_model
+        self.device = device
         # We use an ensemble of tiny gine_conv as priors
         model_factory_gine_conv = ModelFactory(prior_config)
-        ensemble_gnn = [model_factory_gine_conv.load_gine_conv() for _ in range(epi_index_dim)]
-        ensemble_plan_cost = [PlanCostEstimatorTiny(device, 5) for _ in range(epi_index_dim)]
+        ensemble_gnn = [model_factory_gine_conv.load_gine_conv().to(device) for _ in range(epi_index_dim)]
+        ensemble_plan_cost = [PlanCostEstimatorTiny(device, 5).to(device) for _ in range(epi_index_dim)]
         self.ensemble_combined_prior_models = [
             QueryPlansPredictionModel(ensemble_gnn[i], ensemble_plan_cost[i], device) for i in range(epi_index_dim)
         ]
@@ -220,6 +221,9 @@ class EpistemicNetwork(nn.Module):
     def embed_query_batched(self, queries):
         return self.cost_estimation_model.embed_query_batched(queries)
 
+    def estimate_cost_full(self, plans, embedded_query, precomputed_indexes):
+        return self.cost_estimation_model.estimate_cost(plans, embedded_query, precomputed_indexes)
+
     def embed_query_batched_prior(self, queries):
         embedded_query_batches = []
         for prior_model in self.ensemble_combined_prior_models:
@@ -250,18 +254,19 @@ class EpistemicNetwork(nn.Module):
         pass
 
 
-    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, epi_index):
+    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, epi_index, query_idx):
         with torch.no_grad():
-            prepared_trees, prepared_indexes = build_trees_and_indexes(
-                [[plan[0] for plan in plans]], [embedded_query],
-                precomputed_indexes
-            )
-            prepared_trees.to(self.device)
-            [prepared_index.to(self.device) for prepared_index in prepared_indexes]
-            estimated_cost_priors = torch.zeros((epi_index, 1))
+            estimated_cost_priors = torch.zeros((self.epi_index_dim, 1))
             for i in range(self.epi_index_dim):
+                prepared_trees, prepared_indexes = build_trees_and_indexes(
+                    [[plan[0] for plan in plans]], [embedded_query[i][query_idx]],
+                    precomputed_indexes
+                )
+                prepared_trees.to(self.device)
+                [prepared_index.to(self.device) for prepared_index in prepared_indexes]
+                #TODO: This needs to be shaped to the number of plans
                 est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
-                    plans, embedded_query, precomputed_indexes
+                    plans, embedded_query[i][query_idx], precomputed_indexes
                 )
                 estimated_cost_priors[i] = est_cost
             weighted_sum = torch.matmul(epi_index, estimated_cost_priors)
@@ -410,7 +415,7 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
 def validate(queries_val, query_plans_val,
              precomputed_indexes, min_cost, max_cost,
              train_loss,
-             model_query, model_plan, combined_model,
+             combined_model,
              device):
     query_to_val = {}
     mape = MeanAbsolutePercentageError()
@@ -436,8 +441,9 @@ def validate(queries_val, query_plans_val,
 
 
 def train_simulated(queries_train, query_plans_train,
-                    queries_val, query_plans_val, model_query, model_plan,
-                    combined_model, device, query_batch_size, train_batch_size):
+                    queries_val, query_plans_val,
+                    combined_model, epinet_cost_estimation: EpistemicNetwork,
+                    device, query_batch_size):
     combined_model.to(device)
 
     precomputed_indexes = precompute_left_deep_tree_conv_index(100, device)
@@ -465,10 +471,25 @@ def train_simulated(queries_train, query_plans_train,
         for k, queries in tqdm(enumerate(loader), total=len(loader)):
             optimizer.zero_grad()
             embedded = combined_model.embed_query_batched(queries)
+
+            embedded_epinet = epinet_cost_estimation.embed_query_batched(queries)
+            embedded_prior = epinet_cost_estimation.embed_query_batched_prior(queries)
+
             total_loss_tensor = torch.tensor(0.0, device=device)
             for i in range(len(queries.query)):
-
                 plans = query_plans_train[queries.query[i]]
+
+                estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
+                    plans, embedded_epinet[i], precomputed_indexes
+                )
+
+                #TODO Here we just do one epistemic index for all plans, however that might not be the way to go?
+                #TODO: Need to do this with multiple epinet indexes sampled so in a loop
+                epinet_index = epinet_cost_estimation.sample_epistemic_indexes()
+                epinet_cost_estimation.compute_ensemble_prior(
+                    plans, embedded_prior, precomputed_indexes, epinet_index, i
+                )
+                epinet_cost_estimation.compute_mlp_prior(last_feature, epinet_index)
                 target = torch.tensor([plan[1] for plan in plans], device=device)
 
                 output, _ = combined_model.estimate_cost(plans, embedded[i], precomputed_indexes)
@@ -485,7 +506,6 @@ def train_simulated(queries_train, query_plans_train,
                                  precomputed_indexes,
                                  min_val, max_val,
                                  loss,
-                                 model_query, model_plan,
                                  combined_model,
                                  device)
         val_losses = [val_output["loss"] for val_output in query_to_val.values()]
@@ -496,9 +516,9 @@ def train_simulated(queries_train, query_plans_train,
 
 
 def main_simulated_training(train_dataset, val_dataset,
-                            oracle_model, model_query, model_plan,
-                            combined_model,
-                            device, query_batch_size, train_batch_size,
+                            oracle_model,
+                            combined_model, epinet_cost_estimation,
+                            device, query_batch_size,
                             save_loc_simulated_dataset, save_loc_simulated_dataset_val):
     oracle_model = oracle_model.to(device)
     data = prepare_simulated_dataset(train_dataset, oracle_model, device, save_loc_simulated_dataset)
@@ -508,11 +528,10 @@ def main_simulated_training(train_dataset, val_dataset,
     query_plan_dict_val = {k: v for d in val_data for k, v in d.items()}
     train_simulated(queries_train=train_dataset, query_plans_train=query_plans_dict,
                     queries_val=val_dataset, query_plans_val=query_plan_dict_val,
-                    model_query=model_query, model_plan=model_plan,
                     combined_model=combined_model,
+                    epinet_cost_estimation=epinet_cost_estimation,
                     device=device,
                     query_batch_size=query_batch_size,
-                    train_batch_size=train_batch_size
                     )
 
 def main_supervised_value_estimation(endpoint_location,
@@ -536,16 +555,14 @@ def main_supervised_value_estimation(endpoint_location,
     embedding_model = prepare_cardinality_estimator(model_config=model_config_embedder)
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
 
-    EpistemicNetwork(8, )
-    epi_index_dim, prior_config,
-    cost_estimation_model: PlanCostEstimatorFull,
-    device = torch.device('cpu')):
+    epinet_cost_estimation = EpistemicNetwork(8, model_config_epistemic_prior, combined_model, device=device)
 
     main_simulated_training(train_dataset, val_dataset,
-                            oracle_model, embedding_model, cost_net_attention_pooling,
+                            oracle_model,
                             combined_model,
+                            epinet_cost_estimation,
                             device,
-                            6, 128,
+                            6,
                             save_loc_simulated_dataset, save_loc_simulated_val,)
 
 
@@ -573,5 +590,6 @@ if __name__ == "__main__":
                                      save_loc_simulated, save_loc_simulated_val,
                                      occurrences_location, tp_cardinality_location,
                                      model_config_oracle, model_dir_oracle,
-                                     model_config_emb
+                                     model_config_emb,
+                                     model_config_prior
                                      )
