@@ -21,8 +21,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.utils.tree_conv_utils import prepare_trees, build_batched_flat_trees_and_indexes
-
 
 #TODO: Change this binary tree conv to take a batch of features (b, n, feature_dim) and batch of orders (b, 1(list))
 # Batchwise converts this to a convable index and does batchwise conv
@@ -150,57 +148,3 @@ def right_child(x):
 # should be a numpy array.
 def transformer(x):
     return np.array(x[0])
-
-if __name__ == "__main__":
-    pass
-    # Example: left-deep join order
-    # Tree:   8
-    #       7   4
-    #     6   3
-    #   5   2
-    # 0   1
-
-    join_order = [0, 1, 2, 3, 4]  # Bottom-up, left-to-right traversal
-
-    # Create example features tensor (7 relations, 2 features each)
-    features1 = torch.tensor([
-        [1.0, 2.0],  # relation 0
-        [3.0, 4.0],  # relation 1
-        [5.0, 6.0],  # relation 2
-        [7.0, 8.0],  # relation 3
-        [9.0, 10.0],  # relation 4
-    ])
-
-    # Convert to nested tuple format
-    tree_structure_1 = build_t_cnn_tree_from_order(join_order, features1)
-
-    features = torch.tensor([
-        [5.0,3.0],
-        [2.0,6.0],
-        [2.0,9.0]
-    ])
-    tree_structure_2 = build_t_cnn_tree_from_order([0,1,2], features)
-    trees = [tree_structure_1, tree_structure_2]
-    trees_singleton = [tree_structure_1]
-    # this call to `prepare_trees` will create the correct input for
-    # a `tcnn.BinaryTreeConv` operator.
-    prepared_trees = prepare_trees(trees, transformer, left_child, right_child)
-    prepared_trees_singleton = prepare_trees(trees_singleton, transformer, left_child, right_child)
-
-    test = build_batched_flat_trees_and_indexes([join_order], features1)
-    print(trees)
-    print(prepared_trees[0])
-    pause = 5
-    net = nn.Sequential(
-        BinaryTreeConv(2, 2),
-        TreeLayerNorm(),
-        TreeActivation(nn.ReLU()),
-        BinaryTreeConv(2, 2),
-        TreeLayerNorm(),
-        TreeActivation(nn.ReLU()),
-        BinaryTreeConv(2, 1),
-    )
-
-    # output: torch.Size([2, 4])
-    print(net(prepared_trees).shape)
-

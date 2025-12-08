@@ -1,171 +1,8 @@
-# < begin copyright >
-# Copyright Ryan Marcus 2019
-#
-# This file is part of TreeConvolution.
-#
-# TreeConvolution is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# TreeConvolution is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with TreeConvolution.  If not, see <http://www.gnu.org/licenses/>.
-#
-# < end copyright >
-from typing import List, Tuple
-
 import numpy as np
 import torch
-from torch import Tensor
-
-
-class TreeConvolutionError(Exception):
-    pass
-
-
-def _is_leaf(x, left_child, right_child):
-    has_left = left_child(x) is not None
-    has_right = right_child(x) is not None
-
-    if has_left != has_right:
-        raise TreeConvolutionError(
-            "All nodes must have both a left and a right child or no children"
-        )
-
-    return not has_left
-
-
-def _flatten(root, transformer, left_child, right_child):
-    """ turns a tree into a flattened vector, preorder """
-
-    if not callable(transformer):
-        raise TreeConvolutionError(
-            "Transformer must be a function mapping a tree node to a vector"
-        )
-
-    if not callable(left_child) or not callable(right_child):
-        raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a "
-            + "tree node to its child, or None"
-        )
-
-    accum = []
-
-    def recurse(x):
-        if _is_leaf(x, left_child, right_child):
-            accum.append(transformer(x))
-            return
-
-        accum.append(transformer(x))
-        recurse(left_child(x))
-        recurse(right_child(x))
-
-    recurse(root)
-
-    try:
-        accum = [np.zeros(accum[0].shape)] + accum
-    except:
-        raise TreeConvolutionError(
-            "Output of transformer must have a .shape (e.g., numpy array)"
-        )
-
-    return np.array(accum)
-
-
-def _preorder_indexes(root, left_child, right_child, idx=1):
-    """ transforms a tree into a tree of preorder indexes """
-
-    if not callable(left_child) or not callable(right_child):
-        raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a " +
-            "tree node to its child, or None"
-        )
-
-    if _is_leaf(root, left_child, right_child):
-        # leaf
-        return idx
-
-    def rightmost(tree):
-        if isinstance(tree, tuple):
-            return rightmost(tree[2])
-        return tree
-
-    left_subtree = _preorder_indexes(left_child(root), left_child, right_child,
-                                     idx=idx + 1)
-
-    max_index_in_left = rightmost(left_subtree)
-    right_subtree = _preorder_indexes(right_child(root), left_child, right_child,
-                                      idx=max_index_in_left + 1)
-
-    return (idx, left_subtree, right_subtree)
-
-
-def _tree_conv_indexes(root, left_child, right_child):
-    """
-    Create indexes that, when used as indexes into the output of `flatten`,
-    create an array such that a stride-3 1D convolution is the same as a
-    tree convolution.
-    """
-
-    if not callable(left_child) or not callable(right_child):
-        raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a "
-            + "tree node to its child, or None"
-        )
-
-    index_tree = _preorder_indexes(root, left_child, right_child)
-
-    def recurse(root):
-        if isinstance(root, tuple):
-            my_id = root[0]
-            left_id = root[1][0] if isinstance(root[1], tuple) else root[1]
-            right_id = root[2][0] if isinstance(root[2], tuple) else root[2]
-            yield [my_id, left_id, right_id]
-
-            yield from recurse(root[1])
-            yield from recurse(root[2])
-        else:
-            yield [root, 0, 0]
-
-    return np.array(list(recurse(index_tree))).flatten().reshape(-1, 1)
-
-
-def _pad_and_combine(x):
-    assert len(x) >= 1
-    assert len(x[0].shape) == 2
-
-    for itm in x:
-        if itm.dtype == np.dtype("object"):
-            raise TreeConvolutionError(
-                "Transformer outputs could not be unified into an array. "
-                + "Are they all the same size?"
-            )
-
-    second_dim = x[0].shape[1]
-    for itm in x[1:]:
-        assert itm.shape[1] == second_dim
-
-    max_first_dim = max(arr.shape[0] for arr in x)
-
-    vecs = []
-    for arr in x:
-        padded = np.zeros((max_first_dim, second_dim))
-        padded[0:arr.shape[0]] = arr
-        vecs.append(padded)
-
-    return np.array(vecs)
 
 
 def precompute_left_deep_tree_conv_index(max_leaves: int, device):
-    #TODO: These still need padding, use max_size in some way to determine max size of the indexes in batch.
-    # Then just fill in the tensor from lookup in the pre-allocated pytorch tensor
-    # Current idea is good but doesn't work as indexes are precomputed, so instead
-    # Pre-alloc should be size n_plans, max_size, 1
     """
     In left-deep trees its trivial precompute the indexes based on the number of leaves
     :param max_leaves:
@@ -194,149 +31,80 @@ def left_deep_tree_conv_index(n_leaves: int):
 
     return np.array(triples)
 
-
-def prepare_trees(trees, transformer, left_child, right_child):
-    flat_trees = [_flatten(x, transformer, left_child, right_child) for x in trees]
-    flat_trees = _pad_and_combine(flat_trees)
-    flat_trees = torch.Tensor(flat_trees)
-
-    # flat trees is now batch x max tree nodes x channels
-    flat_trees = flat_trees.transpose(1, 2)
-
-    indexes = [_tree_conv_indexes(x, left_child, right_child) for x in trees]
-    indexes = _pad_and_combine(indexes)
-    indexes = torch.Tensor(indexes).long()
-
-    return (flat_trees, indexes)
-
-def build_batched_flat_trees_and_indexes(
-    join_orders: List[List[int]],
-    features: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.LongTensor]:
+def precompute_left_deep_trees_placeholders(max_leaves: int, emb_dim, precomputed_indexes, device):
     """
-    Build the same outputs as `prepare_trees(trees, transformer, left_child, right_child)`
-    but directly, for left-deep trees generated from `join_orders` and `features`.
-
-    Args:
-        join_orders: list of join orders (each a list of relation indices into `features`)
-        features: tensor of shape [n_rels, channels] (requires_grad if backbone is trainable)
-
-    Returns:
-        flat_trees: Tensor (batch, channels, max_nodes_plus_one)
-        indexes: LongTensor (batch, max_triplets, 1)
+    Precomputes tree structures used for 1d convolution in tree cnn. These tree structures must be right-padded with
+    zero tensors of emb_dim size tto batch multiple plan sizes together
+    :param max_leaves: Max join entries to precompute trees for
+    :param emb_dim: The dimension of the placeholder embeddings
+    :param precomputed_indexes: Precomputed index tensors (needed for tcnn)
+    :param device:
+    :return: Dict mapping number of join entries to the tree structure dict. With elements 'trees',
+    'node_mapping'. node_mapping maps the index in the join order to the index of the placeholder tensor.
     """
+    leaves_to_tree = {}
+    for i in range(2, max_leaves):
+        node_ids = torch.arange(i, device=device).unsqueeze(1)
+        embedded = node_ids.repeat(1, emb_dim)
+        embedded = embedded.float()
 
-    device = features.device
-    dtype = features.dtype
-    batch_node_feats = []   # list of tensors (n_nodes_plus1, channels)
-    batch_index_vecs = []   # list of tensors (n_nodes*3, 1) -- flattened triplets
+        # Placeholder join order
+        join_order = [j for j in range(i)]
+        node_count = 2 * len(join_order)
 
-    # Helper: build a lightweight index-only tree structure for a left-deep join order
-    # We'll represent nodes by dicts with integers, but the features we append are torch tensors.
-    for join_order in join_orders:
-        if len(join_order) < 2:
-            raise ValueError("Each join_order must have at least two relations.")
 
-        # Build a left-deep tree structure using indices (integers):
-        # Leaves are stored as ('leaf', rel_idx)
-        # Internals as ('node', left_node, right_node)
-        # We'll create the tree iteratively to avoid recursion on Python objects with tensors.
-        # Start with base tree combining first two leaves
-        # Represent nodes as tuples: ('leaf', rel_idx) or ('node', left_obj, right_obj)
-        # These are small Python objects used only to compute traversal order and indexes.
-        left_obj = ('leaf', join_order[0])
-        right_obj = ('leaf', join_order[1])
-        root = ('node', left_obj, right_obj)
+        prepared_trees, prepared_indexes = build_trees_and_indexes(
+            [[[j for j in range(i)]]], [embedded],
+            precomputed_indexes
+        )
+        prepared_trees = prepared_trees.transpose(1, 2)
 
-        for rel in join_order[2:]:
-            root = ('node', root, ('leaf', rel))
+        jo_idx_to_tree_idx = { j: node_count - len(join_order) + j for j in range(len(join_order))}
 
-        # Now compute preorder traversal and map nodes to consecutive preorder indices starting at 1
-        preorder_nodes = []  # list of node objects in preorder
-        node_to_idx = {}     # id(node) -> preorder index (1-based)
+        for key, value in jo_idx_to_tree_idx.items():
+            assert join_order[key] == prepared_trees[0][value][0]
 
-        def preorder_traverse(node):
-            preorder_nodes.append(node)
-            if node[0] == 'node':
-                preorder_traverse(node[1])
-                preorder_traverse(node[2])
 
-        preorder_traverse(root)
+        leaves_to_tree[i] = {
+            'trees': prepared_trees,
+            'node_mapping': jo_idx_to_tree_idx
+        }
 
-        # assign indices
-        for i, node in enumerate(preorder_nodes, start=1):
-            node_to_idx[id(node)] = i
+    return leaves_to_tree
 
-        # Build the feature list in the same preorder used in `_flatten`,
-        # then prepend the zero vector as prepare_trees does.
-        node_feats = []
-        for node in preorder_nodes:
-            if node[0] == 'leaf':
-                rel_idx = node[1]
-                node_feats.append(features[rel_idx])   # tensor view, keeps grad
-            else:  # internal node
-                node_feats.append(torch.zeros_like(features[0]))
 
-        # prepend the zero-vector as in _flatten
-        zero_vec = torch.zeros_like(features[0])
-        node_feats = [zero_vec] + node_feats  # list of tensors shape (channels,)
-        # stack to (nodes_plus_one, channels)
-        node_feats_tensor = torch.stack(node_feats, dim=0).to(device=device, dtype=dtype)
-        batch_node_feats.append(node_feats_tensor)
+def fill_placeholder_trees(plans, embedded, precomputed_trees, precomputed_indexes, device):
+    indexes = get_tree_conv_indexes([[plan[0] for plan in plans]], precomputed_indexes, device)
 
-        # Now build the index triplets (my_id, left_id, right_id) for each preorder node
-        # Note: the indices used in prepare_trees's _tree_conv_indexes start at 1 (because of the prepended zero)
-        # Our node_to_idx maps preorder indices starting at 1 for the actual nodes; since we prepended a zero at index 0,
-        # the mapping into flattened array is already compatible: the first element in flattened array is the zero vector (index 0),
-        # and our nodes occupy indices 1..n_nodes as expected.
-        triplet_list = []
-        for node in preorder_nodes:
-            if node[0] == 'leaf':
-                my_id = node_to_idx[id(node)]
-                triplet_list.extend([my_id, 0, 0])
-            else:
-                my_id = node_to_idx[id(node)]
-                left_node = node[1]
-                right_node = node[2]
-                left_id = node_to_idx[id(left_node)]
-                right_id = node_to_idx[id(right_node)]
-                triplet_list.extend([my_id, left_id, right_id])
+    max_plan_size = max([len(plan[0]) for plan in plans])
+    max_size_placeholder_tree = precomputed_trees[max_plan_size]['trees']
 
-        # convert to tensor shaped (n_nodes*3, 1)
-        triplets_tensor = torch.tensor(triplet_list, dtype=torch.long, device=device).view(-1, 1)
-        batch_index_vecs.append(triplets_tensor)
+    filled_trees = []
+    for plan, cost in plans:
+        precomputed_tree_dict = precomputed_trees[len(plan)]
+        placeholder_tree, mapping = precomputed_tree_dict['trees'], precomputed_tree_dict['node_mapping']
+        filled_tree = torch.zeros_like(max_size_placeholder_tree)
+        for i in range(len(plan)):
+            emb_idx = plan[i]
+            tree_idx = mapping[i]
+            filled_tree[0][tree_idx] = embedded[emb_idx]
+        filled_trees.append(filled_tree)
+    stacked_trees = torch.stack(filled_trees).squeeze()
+    stacked_trees = stacked_trees.transpose(2, 1)
+    return stacked_trees, indexes
 
-    # Pad node feature tensors to same first-dim length
-    max_nodes = max(t.shape[0] for t in batch_node_feats)
-    channels = features.shape[1]
-    padded_feats = []
-    for t in batch_node_feats:
-        if t.shape[0] < max_nodes:
-            pad = torch.zeros((max_nodes - t.shape[0], channels), dtype=dtype, device=device)
-            padded = torch.cat([t, pad], dim=0)
-        else:
-            padded = t
-        padded_feats.append(padded.unsqueeze(0))  # (1, max_nodes, channels)
+    pass
 
-    # stacked -> (batch, max_nodes, channels)
-    stacked_feats = torch.cat(padded_feats, dim=0)
-    # transpose to (batch, channels, max_nodes) to match prepare_trees output after transpose
-    flat_trees = stacked_feats.transpose(1, 2).contiguous()
+def build_trees_and_indexes(join_orders_batched, features_batch, precomputed_indexes):
+    device = features_batch[0].device
+    n_nodes_batched = [feature.shape[0] for feature in features_batch]
 
-    # Pad index vectors to same length
-    max_triplets = max(t.shape[0] for t in batch_index_vecs)
-    padded_idxs = []
-    for idxv in batch_index_vecs:
-        if idxv.shape[0] < max_triplets:
-            pad = torch.zeros((max_triplets - idxv.shape[0], 1), dtype=torch.long, device=device)
-            padded = torch.cat([idxv, pad], dim=0)
-        else:
-            padded = idxv
-        padded_idxs.append(padded.unsqueeze(0))  # (1, max_triplets, 1)
-
-    indexes = torch.cat(padded_idxs, dim=0)  # (batch, max_triplets, 1)
-
-    return flat_trees, indexes
+    # Pre-compute and expand join orders
+    expanded_join_orders, total_join_orders, max_nodes_in_batch, max_triplets_in_batch\
+        = expand_join_orders(join_orders_batched, n_nodes_batched, device)
+    trees = build_trees(expanded_join_orders, total_join_orders, features_batch, max_nodes_in_batch)
+    indexes = get_tree_conv_indexes(join_orders_batched, precomputed_indexes, device)
+    return trees, indexes
 
 def expand_join_orders(join_orders_batched, n_nodes_batched, device):
     total_join_orders = 0
@@ -366,16 +134,6 @@ def expand_join_orders(join_orders_batched, n_nodes_batched, device):
         expanded_join_orders.append(join_order_tensors)
     return expanded_join_orders, total_join_orders, max_nodes_in_batch, max_triplets_in_batch
 
-def build_trees_and_indexes(join_orders_batched, features_batch, precomputed_indexes):
-    device = features_batch[0].device
-    n_nodes_batched = [feature.shape[0] for feature in features_batch]
-
-    # Pre-compute and expand join orders
-    expanded_join_orders, total_join_orders, max_nodes_in_batch, max_triplets_in_batch\
-        = expand_join_orders(join_orders_batched, n_nodes_batched, device)
-    trees = build_trees(expanded_join_orders, total_join_orders, features_batch, max_nodes_in_batch)
-    indexes = get_tree_conv_indexes(join_orders_batched, precomputed_indexes, device)
-    return trees, indexes
 
 def build_trees(expanded_join_orders, total_join_orders, features_batch, max_nodes_in_batch):
     device = features_batch[0].device

@@ -18,13 +18,12 @@
 import json
 import math
 import os
-import shelve
+from abc import abstractmethod
 import time
 # IDEAS:
 # Two losses and estimation heads: Latency and Cost
 # MoE in graph model
 # Uncertainty aware MoE
-from collections import defaultdict
 from functools import partial
 
 from torch_geometric.nn import GlobalAttention
@@ -43,17 +42,16 @@ from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynami
 from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining, prepare_queries
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.utils.tree_conv_utils import build_trees_and_indexes, \
-    precompute_left_deep_tree_conv_index
+    precompute_left_deep_tree_conv_index, precompute_left_deep_trees_placeholders, fill_placeholder_trees
 
 import torch
 import torch.nn as nn
 
 class QueryPlansPredictionModel(nn.Module):
-    def __init__(self, query_emb_model, query_plan_model, emb_dim, device, ):
+    def __init__(self, query_emb_model, query_plan_model, device):
         super().__init__()
         self.query_emb_model = query_emb_model
         self.query_plan_model = query_plan_model
-        self.emb_dim = emb_dim
         self.device = device
 
     def embed_query_batched(self, queries):
@@ -88,47 +86,14 @@ class QueryPlansPredictionModel(nn.Module):
         return self.query_plan_model.forward(prepared_trees, prepared_indexes[0])
 
 
-
-class PyGCardinalityHead(nn.Module):
-    def __init__(self, device, feature_dim=256):
+class BasePlanCostEstimator(nn.Module):
+    def __init__(self, device, feature_dim=100):
         super().__init__()
         self.device = device
-        # 1. Tree/Graph Convolution
-        # Assuming you have a GNN/TreeConv backbone defined elsewhere
-        # (If using standard GCN/GAT, define them here)
-        self.conv1 = BinaryTreeConv(200, 512)
-        self.conv2 = BinaryTreeConv(512, feature_dim)
-
-        # 2. Global Attention Pooling
-        # gate_nn: Compares node features to scalar scores
-        gate_nn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
-            nn.ReLU(),
-            nn.Linear(feature_dim // 2, 1)
-        )
-        self.plan_embedding_nn = nn.Sequential(
-            BinaryTreeConv(200, 512),
-            TreeLayerNorm(),
-            TreeActivation(nn.ReLU()),
-            BinaryTreeConv(512, 512),
-            TreeLayerNorm(),
-            TreeActivation(nn.ReLU()),
-            BinaryTreeConv(512, feature_dim),
-        )
-        self.attn_pool = GlobalAttention(gate_nn=gate_nn, nn=None)
-
-        # 3. Final Regressor
-        # Input size is double feature_dim because we concat [Root, Attention_Pool]
-        self.regressor = nn.Sequential(
-            nn.Linear(feature_dim * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.plan_embedding_nn, self.attn_pool, self.regressor = self.init_model(feature_dim, device)
 
     def forward(self, trees, indexes):
-        # 1. Encode Tree
+        # Encode the query plan
         emb, idx = self.plan_embedding_nn((trees, indexes))
 
         # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
@@ -145,39 +110,121 @@ class PyGCardinalityHead(nn.Module):
         # Repeat each plan index n_nodes times
         batch = plan_indices.repeat_interleave(n_nodes)
 
-        # 3. Attention Pooling (Signal Extraction)
-        # Automatically handles the batch-wise softmax!
         pool_vectors = self.attn_pool(emb_stacked, batch)
 
-        # Get root representation
+        # Get root representation, first element is zero vector inserted for conv purposes
         root_vectors = emb_transposed[:, 1, :]
-
-        # 4. Concatenate
         combined = torch.cat([root_vectors, pool_vectors], dim=1)
 
-        # 5. Predict
         return self.regressor(combined), combined
+
+    @abstractmethod
+    def init_model(self, feature_dim, device):
+        pass
+
+class PlanCostEstimatorFull(BasePlanCostEstimator):
+    def init_model(self, feature_dim, device):
+        gate_nn = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 2, 1)
+        ).to(device)
+        plan_embedding_nn = nn.Sequential(
+            BinaryTreeConv(200, 200),
+            TreeLayerNorm(),
+            TreeActivation(nn.ReLU()),
+            BinaryTreeConv(200, 100),
+            TreeLayerNorm(),
+            TreeActivation(nn.ReLU()),
+            BinaryTreeConv(100, feature_dim),
+        ).to(device)
+        attn_pool = GlobalAttention(gate_nn=gate_nn, nn=None).to(device)
+
+        # Input size is double feature_dim because we concat [Root, Attention_Pool]
+        regressor = nn.Sequential(
+            nn.Linear(feature_dim * 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        ).to(device)
+
+        return plan_embedding_nn, attn_pool, regressor
+
+class PlanCostEstimatorTiny(BasePlanCostEstimator):
+    def init_model(self, feature_dim, device):
+        gate_nn = nn.Sequential(
+            nn.Linear(feature_dim, 5),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 2, 1)
+        ).to(device)
+        plan_embedding_nn = nn.Sequential(
+            BinaryTreeConv(10, 10),
+            TreeLayerNorm(),
+            TreeActivation(nn.ReLU()),
+            BinaryTreeConv(10, 10),
+            TreeLayerNorm(),
+            TreeActivation(nn.ReLU()),
+            BinaryTreeConv(10, feature_dim),
+        ).to(device)
+        attn_pool = GlobalAttention(gate_nn=gate_nn, nn=None).to(device)
+
+        # Input size is double feature_dim because we concat [Root, Attention_Pool]
+        regressor = nn.Sequential(
+            nn.Linear(feature_dim * 2, 5),
+            nn.ReLU(),
+            nn.Linear(5, 1),
+        ).to(device)
+        return plan_embedding_nn, attn_pool, regressor
 
 class EpistemicNetwork(nn.Module):
     def __init__(self,
-                 learnable_mlp_config,
                  epi_index_dim, prior_config,
+                 cost_estimation_model: PlanCostEstimatorFull,
                  device=torch.device('cpu')):
+        super().__init__()
+        self.epi_index_dim = epi_index_dim
+        self.cost_estimation_model = cost_estimation_model
         # We use an ensemble of tiny gine_conv as priors
-        # TODO: Make combined network here in loop. Define the config etc
         model_factory_gine_conv = ModelFactory(prior_config)
-        ensemble_gnn = [model_factory_gine_conv.load_gine_conv() for i in range(epi_index_dim)]
-
-        model_factory_mlp = ModelFactory(learnable_mlp_config)
+        ensemble_gnn = [model_factory_gine_conv.load_gine_conv() for _ in range(epi_index_dim)]
+        ensemble_plan_cost = [PlanCostEstimatorTiny(device, 5) for _ in range(epi_index_dim)]
+        self.ensemble_combined_prior_models = [
+            QueryPlansPredictionModel(ensemble_gnn[i], ensemble_plan_cost[i], device) for i in range(epi_index_dim)
+        ]
 
         # The learnable and fixed MLPs should have same config all three parts should have same output dimension
-        self.learnable_epinet = model_factory_mlp.load_gine_conv()
-        self.prior_epinet = model_factory_mlp.load_gine_conv()
+        self.learnable_epinet = nn.Sequential(
+            nn.Linear(64+epi_index_dim, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1)
+        ).to(device)
+
+        self.prior_epinet = nn.Sequential(
+            nn.Linear(64+epi_index_dim, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1)
+        ).to(device)
 
         #TODO: Check if this works
         for param in self.prior_epinet.parameters():
             param.requires_grad = False
-        pass
+
+        for combined_prior in self.ensemble_combined_prior_models:
+            for param in combined_prior.parameters():
+                param.requires_grad = False
+
+    # This model should separate query embedding from plan enumeration.
+    # Predicting cost should take as input embedded query + join orders and output the number of required
+    # predictions of the epistemic network
+    def embed_query_batched(self, queries):
+        return self.cost_estimation_model.embed_query_batched(queries)
+
+    def embed_query_batched_prior(self, queries):
+        embedded_query_batches = []
+        for prior_model in self.ensemble_combined_prior_models:
+            embedded_query_batches.append(prior_model.embed_query_batched(queries))
+        return embedded_query_batches
 
     def forward(self):
         #TODO:
@@ -198,6 +245,30 @@ class EpistemicNetwork(nn.Module):
         # proposed.
         pass
 
+    def compute_mlp_prior(self, last_feature, epi_index):
+        #TODO: Concat this properly
+        pass
+
+
+    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, epi_index):
+        with torch.no_grad():
+            prepared_trees, prepared_indexes = build_trees_and_indexes(
+                [[plan[0] for plan in plans]], [embedded_query],
+                precomputed_indexes
+            )
+            prepared_trees.to(self.device)
+            [prepared_index.to(self.device) for prepared_index in prepared_indexes]
+            estimated_cost_priors = torch.zeros((epi_index, 1))
+            for i in range(self.epi_index_dim):
+                est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
+                    plans, embedded_query, precomputed_indexes
+                )
+                estimated_cost_priors[i] = est_cost
+            weighted_sum = torch.matmul(epi_index, estimated_cost_priors)
+        return weighted_sum
+
+    def sample_epistemic_indexes(self):
+        return torch.normal(0, 1, size=(1, self.epi_index_dim))
 
 
 def min_max_scale_plans(query_plans):
@@ -381,9 +452,7 @@ def train_simulated(queries_train, query_plans_train,
     lr = 1e-4
     n_epochs = 10
 
-    # TODO: Check if this works (gets all parameters)
     params = chain(combined_model.parameters())
-    
     optimizer = torch.optim.AdamW(
         params,
         lr=lr,
@@ -411,7 +480,6 @@ def train_simulated(queries_train, query_plans_train,
             total_loss_tensor.backward()
 
             optimizer.step()
-            break
 
         query_to_val = validate(queries_val, query_plans_val,
                                  precomputed_indexes,
@@ -453,10 +521,10 @@ def main_supervised_value_estimation(endpoint_location,
                                      save_loc_simulated_dataset, save_loc_simulated_val,
                                      occurrences_location, tp_cardinality_location,
                                      model_config_oracle, model_directory_oracle,
-                                     model_config_embedder
+                                     model_config_embedder,
+                                     model_config_epistemic_prior,
                                      ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
     train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
                                               rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
@@ -464,9 +532,14 @@ def main_supervised_value_estimation(endpoint_location,
         model_config=model_config_oracle,model_directory=model_directory_oracle
     )
 
-    cost_net_attention_pooling = PyGCardinalityHead(256)
+    cost_net_attention_pooling = PlanCostEstimatorFull(device, 100)
     embedding_model = prepare_cardinality_estimator(model_config=model_config_embedder)
-    combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, 200, device)
+    combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
+
+    EpistemicNetwork(8, )
+    epi_index_dim, prior_config,
+    cost_estimation_model: PlanCostEstimatorFull,
+    device = torch.device('cpu')):
 
     main_simulated_training(train_dataset, val_dataset,
                             oracle_model, embedding_model, cost_net_attention_pooling,
@@ -483,8 +556,11 @@ if __name__ == "__main__":
     rdf2vec_vector_location = "data/rdf2vec_embeddings/yago_gnce/model.json"
     occurrences_location = "data/term_occurrences/yago_gnce/occurrences.json"
     tp_cardinality_location = "data/term_occurrences/yago_gnce/tp_cardinalities.json"
+
     model_config_oracle = "experiments/model_configs/policy_networks/t_cv_repr_huge.yaml"
     model_config_emb = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
+    model_config_prior = "experiments/model_configs/prior_networks/prior_t_cv_tiny.yaml"
+
     experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce_large_pretrain-05-10-2025-18-13-40"
     save_loc_simulated = "data/simulated_query_plan_data/star_yago_gnce/data"
     save_loc_simulated_val = "data/simulated_query_plan_data/star_yago_gnce/val_data"
