@@ -18,7 +18,7 @@ from src.utils.training_utils.training_tracking import ExperimentWriter
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Set experiment config path
 os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR,
-                                               "experiments", "experiment_configs", "combination_experiments")
+                                               "experiments", "experiment_configs", "pretraining_experiments")
 
 
 def get_config_name():
@@ -38,31 +38,6 @@ def get_config_name():
 # Get config_name before Hydra runs
 config_name = get_config_name()
 
-
-# TODO:
-# Ensure cross products get avoided; implement connected sub graphs and mask any action that is not connected to
-# current graph patterns joined together
-# Implement own validation runner:
-# - Run model PPO using default validation code on all validation queries at certain checkpoints.
-# - Run QR-DQN with custom variance penalized cost function
-# Implement full validation runner
-# - First enumerate join options (use existing)
-# - Write them to file divided by query
-# - Let G-Care do cardinality estimation over them
-# - Use those to make join plans and get latency / cost
-# Use hand-crafted / wikidata user queries
-# - Apply same validation
-# Metrics to use:
-# - Query cost (sum of intermediate results)
-# - Query latency (averaged over 10? runs)
-# Figures:
-# - Box plot of latency / cost per shape and combined shapes
-# - Training curves with 50 random seeds for WatDiv path / star and Wikidata path / star (or whatever is typical dataset)
-# Table showing ablation study
-# - No pretraining
-# - No fine-tuning
-# - Incase QR-DQN, no penalized variance
-
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
             config_name=config_name)
 def main(cfg: DictConfig):
@@ -70,7 +45,10 @@ def main(cfg: DictConfig):
     train_set, val_set = None, None
     writer = None
     rl_configs = OmegaConf.select(cfg, "rl_training", default=None)
-    skip_pretraining = OmegaConf.select(list(rl_configs.values())[0], "model_directory", default=None)
+
+    skip_pretraining = False
+    if rl_configs:
+        skip_pretraining = OmegaConf.select(list(rl_configs.values())[0], "model_directory", default=None)
 
     if "pretraining" in cfg and not skip_pretraining:
         c1 = cfg.pretraining

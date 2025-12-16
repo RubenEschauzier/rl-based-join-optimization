@@ -51,7 +51,7 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
 
 def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
                             seed, test_queries=None, test_cardinalities=None):
-    print("Training on {} queries".format(len(train_dataset)))
+    print("Training on {} queries, device: {}".format(len(train_dataset), device))
 
     model_factory_gine_conv= ModelFactory(model_config_location)
     gine_conv_model = model_factory_gine_conv.load_gine_conv()

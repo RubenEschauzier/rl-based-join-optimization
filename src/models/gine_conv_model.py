@@ -22,6 +22,7 @@ class GINEConvModel(torch.nn.Module):
         self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus', 'LayerNorm']
         self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
         self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'DirectionalGINEConv']
+        self.supported_normalization = ['PairNorm', 'GraphNorm']
 
     def init_model(self, model_architecture_config):
         """
@@ -113,7 +114,10 @@ class GINEConvModel(torch.nn.Module):
             mlp_class = getattr(torch.nn, layer_type)
             mlp_params = self.__filter_parameters(layer_config, ['type', 'id'])
             embedding_layers[layer_id] = mlp_class(**mlp_params)
-
+        elif layer_type in self.supported_normalization:
+            norm_class = getattr(torch_geometric.nn, layer_type)
+            norm_params = self.__filter_parameters(layer_config, ['type', 'id'])
+            embedding_layers[layer_id] = (norm_class(**norm_params), 'x, batch -> x')
         else:
             raise NotImplementedError(f'Unsupported layer type: {layer_type}')
 

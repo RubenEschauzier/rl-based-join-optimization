@@ -15,6 +15,17 @@ def precompute_left_deep_tree_conv_index(max_leaves: int, device):
         leaves_to_idx[i] = torch.tensor(tree_conv_idx.flatten().reshape(-1, 1), device=device)
     return leaves_to_idx
 
+def precompute_left_deep_tree_node_mask(max_leaves: int, device):
+    n_leaves_to_mask = {}
+    for i in range(2, max_leaves):
+        # i - 1 intermediate results + zero_vector in plan
+        n_nodes = 2*i
+        n_leaves_to_mask[i] = torch.zeros(n_nodes, device=device, dtype=torch.bool)
+        # Mask out the zero vector
+        n_leaves_to_mask[i][0] = True
+    return n_leaves_to_mask
+
+
 
 def left_deep_tree_conv_index(n_leaves: int):
     n_internal = n_leaves - 1
@@ -100,7 +111,7 @@ def build_trees_and_indexes(join_orders_batched, features_batch, precomputed_ind
     n_nodes_batched = [feature.shape[0] for feature in features_batch]
 
     # Pre-compute and expand join orders
-    expanded_join_orders, total_join_orders, max_nodes_in_batch, max_triplets_in_batch\
+    expanded_join_orders, total_join_orders, max_nodes_in_batch, _\
         = expand_join_orders(join_orders_batched, n_nodes_batched, device)
     trees = build_trees(expanded_join_orders, total_join_orders, features_batch, max_nodes_in_batch)
     indexes = get_tree_conv_indexes(join_orders_batched, precomputed_indexes, device)
