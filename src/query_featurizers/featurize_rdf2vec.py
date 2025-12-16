@@ -79,6 +79,6 @@ class FeaturizeQueriesRdf2Vec:
 
     @staticmethod
     def load_vectors(location):
-        with open(location, 'r') as f:
+        with open(location, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data

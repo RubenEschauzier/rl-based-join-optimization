@@ -21,7 +21,6 @@ import math
 import os
 import sys
 from abc import abstractmethod
-import tracemalloc
 
 import time
 # IDEAS:
@@ -29,13 +28,21 @@ import time
 # MoE in graph model
 # Uncertainty aware MoE
 from functools import partial
-
 import psutil
 from torch_geometric.nn import GlobalAttention, AttentionalAggregation
 from tqdm import tqdm
 from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
 from itertools import chain
+# Get the path of the parent directory (the root of the project)
+# This finds the directory of the current script (__file__), goes up one level ('..'),
+# and then converts it to an absolute path for reliability.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Insert the project root path at the beginning of the search path (sys.path)
+# This forces Python to look in the parent directory first.
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from main import find_best_epoch_directory
 from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
@@ -469,14 +476,13 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
             for line in tqdm(f):
                 data.append(json.loads(line))
                 k += 1
-                # if k % 5000 == 0:
-                #     gc.collect()
-                #     torch.cuda.empty_cache()  # If using GPU
-                #
-                #     print_memory_usage()
-                #     comprehensive_memory_analysis()
-                # #     size_data = deep_size(data) / 1024**2
-                # #     print(f"Loaded data size: {size_data:.2f} MB")
+                if k % 5000 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()  # If using GPU
+                
+                    print_memory_usage()
+                #     size_data = deep_size(data) / 1024**2
+                #     print(f"Loaded data size: {size_data:.2f} MB")
                 if k == 20000:
                     break
         return data
@@ -678,19 +684,6 @@ def main_supervised_value_estimation(endpoint_location,
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
 
     epinet_cost_estimation = EpistemicNetwork(8, model_config_epistemic_prior, combined_model, device=device)
-
-    def tensor_report(min_mb=10, device='cpu'):
-        for obj in gc.get_objects():
-            try:
-                if torch.is_tensor(obj) and obj.device.type == device:
-                    mb = obj.numel() * obj.element_size() / 1024 ** 2
-                    if mb >= min_mb:
-                        print(f"{type(obj)} {tuple(obj.shape)} {mb:.1f} MB on {device}")
-            except Exception:
-                pass
-
-    tensor_report(min_mb=1,device='cpu')
-    tensor_report(min_mb=1, device='cuda')
 
     main_simulated_training(train_dataset, val_dataset,
                             oracle_model,
@@ -909,7 +902,6 @@ def full_memory_debug():
 
 
 if __name__ == "__main__":
-    tracemalloc.start()
     endpoint_location = "http://localhost:9999/blazegraph/namespace/yago/sparql"
     queries_location_train = "data/generated_queries/star_yago_gnce/dataset_train"
     queries_location_val = "data/generated_queries/star_yago_gnce/dataset_val"

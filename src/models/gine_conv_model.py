@@ -23,6 +23,7 @@ class GINEConvModel(torch.nn.Module):
         self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
         self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'DirectionalGINEConv']
         self.supported_normalization = ['PairNorm', 'GraphNorm']
+        self.verbose = 0
 
     def init_model(self, model_architecture_config):
         """
@@ -59,12 +60,13 @@ class GINEConvModel(torch.nn.Module):
             self.heads.append(torch_geometric.nn.Sequential(input_args, head_layers_geometric))
             self.head_types.append(estimation_type)
 
-        print("Embedding layers:")
-        print(self.embedding_model)
-        print("Estimation heads:")
-        print(self.heads)
-        print("Head types:")
-        print(self.head_types)
+        if self.verbose > 0:
+            print("Embedding layers:")
+            print(self.embedding_model)
+            print("Estimation heads:")
+            print(self.heads)
+            print("Head types:")
+            print(self.head_types)
 
     def init_layers(self, config):
         embedding_layers = OrderedDict()
