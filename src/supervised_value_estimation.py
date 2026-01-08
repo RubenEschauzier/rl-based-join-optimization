@@ -15,25 +15,20 @@
 #   - Track execution times found for normalization between 0 and 1
 #   - Augment data for sub plans, but ensure the best plan is used for reward of that sub plan
 #   - Do adaptive timeouts by tracking execution times per query
-import gc
 import json
 import math
 import os
 import sys
-from abc import abstractmethod
+import numpy as np
+from abc import abstractmethod, ABC
 
 import time
-# IDEAS:
-# Two losses and estimation heads: Latency and Cost
-# MoE in graph model
-# Uncertainty aware MoE
 from functools import partial
-import psutil
 from torch_geometric.nn import GlobalAttention, AttentionalAggregation
 from tqdm import tqdm
 from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
-from itertools import chain
+from scipy.stats import pearsonr
 # Get the path of the parent directory (the root of the project)
 # This finds the directory of the current script (__file__), goes up one level ('..'),
 # and then converts it to an absolute path for reliability.
@@ -47,15 +42,13 @@ if project_root not in sys.path:
 from main import find_best_epoch_directory
 from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.models.model_instantiator import ModelFactory
-from src.models.model_layers.tcnn import build_t_cnn_tree_from_order, transformer, left_child, right_child, \
-    build_t_cnn_trees, BinaryTreeConv, TreeLayerNorm, TreeActivation, DynamicPooling
+from src.models.model_layers.tcnn import BinaryTreeConv, TreeLayerNorm, TreeActivation
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
-from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining, prepare_queries
+from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.utils.tree_conv_utils import build_trees_and_indexes, \
-    precompute_left_deep_tree_conv_index, precompute_left_deep_trees_placeholders, fill_placeholder_trees, \
-    precompute_left_deep_tree_node_mask
+    precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
 
 import torch
 import torch.nn as nn
@@ -107,7 +100,7 @@ class QueryPlansPredictionModel(nn.Module):
         return mask
 
 
-class BasePlanCostEstimator(nn.Module):
+class BasePlanCostEstimator(nn.Module, ABC):
     def __init__(self, device, feature_dim=100):
         super().__init__()
         self.device = device
@@ -115,8 +108,6 @@ class BasePlanCostEstimator(nn.Module):
 
     def forward(self, trees, indexes, mask_padding):
         # Encode the query plan
-        print(trees)
-        test_trees = trees.detach().cpu().numpy()
         emb, idx = self.plan_embedding_nn((trees, indexes))
 
         # Consider hierarchical application of our trees. What if we take the output representation of the
@@ -124,11 +115,9 @@ class BasePlanCostEstimator(nn.Module):
 
         # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
         emb_transposed = emb.transpose(1, 2)
-        test_emb_transposed = emb_transposed.detach().cpu().numpy()
 
         # Stack the node embeddings to a tensor (n_plans * n_nodes, dim) to use with batch variable
         emb_stacked = emb_transposed.reshape((-1, emb_transposed.shape[-1]))
-        test_stacked = emb_stacked.detach().cpu().numpy()
 
         # Create batch vector to represent the fact that we merged plans
         n_plans = emb_transposed.shape[0]
@@ -142,39 +131,16 @@ class BasePlanCostEstimator(nn.Module):
         emb_masked_padding = emb_stacked[valid]
         batch_masked_padding = batch[valid]
 
-        test_mask = mask_padding.detach().cpu().numpy()
-        test_emb_non_padding = emb_masked_padding.detach().cpu().numpy()
-        test_batch_non_padding = batch_masked_padding.detach().cpu().numpy()
-
         pool_vectors = self.attn_pool(emb_masked_padding, batch_masked_padding)
-        test_pool_vecs = pool_vectors.detach().cpu().numpy()
 
         # Get root representation.
         # First element is the zero vector (that is padded out in attention), so we take index 1
         root_vectors = emb_transposed[:, 1, :]
-        test_root_vecs = root_vectors.detach().cpu().numpy()
 
         #TODO: Consider if we should also add a pooled version of the graph. Reasoning: Separate the graph structure and
         # the plan structure. Easy to figure out, just make a small experiment
         combined = torch.cat([root_vectors, pool_vectors], dim=1)
-        test = self.regressor(combined)
-        test_numpy = test.detach().cpu().numpy()
-        five = 5
         return self.regressor(combined), combined
-
-        # pool_vectors = self.attn_pool(emb_stacked, batch)
-        # test_pool_vecs = pool_vectors.detach().cpu().numpy()
-        # #TODO: It seems that the pool vectors entry is equivalent to the root vector, thus our concat is just a
-        # # repetition
-        #
-        # # Get root representation
-        # root_vectors = emb_transposed[:, 1, :]
-        # test_root_vecs = root_vectors.detach().cpu().numpy()
-        # combined = torch.cat([root_vectors, pool_vectors], dim=1)
-        # test = self.regressor(combined)
-        # test_numpy = test.detach().cpu().numpy()
-        # five = 5
-        # return self.regressor(combined), combined
 
     @abstractmethod
     def init_model(self, feature_dim, device):
@@ -255,13 +221,13 @@ class EpistemicNetwork(nn.Module):
 
         # The learnable and fixed MLPs should have same config all three parts should have same output dimension
         self.learnable_epinet = nn.Sequential(
-            nn.Linear(64+epi_index_dim, 10),
+            nn.Linear(200+epi_index_dim, 10),
             nn.ReLU(),
             nn.Linear(10, 1)
         ).to(device)
 
         self.prior_epinet = nn.Sequential(
-            nn.Linear(64+epi_index_dim, 10),
+            nn.Linear(200+epi_index_dim, 10),
             nn.ReLU(),
             nn.Linear(10, 1)
         ).to(device)
@@ -274,9 +240,6 @@ class EpistemicNetwork(nn.Module):
             for param in combined_prior.parameters():
                 param.requires_grad = False
 
-    # This model should separate query embedding from plan enumeration.
-    # Predicting cost should take as input embedded query + join orders and output the number of required
-    # predictions of the epistemic network
     def embed_query_batched(self, queries):
         return self.cost_estimation_model.embed_query_batched(queries)
 
@@ -290,30 +253,29 @@ class EpistemicNetwork(nn.Module):
         return embedded_query_batches
 
     def forward(self):
+        #TODO Move logic into forward pass?
+        # Maybe hold off until we see what non-simulated requirements will be
         #TODO:
-        # This should be passed a batch of queries, then it should first make a prediction with the full model:
-        # gnn + tcnn
-        # Then it should sample a gaussian z for each predicted cost, with certain dimension
-        # Then compute for the epinet part:
-        # The MLP representation given z and last layer feature of the full model (combined variable).
-        # This last layer feature should have its gradient removed (sg operator)
-        # Then for prior:
-        # Again the MLP but completely no gradients
-        # Then also the full model but with no gradients, its fixed randomness
-        # There should be two modes: precomputed trees with indexes and trees and on the fly.
         # We can do the calc of indexes again with cache when we train on actual query execution though if it turns out
         # very slow
 
         #TODO: For beam search we should investigate thompson sampling using epinet and just whatever that other paper
         # proposed.
+
+        #TODO: Ideas
+        # Two losses and estimation heads: Latency and Cost?
+        # MoE in graph model
+        # Uncertainty aware MoE with router based on epinet uncertainty
+
         pass
 
     def compute_mlp_prior(self, last_feature, epi_index):
-        #TODO: Concat this properly
-        pass
+        concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
+        return self.prior_epinet(concat_input)
 
     def compute_learnable_mlp(self, last_feature, epi_index):
-        pass
+        concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
+        return self.learnable_epinet(concat_input)
 
 
     def compute_ensemble_prior(self, plans, embedded_query,
@@ -321,7 +283,7 @@ class EpistemicNetwork(nn.Module):
                                epi_index, query_idx):
         with torch.no_grad():
             # (epi_index, n_plans)
-            estimated_cost_priors = torch.zeros((self.epi_index_dim, len(plans)))
+            estimated_cost_priors = torch.zeros((self.epi_index_dim, len(plans)), device=self.device)
             for i in range(self.epi_index_dim):
                 prepared_trees, prepared_indexes = build_trees_and_indexes(
                     [[plan[0] for plan in plans]], [embedded_query[i][query_idx]],
@@ -330,11 +292,6 @@ class EpistemicNetwork(nn.Module):
                 prepared_trees.to(self.device)
                 [prepared_index.to(self.device) for prepared_index in prepared_indexes]
 
-                # TODO: Check how we get the predictions here, as they seem too similar
-                # We should check the input to the estimate cost and see how values flow there.
-                # The weird thing is different plans get the same prediction, this might also indicate
-                # insufficient expressivity of the model
-
                 # Est_cost: (n_plans, 1)
                 est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
                     plans, embedded_query[i][query_idx], precomputed_indexes, precomputed_masks
@@ -342,12 +299,11 @@ class EpistemicNetwork(nn.Module):
                 # Est_cost: (1, n_plans)
                 est_cost_t = est_cost.transpose(0,1)
                 estimated_cost_priors[i] = est_cost_t
-            #TODO: Make this a weighted sum for each plan in plans between estimated cost and epi_index value currently not yet correct!
             weighted_sum = torch.matmul(epi_index, estimated_cost_priors)
         return weighted_sum
 
     def sample_epistemic_indexes(self):
-        return torch.normal(0, 1, size=(1, self.epi_index_dim))
+        return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
 
 
 def min_max_scale_plans(query_plans):
@@ -437,54 +393,14 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
     # Training is done over batches of Queries, to amortize the query embedding step. For each sub plan we create
     # tree-based embedding
     # Use different model for estimating cost and estimating plan (plan estimation smaller, big model can act as oracle)
-    def deep_size(obj, seen=None):
-        if seen is None:
-            seen = set()
-        obj_id = id(obj)
-        if obj_id in seen:
-            return 0
-        seen.add(obj_id)
-
-        size = sys.getsizeof(obj)
-
-        if isinstance(obj, dict):
-            size += sum(deep_size(k, seen) + deep_size(v, seen) for k, v in obj.items())
-        elif isinstance(obj, (list, tuple, set)):
-            size += sum(deep_size(i, seen) for i in obj)
-
-        return size
-
-    def print_memory_usage():
-        process = psutil.Process(os.getpid())
-        print(f"Memory: {process.memory_info().rss / 1024 ** 3:.2f} GB")
-
-    from pympler import muppy, summary, tracker
-
-    # Option A: Summary of all objects
-    def show_memory_summary():
-        all_objects = muppy.get_objects()
-        sum1 = summary.summarize(all_objects)
-        summary.print_(sum1)
 
     data = []
-    # TODO Figure out how to run this through WSL: https://pypi.org/project/memray/ 
     if os.path.exists(output_loc_raw + '.jsonl'):
-        print("Using pre-made plans")
         k = 0
-        print_memory_usage()
         with open(output_loc_raw + '.jsonl', 'r', encoding="utf-8") as f:
             for line in tqdm(f):
                 data.append(json.loads(line))
                 k += 1
-                if k % 5000 == 0:
-                    gc.collect()
-                    torch.cuda.empty_cache()  # If using GPU
-                
-                    print_memory_usage()
-                #     size_data = deep_size(data) / 1024**2
-                #     print(f"Loaded data size: {size_data:.2f} MB")
-                if k == 20000:
-                    break
         return data
 
     loader = DataLoader(dataset_to_prepare, batch_size=1, shuffle=False)
@@ -528,25 +444,43 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
     return data
 
 def validate(queries_val, query_plans_val,
-             precomputed_indexes, min_cost, max_cost,
+             precomputed_indexes, precomputed_masks,
+             min_cost, max_cost,
              train_loss,
-             combined_model,
-             device):
+             epinet_cost_estimation,
+             device,
+             validate_epi_network, n_val_epi_indexes):
     query_to_val = {}
     mape = MeanAbsolutePercentageError()
     mape.to(device)
     val_loader = DataLoader(queries_val, batch_size=1, shuffle=False)
     for queries in tqdm(val_loader, total=len(val_loader)):
         with torch.no_grad():
-            embedded= combined_model.embed_query_batched(queries)
+            embedded = epinet_cost_estimation.embed_query_batched(queries)
+
+            embedded_prior = None
+            if validate_epi_network:
+                embedded_prior = epinet_cost_estimation.embed_query_batched_prior(queries)
 
             plans = query_plans_val[queries.query[0]]
+            estimated_cost, last_feature = epinet_cost_estimation.estimate_cost(plans, embedded[0], precomputed_indexes)
+
+            if validate_epi_network:
+                loss_epinet, repeated_target, epinet_cost_estimates = calculate_loss_epinet(
+                    epinet_cost_estimation=epinet_cost_estimation,
+                    loss=train_loss,
+                    estimated_cost=estimated_cost, last_feature=last_feature,
+                    embedded_prior=embedded_prior,
+                    plans=plans, precomputed_indexes=precomputed_indexes, precomputed_masks=precomputed_masks, i=0,
+                    n_epi_indexes=n_val_epi_indexes, device=device
+                )
+                compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_val_epi_indexes,
+                                                  min_cost, max_cost)
+            estimated_cost = estimated_cost.squeeze()
+
+            #TODO Where is target being scaled? it should probably also be scaled (CHECK IT)
             target = torch.tensor([plan[1] for plan in plans], device=device)
-
-            output, _ = combined_model.estimate_cost(plans, embedded[0], precomputed_indexes)
-            output = output.squeeze()
-
-            original_cost = output * (max_cost - min_cost) + min_cost
+            original_cost = estimated_cost * (max_cost - min_cost) + min_cost
 
             mape_val = mape(original_cost, target)
             query_loss = train_loss(original_cost, target)
@@ -554,12 +488,65 @@ def validate(queries_val, query_plans_val,
             query_to_val[queries.query[0]] = {"loss": query_loss.cpu().item(), "mape": mape_val.cpu().item()}
     return query_to_val
 
+def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_epi_indexes, min_cost, max_cost):
+    #TODO Investigate this code
+    # 1. Move to CPU and Numpy
+    # Reshape to (-1, 1) because scaler expects 2D array [samples, features]
+    pred_flat = epinet_cost_estimates.detach().cpu().numpy().reshape(-1, 1)
+    targets_flat = repeated_target.detach().cpu().numpy().reshape(-1, 1)
 
-def train_simulated(queries_train, query_plans_train,
-                    queries_val, query_plans_val,
-                    combined_model, epinet_cost_estimation: EpistemicNetwork,
-                    device, query_batch_size):
-    combined_model.to(device)
+    # 2. Unscale Individually (Robust Method)
+    # We unscale every single prediction point before averaging
+    cost_range = max_cost - min_cost
+
+    pred_unscaled = pred_flat * cost_range + min_cost
+    targets_unscaled = targets_flat * cost_range + min_cost
+
+    # 3. Reshape into Matrix form: (n_samples, n_plans)
+    # The data structure is [Block_Z1, Block_Z2, ... Block_Zn]
+    n_total = pred_unscaled.shape[0]
+    n_plans = n_total // n_epi_indexes
+
+    # Shape: (n_epi_indexes, n_plans)
+    # Column j contains all 'n_epi_indexes' predictions for Plan j
+    pred_matrix = pred_unscaled.reshape(n_epi_indexes, n_plans)
+
+    # We only need one copy of the unscaled targets (since they are identical chunks)
+    # Take the first 'n_plans' elements to get the ground truth for each plan
+    y_true = targets_unscaled[:n_plans].flatten()
+
+    # 4. Aggregate Statistics
+    y_pred_mean = pred_matrix.mean(axis=0)
+    y_pred_std = pred_matrix.std(axis=0)
+
+
+    mse = np.mean((y_pred_mean - y_true) ** 2)
+
+    abs_error = np.abs(y_pred_mean - y_true)
+    uncertainty_corr, _ = pearsonr(abs_error, y_pred_std)
+
+    # C. Calibration: 95% Interval Coverage
+    # Does the truth fall within Mean ± 1.96 * Std?
+    lower_bound = y_pred_mean - 1.96 * y_pred_std
+    upper_bound = y_pred_mean + 1.96 * y_pred_std
+
+    is_in_interval = (y_true >= lower_bound) & (y_true <= upper_bound)
+    coverage_95 = np.mean(is_in_interval)
+
+    return {
+        "mse": mse,
+        "uncertainty_corr": uncertainty_corr,
+        "coverage_95": coverage_95,
+        "avg_std": np.mean(y_pred_std)
+    }
+
+def train_simulated_cost_model(queries_train, query_plans_train,
+                                queries_val, query_plans_val,
+                                epinet_cost_estimation: EpistemicNetwork,
+                                device,
+                                query_batch_size,
+                                n_epi_indexes, train_epi_network: bool):
+    epinet_cost_estimation.to(device)
 
     precomputed_indexes = precompute_left_deep_tree_conv_index(20, device)
     precomputed_masks = precompute_left_deep_tree_node_mask(20, device)
@@ -570,21 +557,34 @@ def train_simulated(queries_train, query_plans_train,
 
     query_plans_val = flatten_plans(query_plans_val)
 
-    # --- 1. Define Hyperparameters ---
     lr = 1e-4
     n_epochs = 10
 
-    params = list(combined_model.parameters())
+    # Freeze base cost model when training the epistemic network
+    if train_epi_network:
+        for param in epinet_cost_estimation.cost_estimation_model.parameters():
+            param.requires_grad = False
+        epinet_cost_estimation.cost_estimation_model.eval()
+
+    params = list(epinet_cost_estimation.parameters())
+    params_cost_estimate = list(epinet_cost_estimation.cost_estimation_model.parameters())
     optimizer = torch.optim.AdamW(
         params,
         lr=lr,
-        weight_decay=0.01  # Standard L2 regularization for AdamW
+        weight_decay=0.01
     )
-    total_params = 0
-    for param in params:
-        total_params += param.numel()
 
-    print(f"Combined model has {total_params} parameters")
+    total_params_cost_estimation = 0
+    for param in params_cost_estimate:
+        total_params_cost_estimation += param.numel()
+    print(f"Cost estimation model has {total_params_cost_estimation} parameters")
+
+    if train_epi_network:
+        total_params = 0
+        for param in epinet_cost_estimation.parameters():
+            total_params += param.numel()
+        print(f"Cost estimation model has {total_params} parameters")
+        print(f"Epinet model has {total_params - total_params_cost_estimation} parameters")
 
     loss = torch.nn.MSELoss(reduction='mean')
 
@@ -592,59 +592,117 @@ def train_simulated(queries_train, query_plans_train,
         query_loss_epoch = []
         for k, queries in tqdm(enumerate(loader), total=len(loader)):
             optimizer.zero_grad()
-            embedded = combined_model.embed_query_batched(queries)
 
-            embedded_epinet = epinet_cost_estimation.embed_query_batched(queries)
-            embedded_prior = epinet_cost_estimation.embed_query_batched_prior(queries)
+            embedded = epinet_cost_estimation.embed_query_batched(queries)
+
+            embedded_prior = None
+            if train_epi_network:
+                embedded_prior = epinet_cost_estimation.embed_query_batched_prior(queries)
 
             total_loss_tensor = torch.tensor(0.0, device=device)
             for i in range(len(queries.query)):
-                test_embedded_epinet = embedded_epinet[i].cpu().detach().numpy()
-                test_embedded_prior = embedded_prior[0][i].cpu().detach().numpy()
                 plans = query_plans_train[queries.query[i]]
-
                 estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
-                    plans, embedded_epinet[i], precomputed_indexes, precomputed_masks
+                    plans, embedded[i], precomputed_indexes, precomputed_masks
                 )
-                # Apply stop gradient operator to last feature to serve as input to epinet
-                last_feature = last_feature.detach()
 
-                #TODO Here we just do one epistemic index for all plans, however that might not be the way to go?
-                #TODO: Need to do this with multiple epinet indexes sampled so in a loop
-                epinet_index = epinet_cost_estimation.sample_epistemic_indexes()
-                epinet_cost_estimation.compute_ensemble_prior(
-                    plans, embedded_prior, precomputed_indexes, precomputed_masks, epinet_index, i
-                )
-                epinet_cost_estimation.compute_mlp_prior(last_feature, epinet_index)
+                if train_epi_network:
+                    loss_epinet, _, _ = calculate_loss_epinet(
+                        epinet_cost_estimation=epinet_cost_estimation,
+                        loss = loss,
+                        estimated_cost=estimated_cost, last_feature=last_feature,
+                        embedded_prior=embedded_prior,
+                        plans=plans, precomputed_indexes=precomputed_indexes, precomputed_masks=precomputed_masks, i=i,
+                        n_epi_indexes=n_epi_indexes, device=device
+                    )
+                    total_loss_tensor += loss_epinet
+                else:
+                    target = torch.tensor([plan[1] for plan in plans], device=device).squeeze()
+                    total_loss_tensor += loss(estimated_cost.squeeze(), target)
 
-                target = torch.tensor([plan[1] for plan in plans], device=device)
-
-                output, _ = combined_model.estimate_cost(plans, embedded[i], precomputed_indexes)
-
-                query_loss = loss(output.squeeze(), target)
-                query_loss_epoch.append(query_loss.detach().cpu().item())
-                total_loss_tensor += query_loss
+                # # Apply stop gradient operator to last feature to serve as input to epinet
+                # last_feature = last_feature.detach()
+                #
+                # n_plans = estimated_cost.shape[0]
+                # epinet_estimated_cost = torch.zeros((n_plans*n_epi_indexes, 1), device=device)
+                # for j in range(n_epi_indexes):
+                #     epinet_index = epinet_cost_estimation.sample_epistemic_indexes()
+                #     ensemble_prior = epinet_cost_estimation.compute_ensemble_prior(
+                #         plans, embedded_prior, precomputed_indexes, precomputed_masks, epinet_index, i
+                #     )
+                #     ensemble_prior = ensemble_prior.view(-1,1)
+                #     mlp_prior = epinet_cost_estimation.compute_mlp_prior(last_feature, epinet_index)
+                #     learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp(last_feature, epinet_index)
+                #     epinet_output = estimated_cost + (learnable_mlp_prior + mlp_prior + ensemble_prior)
+                #
+                #     start_idx = j * n_plans
+                #     end_idx = (j + 1) * n_plans
+                #
+                #     epinet_estimated_cost[start_idx:end_idx] = epinet_output.view(n_plans, 1)
+                #
+                # raw_targets = torch.tensor([plan[1] for plan in plans], device=device)
+                # target = raw_targets.repeat(n_epi_indexes)
+                #
+                # query_loss = loss(epinet_estimated_cost.squeeze(), target)
+                # query_loss_epoch.append(query_loss.detach().cpu().item())
+                # total_loss_tensor += query_loss
 
             total_loss_tensor.backward()
 
             optimizer.step()
+        if train_epi_network:
+            pass
+        else:
+            query_to_val_cost = validate_cost(queries_val, query_plans_val,
+                                     precomputed_indexes,
+                                     min_val, max_val,
+                                     loss,
+                                     epinet_cost_estimation,
+                                     device)
+            val_losses = [val_output["loss"] for val_output in query_to_val_cost.values()]
+            val_mape = [val_output["mape"] for val_output in query_to_val_cost.values()]
 
-        query_to_val = validate(queries_val, query_plans_val,
-                                 precomputed_indexes,
-                                 min_val, max_val,
-                                 loss,
-                                 combined_model,
-                                 device)
-        val_losses = [val_output["loss"] for val_output in query_to_val.values()]
-        val_mape = [val_output["mape"] for val_output in query_to_val.values()]
+            print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
+            print(f"Validation loss on cost: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
 
-        print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
-        print(f"Validation loss: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
+
+def calculate_loss_epinet(epinet_cost_estimation,
+                          loss,
+                          estimated_cost, last_feature, embedded_prior,
+                          plans, precomputed_indexes, precomputed_masks, i,
+                          n_epi_indexes, device):
+    # Apply stop gradient operator to last feature to serve as input to epinet
+    last_feature = last_feature.detach()
+    # Training the epinet is done on frozen model
+
+    n_plans = estimated_cost.shape[0]
+    epinet_estimated_cost = torch.zeros((n_plans*n_epi_indexes, 1), device=device)
+    # TODO GNN PRIOR ONLY DEPENDS ON X, NOT THE EPI INDEX, SO CAN BE LIFTED OUTSIDE THE LOOP
+    for j in range(n_epi_indexes):
+        epinet_index = epinet_cost_estimation.sample_epistemic_indexes()
+        ensemble_prior = epinet_cost_estimation.compute_ensemble_prior(
+            plans, embedded_prior, precomputed_indexes, precomputed_masks, epinet_index, i
+        )
+        ensemble_prior = ensemble_prior.view(-1,1)
+        mlp_prior = epinet_cost_estimation.compute_mlp_prior(last_feature, epinet_index)
+        learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp(last_feature, epinet_index)
+        epinet_output = estimated_cost + (learnable_mlp_prior + mlp_prior + ensemble_prior)
+
+        start_idx = j * n_plans
+        end_idx = (j + 1) * n_plans
+
+        epinet_estimated_cost[start_idx:end_idx] = epinet_output.view(n_plans, 1)
+
+    raw_targets = torch.tensor([plan[1] for plan in plans], device=device)
+    target = raw_targets.repeat(n_epi_indexes)
+
+    query_loss = loss(epinet_estimated_cost.squeeze(), target)
+    return query_loss, target, epinet_estimated_cost
 
 
 def main_simulated_training(train_dataset, val_dataset,
                             oracle_model,
-                            combined_model, epinet_cost_estimation,
+                            epinet_cost_estimation,
                             device, query_batch_size,
                             save_loc_simulated_dataset, save_loc_simulated_dataset_val):
     oracle_model = oracle_model.to(device)
@@ -653,12 +711,13 @@ def main_simulated_training(train_dataset, val_dataset,
 
     val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, save_loc_simulated_dataset_val)
     query_plan_dict_val = {k: v for d in val_data for k, v in d.items()}
-    train_simulated(queries_train=train_dataset, query_plans_train=query_plans_dict,
-                    queries_val=val_dataset, query_plans_val=query_plan_dict_val,
-                    combined_model=combined_model,
-                    epinet_cost_estimation=epinet_cost_estimation,
-                    device=device,
-                    query_batch_size=query_batch_size,
+    train_simulated_cost_model(queries_train=train_dataset, query_plans_train=query_plans_dict,
+                                queries_val=val_dataset, query_plans_val=query_plan_dict_val,
+                                epinet_cost_estimation=epinet_cost_estimation,
+                                device=device,
+                                query_batch_size=query_batch_size,
+                                n_epi_indexes=2,
+                                train_epi_network=False,
                     )
 
 def main_supervised_value_estimation(endpoint_location,
@@ -687,218 +746,10 @@ def main_supervised_value_estimation(endpoint_location,
 
     main_simulated_training(train_dataset, val_dataset,
                             oracle_model,
-                            combined_model,
                             epinet_cost_estimation,
                             device,
-                            2,
+                            8,
                             save_loc_simulated_dataset, save_loc_simulated_val,)
-
-
-import gc
-import sys
-import torch
-import psutil
-import os
-from pympler import asizeof
-
-
-def comprehensive_memory_analysis():
-    """Find ALL memory consumers including hidden ones"""
-
-    process = psutil.Process(os.getpid())
-    total_rss = process.memory_info().rss / 1024 ** 3
-    print(f"\n{'=' * 70}")
-    print(f"Total Process Memory (RSS): {total_rss:.2f} GB")
-    print(f"{'=' * 70}\n")
-
-    # 1. Check PyTorch GPU memory
-    print("1. GPU Memory (PyTorch):")
-    print("-" * 70)
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / 1024 ** 3
-            reserved = torch.cuda.memory_reserved(i) / 1024 ** 3
-            print(f"   GPU {i}: Allocated={allocated:.2f} GB, Reserved={reserved:.2f} GB")
-    else:
-        print("   No CUDA devices")
-    print()
-
-    # 2. Check PyTorch CPU tensors
-    print("2. PyTorch CPU Tensors:")
-    print("-" * 70)
-    cpu_tensors = []
-    total_tensor_memory = 0
-
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) and obj.device.type == 'cpu':
-                size_mb = obj.numel() * obj.element_size() / 1024 ** 2
-                total_tensor_memory += size_mb
-                if size_mb > 10:  # Only show tensors > 10MB
-                    cpu_tensors.append({
-                        'shape': tuple(obj.shape),
-                        'size_mb': size_mb,
-                        'dtype': obj.dtype
-                    })
-        except:
-            pass
-
-    cpu_tensors.sort(key=lambda x: x['size_mb'], reverse=True)
-    print(f"   Total CPU Tensor Memory: {total_tensor_memory / 1024:.2f} GB")
-    print(f"   Number of CPU tensors: {len(cpu_tensors)}")
-    print(f"\n   Top 10 largest CPU tensors:")
-    for i, t in enumerate(cpu_tensors[:10], 1):
-        print(f"   {i:2d}. Shape: {str(t['shape']):30s} "
-              f"Size: {t['size_mb']:>10.2f} MB  dtype: {t['dtype']}")
-    print()
-
-    # 3. Check for large lists/dicts with deep size
-    print("3. Large Container Objects (Deep Size):")
-    print("-" * 70)
-    large_objects = []
-
-    for obj in gc.get_objects():
-        try:
-            obj_type = type(obj).__name__
-            if obj_type in ['list', 'dict', 'tuple', 'set']:
-                # Only check objects with some minimum shallow size
-                shallow_size = sys.getsizeof(obj)
-                if shallow_size > 1024 * 100:  # > 100 KB shallow
-                    deep_size = asizeof.asizeof(obj) / 1024 ** 2
-                    if deep_size > 50:  # > 50 MB deep
-                        large_objects.append({
-                            'type': obj_type,
-                            'shallow_mb': shallow_size / 1024 ** 2,
-                            'deep_mb': deep_size,
-                            'len': len(obj) if hasattr(obj, '__len__') else 0,
-                            'id': id(obj)
-                        })
-        except:
-            pass
-
-    large_objects.sort(key=lambda x: x['deep_mb'], reverse=True)
-    total_container_memory = sum(obj['deep_mb'] for obj in large_objects) / 1024
-    print(f"   Total Large Container Memory: {total_container_memory:.2f} GB")
-    print(f"\n   Top 10 largest containers:")
-    for i, obj in enumerate(large_objects[:10], 1):
-        print(f"   {i:2d}. {obj['type']:10s} len={obj['len']:>8d}  "
-              f"Deep Size: {obj['deep_mb']:>10.2f} MB  "
-              f"(shallow: {obj['shallow_mb']:.2f} MB)")
-    print()
-
-    # 4. Check for C/C++ extensions memory (won't show in Python)
-    print("4. Potential Hidden Memory:")
-    print("-" * 70)
-    accounted_memory = (total_tensor_memory / 1024 + total_container_memory)
-    unaccounted = total_rss - accounted_memory
-    print(f"   Accounted for: {accounted_memory:.2f} GB")
-    print(f"   Unaccounted:   {unaccounted:.2f} GB")
-    print()
-
-    if unaccounted > 1.0:
-        print("   Likely causes of unaccounted memory:")
-        print("   - PyTorch C++ backend allocations")
-        print("   - NumPy arrays")
-        print("   - Memory fragmentation")
-        print("   - Shared libraries")
-        print("   - Python interpreter overhead")
-    print()
-
-    # 5. Memory fragmentation check
-    print("5. Memory Fragmentation:")
-    print("-" * 70)
-    mem_info = process.memory_info()
-    print(f"   RSS (actual memory):     {mem_info.rss / 1024 ** 3:.2f} GB")
-    print(f"   VMS (virtual memory):    {mem_info.vms / 1024 ** 3:.2f} GB")
-    if hasattr(mem_info, 'data'):
-        print(f"   Data segment:            {mem_info.data / 1024 ** 3:.2f} GB")
-    print()
-
-    return {
-        'total_rss_gb': total_rss,
-        'tensor_memory_gb': total_tensor_memory / 1024,
-        'container_memory_gb': total_container_memory,
-        'unaccounted_gb': unaccounted,
-        'large_objects': large_objects
-    }
-
-
-def find_specific_large_lists():
-    """Specifically hunt for your JSON-loaded data"""
-    print("\n6. Hunting for JSON/Data Lists:")
-    print("=" * 70)
-
-    for obj in gc.get_objects():
-        try:
-            if isinstance(obj, list):
-                if len(obj) > 1000:  # Large lists
-                    # Check if it contains dicts (likely JSON data)
-                    if obj and isinstance(obj[0], dict):
-                        size_mb = asizeof.asizeof(obj) / 1024 ** 2
-                        if size_mb > 100:
-                            print(f"Found large list: len={len(obj)}, "
-                                  f"size={size_mb:.2f} MB")
-                            # Try to identify it
-                            if obj[0]:
-                                print(f"  First element keys: {list(obj[0].keys())[:5]}")
-                            print(f"  Object ID: {id(obj)}")
-                            print()
-        except:
-            pass
-
-
-def check_numpy_arrays():
-    """Check for NumPy arrays which pympler might miss"""
-    try:
-        import numpy as np
-        print("\n7. NumPy Arrays:")
-        print("=" * 70)
-
-        arrays = []
-        for obj in gc.get_objects():
-            try:
-                if isinstance(obj, np.ndarray):
-                    size_mb = obj.nbytes / 1024 ** 2
-                    if size_mb > 10:
-                        arrays.append({
-                            'shape': obj.shape,
-                            'dtype': obj.dtype,
-                            'size_mb': size_mb
-                        })
-            except:
-                pass
-
-        arrays.sort(key=lambda x: x['size_mb'], reverse=True)
-        total_np = sum(a['size_mb'] for a in arrays) / 1024
-        print(f"Total NumPy memory: {total_np:.2f} GB")
-        print(f"Number of arrays: {len(arrays)}")
-        for i, arr in enumerate(arrays[:10], 1):
-            print(f"{i:2d}. Shape: {str(arr['shape']):30s} "
-                  f"Size: {arr['size_mb']:>10.2f} MB  dtype: {arr['dtype']}")
-        print()
-    except ImportError:
-        print("NumPy not available")
-
-
-def full_memory_debug():
-    """Run all checks"""
-    gc.collect()  # Clean up first
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    comprehensive_memory_analysis()
-    find_specific_large_lists()
-    check_numpy_arrays()
-
-    print("\n" + "=" * 70)
-    print("RECOMMENDATIONS:")
-    print("=" * 70)
-    print("If you still have unaccounted memory:")
-    print("1. Run: torch.cuda.empty_cache() to clear GPU caches")
-    print("2. Check if you're holding references to old DataLoader batches")
-    print("3. Look for cached computation graphs (gradients not released)")
-    print("4. Try: gc.collect() to force garbage collection")
-    print("5. Use tracemalloc to see where allocations happened")
-    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":

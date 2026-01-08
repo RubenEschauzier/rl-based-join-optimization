@@ -51,23 +51,3 @@ def get_query_triple_pattern_cardinalities(queries, env):
                 tp_cardinality = env.cardinality_triple_pattern(tp_str)
                 triple_pattern_cardinalities[tp_str] = tp_cardinality
     return triple_pattern_cardinalities
-
-
-if __name__ == '__main__':
-    dataset_name = "yago"
-    query_loc_path = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\path_{}".format(
-        dataset_name)
-    query_loc_star = r"C:\Users\ruben\projects\rl-based-join-optimization\data\generated_queries\star_{}".format(
-        dataset_name)
-    output_location = r"C:\Users\ruben\projects\rl-based-join-optimization\data\term_occurrences\{}".format(
-        dataset_name)
-    query_env = BlazeGraphQueryEnvironment("http://localhost:9999/blazegraph/namespace/{}/sparql".format(dataset_name))
-    loaded_queries = read_queries(query_loc_path)
-    loaded_queries_star = read_queries(query_loc_star)
-    loaded_queries.extend(loaded_queries_star)
-    loaded_occurrences = get_occurrences(loaded_queries, query_env)
-    loaded_tp_cardinalities = get_query_triple_pattern_cardinalities(loaded_queries, query_env)
-    with open(os.path.join(output_location, 'occurrences.json'), 'w') as f0:
-        json.dump(loaded_occurrences, f0)
-    with open(os.path.join(output_location, 'tp_cardinalities.json'), 'w') as f1:
-        json.dump(loaded_tp_cardinalities, f1)
