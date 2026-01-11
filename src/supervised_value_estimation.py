@@ -30,7 +30,7 @@ from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
 from scipy.stats import pearsonr
 # Get the path of the parent directory (the root of the project)
-# This finds the directory of the current script (__file__), goes up one level ('..'),
+# This finds the directory of the current script (__file__), goes up one level ('...'),
 # and then converts it to an absolute path for reliability.
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -47,8 +47,8 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 from src.query_environments.gym.query_gym_wrapper_dp_baseline import OrderDynamicProgramming
 from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
-from src.utils.tree_conv_utils import build_trees_and_indexes, \
-    precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
+from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask, \
+    get_shared_structure, apply_features_to_structure
 
 import torch
 import torch.nn as nn
@@ -59,6 +59,7 @@ class QueryPlansPredictionModel(nn.Module):
         self.query_emb_model = query_emb_model
         self.query_plan_model = query_plan_model
         self.device = device
+
 
     def embed_query_batched(self, queries):
         """
@@ -81,24 +82,139 @@ class QueryPlansPredictionModel(nn.Module):
         embedded = torch.vsplit(embedded_combined, selection_index)
         return embedded
 
-    def estimate_cost(self, plans, embedded_query, precomputed_indexes, precomputed_masks):
-        prepared_trees, prepared_indexes = build_trees_and_indexes(
-            [[plan[0] for plan in plans]], [embedded_query],
-            precomputed_indexes
-        )
-        prepared_trees.to(self.device)
-        [prepared_index.to(self.device) for prepared_index in prepared_indexes]
-        mask = self.get_node_masks(plans,  prepared_trees, embedded_query.shape[0], precomputed_masks)
+    def estimate_cost(self, prepared_trees, prepared_indexes, prepared_masks):
+        return self.query_plan_model.forward(prepared_trees, prepared_indexes, prepared_masks)
 
-        return self.query_plan_model.forward(prepared_trees, prepared_indexes[0], mask)
-
-    def get_node_masks(self, plans, trees, max_nodes, precomputed_masks):
-        mask = torch.ones((trees.shape[0], max_nodes*2), dtype=torch.bool)
-        for i, plan in enumerate(plans):
-            n_nodes_in_plan = len(plan[0])
-            mask[i][:n_nodes_in_plan*2] = precomputed_masks[n_nodes_in_plan]
-        return mask
-
+    # def build_t_cnn_input(self, join_orders_batched, features_batch,
+    #                      precomputed_indexes, precomputed_masks, cache):
+    #     """
+    #     Optimized version of build_trees_and_indexes with caching and vectorization.
+    #
+    #     Args:
+    #         join_orders_batched: List of lists of join orders (plans).
+    #         features_batch: List of feature tensors (queries).
+    #         precomputed_indexes: Dictionary of precomputed convolution indexes.
+    #         precomputed_masks: Dictionary of precomputed node masks based on the number of join entries
+    #         cache: A dictionary to store structural indices (pass self.cache here).
+    #     """
+    #     device = features_batch[0].device
+    #     dtype = features_batch[0].dtype
+    #
+    #     # Lists to hold the final results for the whole batch
+    #     batched_trees_results = []
+    #     batched_indexes_results = []
+    #     batched_mask_results = []
+    #
+    #     # Iterate over the batch (usually batch size is 1 for [plans] vs [query])
+    #     for batch_idx, (join_orders, features) in enumerate(zip(join_orders_batched, features_batch)):
+    #         n_nodes = features.shape[0]
+    #
+    #         # Create a unique key for the structure of this specific batch item
+    #         # We need (tuple of join orders, number of nodes)
+    #         # We convert lists to tuples to make them hashable
+    #         structure_key = (tuple(tuple(jo) for jo in join_orders), n_nodes)
+    #
+    #         if structure_key in cache:
+    #             # HIT: Retrieve pre-calculated structural tensors
+    #             gather_indices, conv_indexes, mask = cache[structure_key]
+    #         else:
+    #             # MISS: Compute them efficiently and cache them
+    #             gather_indices, conv_indexes, mask = self._compute_structural_indices(
+    #                 join_orders, n_nodes, precomputed_indexes, precomputed_masks)
+    #             cache[structure_key] = (gather_indices, conv_indexes, mask)
+    #
+    #         if gather_indices.device != device:
+    #             gather_indices = gather_indices.to(device)
+    #             conv_indexes = conv_indexes.to(device)
+    #
+    #         # Pre-compute zero vector and append to features
+    #         # Shape: (n_nodes + 1, channels)
+    #         channels = features.shape[1]
+    #         zero_vec = torch.zeros((1, channels), dtype=dtype, device=device)
+    #         features_padded = torch.cat([features, zero_vec], dim=0)
+    #
+    #         # Expand features: (1, n_nodes+1, channels) -> (num_plans, n_nodes+1, channels)
+    #         num_plans = gather_indices.shape[0]
+    #         features_expanded = features_padded.unsqueeze(0).expand(num_plans, -1, -1)
+    #
+    #         # Expand indices: (num_plans, tree_width) -> (num_plans, tree_width, channels)
+    #         idx_expanded = gather_indices.unsqueeze(-1).expand(-1, -1, channels)
+    #
+    #         # Gather: (num_plans, tree_width, channels)
+    #         flattened_trees = torch.gather(features_expanded, 1, idx_expanded)
+    #
+    #         # Transpose to match original output: (num_plans, channels, tree_width)
+    #         trees = flattened_trees.transpose(1, 2)
+    #
+    #         batched_trees_results.append(trees)
+    #         batched_indexes_results.append(conv_indexes)
+    #         batched_mask_results.append(mask)
+    #
+    #     final_trees = torch.cat(batched_trees_results, dim=0)
+    #     final_indexes = torch.cat(batched_indexes_results, dim=0)
+    #     final_masks = torch.cat(batched_mask_results, dim=0)
+    #     return final_trees, final_indexes, final_masks
+    #
+    # def _compute_structural_indices(self, join_orders, n_nodes, precomputed_indexes, precomputed_masks):
+    #     """
+    #     Internal helper to build indices using fast NumPy vectorization and avoiding GPU communication costs
+    #     """
+    #     lengths = [len(jo) for jo in join_orders]
+    #     max_len = max(lengths)
+    #     max_nodes_in_batch = 2 * max_len
+    #
+    #     # Create the base array filled with 'n_nodes' (which points to the zero-vector)
+    #     # Shape: (num_plans, max_nodes_in_batch)
+    #     # Using int64 for indices
+    #     batch_indices = np.full((len(join_orders), max_nodes_in_batch), n_nodes, dtype=np.int64)
+    #
+    #     # Fill in the actual join orders
+    #     # Original logic: padded_order = [n_nodes]*len + join_order + [n_nodes]*remainder
+    #     # This means the join_order data starts at index `len(jo)`
+    #     for i, jo in enumerate(join_orders):
+    #         l = len(jo)
+    #         # We copy the join order into the middle of the array
+    #         # The left side (0 to l) is already n_nodes
+    #         # The right side (2*l to end) is already n_nodes
+    #         batch_indices[i, l: l + l] = jo
+    #
+    #     gather_indices = torch.from_numpy(batch_indices).to(self.device)
+    #
+    #     # --- 2. Build Conv Indexes ---
+    #     # Logic from original: max size based on precomputed_indexes shapes
+    #     max_conv_size = max([precomputed_indexes[l].shape[0] for l in lengths])
+    #
+    #     conv_indexes = torch.zeros((len(join_orders), max_conv_size, 1), dtype=torch.long, device=self.device)
+    #
+    #     for i, l in enumerate(lengths):
+    #         t = precomputed_indexes[l]
+    #         actual_size = t.shape[0]
+    #         conv_indexes[i, :actual_size] = t
+    #
+    #     target_width = n_nodes * 2
+    #
+    #     # Create batch mask on CPU using Numpy
+    #     batch_mask_np = np.ones((len(join_orders), target_width), dtype=bool)
+    #
+    #     # We need the raw mask data available here.
+    #     # Assumption: precomputed_masks is a dict of Tensors.
+    #     # It is faster to have precomputed_masks_np (dict of numpy arrays) for this step.
+    #
+    #     for i, jo in enumerate(join_orders):
+    #         l = len(jo)
+    #         # Convert to numpy if it isn't already (ideally convert dict to numpy once in init)
+    #         mask_data = precomputed_masks[l]
+    #         batch_mask_np[i, :mask_data.shape[0]] = mask_data
+    #
+    #     masks = torch.from_numpy(batch_mask_np).to(self.device)
+    #     return gather_indices, conv_indexes, masks
+    #
+    # def get_node_masks(self, plans, trees, max_nodes, precomputed_masks):
+    #     mask = torch.ones((trees.shape[0], max_nodes*2), dtype=torch.bool, device=self.device)
+    #     for i, plan in enumerate(plans):
+    #         n_nodes_in_plan = len(plan[0])
+    #         mask[i][:n_nodes_in_plan*2] = torch.from_numpy(precomputed_masks[n_nodes_in_plan]).to(self.device)
+    #     return mask
 
 class BasePlanCostEstimator(nn.Module, ABC):
     def __init__(self, device, feature_dim=100):
@@ -111,7 +227,7 @@ class BasePlanCostEstimator(nn.Module, ABC):
         emb, idx = self.plan_embedding_nn((trees, indexes))
 
         # Consider hierarchical application of our trees. What if we take the output representation of the
-        # query as input to the next embedding / plan phase like in TinyHierarchicalReason modelling?
+        # query as input to the next embedding / plan phase like in TinyHierarchicalReason modeling?
 
         # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
         emb_transposed = emb.transpose(1, 2)
@@ -211,6 +327,8 @@ class EpistemicNetwork(nn.Module):
         self.epi_index_dim = epi_index_dim
         self.cost_estimation_model = cost_estimation_model
         self.device = device
+
+        self.tree_cache = {}
         # We use an ensemble of tiny gine_conv as priors
         model_factory_gine_conv = ModelFactory(prior_config)
         ensemble_gnn = [model_factory_gine_conv.load_gine_conv().to(device) for _ in range(epi_index_dim)]
@@ -232,7 +350,6 @@ class EpistemicNetwork(nn.Module):
             nn.Linear(10, 1)
         ).to(device)
 
-        #TODO: Check if this works
         for param in self.prior_epinet.parameters():
             param.requires_grad = False
 
@@ -244,7 +361,16 @@ class EpistemicNetwork(nn.Module):
         return self.cost_estimation_model.embed_query_batched(queries)
 
     def estimate_cost_full(self, plans, embedded_query, precomputed_indexes, precomputed_masks):
-        return self.cost_estimation_model.estimate_cost(plans, embedded_query, precomputed_indexes, precomputed_masks)
+        join_orders = [plan[0] for plan in plans]
+        n_nodes = embedded_query.shape[0]
+        gather_indices, prepared_indexes, prepared_masks = get_shared_structure(
+            join_orders, n_nodes, precomputed_indexes,
+            precomputed_masks, self.tree_cache, self.device
+        )
+        prepared_trees = apply_features_to_structure(embedded_query, gather_indices)
+        return self.cost_estimation_model.estimate_cost(
+            prepared_trees, prepared_indexes, prepared_masks
+        )
 
     def embed_query_batched_prior(self, queries):
         embedded_query_batches = []
@@ -282,19 +408,32 @@ class EpistemicNetwork(nn.Module):
                                precomputed_indexes, precomputed_masks,
                                epi_index, query_idx):
         with torch.no_grad():
+            num_plans = len(plans)
+            num_ensembles = self.epi_index_dim
+            join_orders = [plan[0] for plan in plans]
+
+            # Determine query size from the first ensemble's embedding
+            n_nodes = embedded_query[0][query_idx].shape[0]
+
+            # Each query has same gather_indices, indexes and masks. So precompute
+            gather_indices, prepared_indexes, prepared_masks = get_shared_structure(
+                join_orders, n_nodes, precomputed_indexes,
+                precomputed_masks, self.tree_cache, self.device
+            )
             # (epi_index, n_plans)
-            estimated_cost_priors = torch.zeros((self.epi_index_dim, len(plans)), device=self.device)
-            for i in range(self.epi_index_dim):
-                prepared_trees, prepared_indexes = build_trees_and_indexes(
-                    [[plan[0] for plan in plans]], [embedded_query[i][query_idx]],
-                    precomputed_indexes
-                )
-                prepared_trees.to(self.device)
-                [prepared_index.to(self.device) for prepared_index in prepared_indexes]
+            estimated_cost_priors = torch.zeros((self.epi_index_dim, num_plans), device=self.device)
+
+            # Precompute tree structure as this is fixed between epinet dimensions
+            for i in range(num_ensembles):
+                # i-th ensemble features: (n_nodes, channels)
+                current_features = embedded_query[i][query_idx]
+
+                # Fast feature mapping using the shared 'gather_indices' blueprint
+                prepared_trees = apply_features_to_structure(current_features, gather_indices)
 
                 # Est_cost: (n_plans, 1)
                 est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
-                    plans, embedded_query[i][query_idx], precomputed_indexes, precomputed_masks
+                    prepared_trees, prepared_indexes, prepared_masks
                 )
                 # Est_cost: (1, n_plans)
                 est_cost_t = est_cost.transpose(0,1)
@@ -306,15 +445,16 @@ class EpistemicNetwork(nn.Module):
         return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
 
 
-def min_max_scale_plans(query_plans):
-    min_cost = math.inf
-    max_cost = -math.inf
-    for query, plans in query_plans.items():
-        for (order, cost) in plans:
-            if min_cost > cost:
-                min_cost = cost
-            if max_cost < cost:
-                max_cost = cost
+def min_max_scale_plans(query_plans, min_cost=None, max_cost=None):
+    if not min_cost or not max_cost:
+        min_cost = math.inf
+        max_cost = -math.inf
+        for query, plans in query_plans.items():
+            for (order, cost) in plans:
+                if min_cost > cost:
+                    min_cost = cost
+                if max_cost < cost:
+                    max_cost = cost
 
     range_cost = max_cost - min_cost
     for query, plans in query_plans.items():
@@ -450,7 +590,7 @@ def validate(queries_val, query_plans_val,
              epinet_cost_estimation,
              device,
              validate_epi_network, n_val_epi_indexes):
-    query_to_val = {}
+    query_to_val_metrics = {}
     mape = MeanAbsolutePercentageError()
     mape.to(device)
     val_loader = DataLoader(queries_val, batch_size=1, shuffle=False)
@@ -463,7 +603,11 @@ def validate(queries_val, query_plans_val,
                 embedded_prior = epinet_cost_estimation.embed_query_batched_prior(queries)
 
             plans = query_plans_val[queries.query[0]]
-            estimated_cost, last_feature = epinet_cost_estimation.estimate_cost(plans, embedded[0], precomputed_indexes)
+            estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
+                plans, embedded[0], precomputed_indexes, precomputed_masks
+            )
+
+            query_metrics = {}
 
             if validate_epi_network:
                 loss_epinet, repeated_target, epinet_cost_estimates = calculate_loss_epinet(
@@ -474,8 +618,9 @@ def validate(queries_val, query_plans_val,
                     plans=plans, precomputed_indexes=precomputed_indexes, precomputed_masks=precomputed_masks, i=0,
                     n_epi_indexes=n_val_epi_indexes, device=device
                 )
-                compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_val_epi_indexes,
+                validation_metrics = compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_val_epi_indexes,
                                                   min_cost, max_cost)
+                query_metrics.update(validation_metrics)
             estimated_cost = estimated_cost.squeeze()
 
             #TODO Where is target being scaled? it should probably also be scaled (CHECK IT)
@@ -485,11 +630,17 @@ def validate(queries_val, query_plans_val,
             mape_val = mape(original_cost, target)
             query_loss = train_loss(original_cost, target)
 
-            query_to_val[queries.query[0]] = {"loss": query_loss.cpu().item(), "mape": mape_val.cpu().item()}
-    return query_to_val
+            query_metrics["loss_cost"] = query_loss.cpu().item()
+            query_metrics["mape_cost"] = mape_val.cpu().item()
+            query_to_val_metrics[queries.query[0]] = query_metrics
+    return query_to_val_metrics
 
 def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_epi_indexes, min_cost, max_cost):
     #TODO Investigate this code
+    #TODO Add train loss of mean epinet prediction per plan in scaled values
+    n_total = repeated_target.shape[0]
+    n_plans = n_total // n_epi_indexes
+
     # 1. Move to CPU and Numpy
     # Reshape to (-1, 1) because scaler expects 2D array [samples, features]
     pred_flat = epinet_cost_estimates.detach().cpu().numpy().reshape(-1, 1)
@@ -500,27 +651,21 @@ def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_
     cost_range = max_cost - min_cost
 
     pred_unscaled = pred_flat * cost_range + min_cost
-    targets_unscaled = targets_flat * cost_range + min_cost
-
-    # 3. Reshape into Matrix form: (n_samples, n_plans)
-    # The data structure is [Block_Z1, Block_Z2, ... Block_Zn]
-    n_total = pred_unscaled.shape[0]
-    n_plans = n_total // n_epi_indexes
+    y_scaled = targets_flat[:n_plans].flatten()
+    y_true = y_scaled * cost_range + min_cost
 
     # Shape: (n_epi_indexes, n_plans)
     # Column j contains all 'n_epi_indexes' predictions for Plan j
     pred_matrix = pred_unscaled.reshape(n_epi_indexes, n_plans)
+    pred_matrix_scaled = pred_flat.reshape(n_epi_indexes, n_plans)
 
-    # We only need one copy of the unscaled targets (since they are identical chunks)
-    # Take the first 'n_plans' elements to get the ground truth for each plan
-    y_true = targets_unscaled[:n_plans].flatten()
-
-    # 4. Aggregate Statistics
     y_pred_mean = pred_matrix.mean(axis=0)
+    y_pred_mean_scaled = pred_matrix_scaled.mean(axis=0)
     y_pred_std = pred_matrix.std(axis=0)
 
 
     mse = np.mean((y_pred_mean - y_true) ** 2)
+    mse_scaled = np.mean((y_pred_mean_scaled - y_scaled) ** 2)
 
     abs_error = np.abs(y_pred_mean - y_true)
     uncertainty_corr, _ = pearsonr(abs_error, y_pred_std)
@@ -534,11 +679,37 @@ def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_
     coverage_95 = np.mean(is_in_interval)
 
     return {
-        "mse": mse,
-        "uncertainty_corr": uncertainty_corr,
-        "coverage_95": coverage_95,
-        "avg_std": np.mean(y_pred_std)
+        "epi_mse": mse,
+        "epi_mse_scaled": mse_scaled,
+        "epi_uncertainty_corr": uncertainty_corr,
+        "epi_coverage_95": coverage_95,
+        "epi_avg_std": np.mean(y_pred_std)
     }
+
+def summarize_epistemic_metrics(metrics_dict):
+    keys = [
+        "epi_mse",
+        "epi_mse_scaled",
+        "epi_uncertainty_corr",
+        "epi_coverage_95",
+        "epi_avg_std",
+    ]
+
+    summary = {
+        k: np.mean([q_metrics[k] for q_metrics in metrics_dict.values()])
+        for k in keys
+    }
+
+    print(
+        "[Epistemic metrics — mean over queries]\n"
+        f"  MSE            : {summary['epi_mse']:.4f}\n"
+        f"  Scaled MSE     : {summary['epi_mse_scaled']:.4f}\n"
+        f"  Unc. Corr      : {summary['epi_uncertainty_corr']:.3f}\n"
+        f"  Coverage @95%  : {summary['epi_coverage_95']:.3f}\n"
+        f"  Avg Std        : {summary['epi_avg_std']:.4f}"
+    )
+
+    return summary
 
 def train_simulated_cost_model(queries_train, query_plans_train,
                                 queries_val, query_plans_val,
@@ -549,13 +720,15 @@ def train_simulated_cost_model(queries_train, query_plans_train,
     epinet_cost_estimation.to(device)
 
     precomputed_indexes = precompute_left_deep_tree_conv_index(20, device)
-    precomputed_masks = precompute_left_deep_tree_node_mask(20, device)
+    precomputed_masks = precompute_left_deep_tree_node_mask(20)
     loader = DataLoader(queries_train, batch_size=query_batch_size, shuffle=True)
 
     query_plans_train = flatten_plans(query_plans_train)
     query_plans_train, min_val, max_val = min_max_scale_plans(query_plans_train)
 
+    # Scale with min and max from validation set
     query_plans_val = flatten_plans(query_plans_val)
+    query_plans_val, _, _ = min_max_scale_plans(query_plans_val, min_val, max_val)
 
     lr = 1e-4
     n_epochs = 10
@@ -583,7 +756,6 @@ def train_simulated_cost_model(queries_train, query_plans_train,
         total_params = 0
         for param in epinet_cost_estimation.parameters():
             total_params += param.numel()
-        print(f"Cost estimation model has {total_params} parameters")
         print(f"Epinet model has {total_params - total_params_cost_estimation} parameters")
 
     loss = torch.nn.MSELoss(reduction='mean')
@@ -650,20 +822,20 @@ def train_simulated_cost_model(queries_train, query_plans_train,
             total_loss_tensor.backward()
 
             optimizer.step()
-        if train_epi_network:
-            pass
-        else:
-            query_to_val_cost = validate_cost(queries_val, query_plans_val,
-                                     precomputed_indexes,
-                                     min_val, max_val,
-                                     loss,
-                                     epinet_cost_estimation,
-                                     device)
-            val_losses = [val_output["loss"] for val_output in query_to_val_cost.values()]
-            val_mape = [val_output["mape"] for val_output in query_to_val_cost.values()]
 
-            print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
-            print(f"Validation loss on cost: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
+        query_to_val_cost = validate(queries_val, query_plans_val,
+                                 precomputed_indexes, precomputed_masks,
+                                 min_val, max_val,
+                                 loss,
+                                 epinet_cost_estimation,
+                                 device,
+                                 train_epi_network, n_epi_indexes)
+        val_losses = [val_output["loss"] for val_output in query_to_val_cost.values()]
+        val_mape = [val_output["mape"] for val_output in query_to_val_cost.values()]
+        print(f"Epoch {epoch + 1} finished ({sum(query_loss_epoch)/len(query_loss_epoch)})")
+        print(f"Validation loss on cost: {sum(val_losses)/len(val_losses)}, mape: {sum(val_mape)/len(val_mape)}")
+        if train_epi_network:
+            mean_metrics = summarize_epistemic_metrics(query_to_val_cost)
 
 
 def calculate_loss_epinet(epinet_cost_estimation,
@@ -677,7 +849,9 @@ def calculate_loss_epinet(epinet_cost_estimation,
 
     n_plans = estimated_cost.shape[0]
     epinet_estimated_cost = torch.zeros((n_plans*n_epi_indexes, 1), device=device)
-    # TODO GNN PRIOR ONLY DEPENDS ON X, NOT THE EPI INDEX, SO CAN BE LIFTED OUTSIDE THE LOOP
+    #TODO GNN PRIOR ONLY DEPENDS ON X, NOT THE EPI INDEX, SO CAN BE LIFTED OUTSIDE THE LOOP
+    # Move weighted sum outside of compute_ensemble_prior and then move compute_ensemble_prior outside of the
+    # epi indexes loop.
     for j in range(n_epi_indexes):
         epinet_index = epinet_cost_estimation.sample_epistemic_indexes()
         ensemble_prior = epinet_cost_estimation.compute_ensemble_prior(
