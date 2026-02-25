@@ -79,7 +79,7 @@ def masked_sample(vector: torch.Tensor,
 
     # Ensure that get no zero probabilities for all tokens if no token should be generated to prevent nans in sampling
     # The generated token will be discarded by applying the mask, so the actual probability does not matter
-    probabilities = probabilities + (no_generation * (1/probabilities.shape[1]))
+    probabilities += no_generation * (1 / probabilities.shape[1])
 
     m = torch.distributions.Categorical(probs=probabilities)
     sampled = m.sample()

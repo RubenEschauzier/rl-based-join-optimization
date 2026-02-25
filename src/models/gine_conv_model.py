@@ -115,7 +115,7 @@ class GINEConvModel(torch.nn.Module):
         elif layer_type in self.supported_mlp_layers:
             mlp_class = getattr(torch.nn, layer_type)
             mlp_params = self.__filter_parameters(layer_config, ['type', 'id'])
-            embedding_layers[layer_id] = mlp_class(**mlp_params)
+            embedding_layers[layer_id] = (mlp_class(**mlp_params), 'x -> x')
         elif layer_type in self.supported_normalization:
             norm_class = getattr(torch_geometric.nn, layer_type)
             norm_params = self.__filter_parameters(layer_config, ['type', 'id'])
@@ -146,21 +146,22 @@ class GINEConvModel(torch.nn.Module):
         for state_dict, head_type in zip(heads_state_dicts, self.head_types):
             torch.save(state_dict, os.path.join(model_dir, "head_{}.pt".format(head_type)))
 
+    def freeze_model(self):
+        """
+        Freezes the entire model (embedding backbone and all heads)
+        and sets it to evaluation mode.
+        """
+        # 1. Turn off gradients for all parameters recursively
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # 2. Set the entire model to evaluation mode recursively
+        self.eval()
+
+        if self.verbose > 0:
+            print("Entire GINEConvModel successfully frozen and set to eval mode.")
+
     @staticmethod
     def __filter_parameters(params, params_to_exclude):
         return {k: v for k, v in params.items() if k not in params_to_exclude}
 
-if __name__ == "__main__":
-    from collections import OrderedDict
-    from torch_geometric.nn import Sequential, GCNConv, global_mean_pool
-
-    layers = OrderedDict([
-        ('conv1_tests', (GCNConv(5, 64), 'x, edge_index -> x')),
-        ('relu1', ReLU()),
-        ('conv2', (GCNConv(64, 64), 'x, edge_index -> x')),
-        ('pool', (global_mean_pool, 'x, batch -> x')),
-        ('lin', Linear(64, 4)),
-    ])
-
-    model = Sequential('x, edge_index, batch', layers)
-    print(model.state_dict())

@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from src.baselines.enumeration import JoinOrderEnumerator, build_adj_list
 from src.datastructures.post_process_data import filter_duplicate_subject_predicate_combinations, query_post_processor
-from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
+from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 import os
 

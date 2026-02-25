@@ -3,7 +3,7 @@ import torch
 from typing_extensions import deprecated
 
 
-def precompute_left_deep_tree_conv_index(max_leaves: int, device):
+def precompute_left_deep_tree_conv_index(max_leaves: int):
     """
     In left-deep trees its trivial precompute the indexes based on the number of leaves
     :param max_leaves:
@@ -13,7 +13,7 @@ def precompute_left_deep_tree_conv_index(max_leaves: int, device):
     leaves_to_idx = {}
     for i in range(2, max_leaves):
         tree_conv_idx = left_deep_tree_conv_index(i)
-        leaves_to_idx[i] = torch.tensor(tree_conv_idx.flatten().reshape(-1, 1), device=device)
+        leaves_to_idx[i] = tree_conv_idx.flatten().reshape(-1, 1)
     return leaves_to_idx
 
 
@@ -203,7 +203,7 @@ def get_tree_conv_indexes(join_orders_batched, precomputed_indexes, device):
 
 
 def get_shared_structure(join_orders, n_nodes, precomputed_indexes,
-                         precomputed_masks, cache, device):
+                         precomputed_masks, device):
     """
     Computes or retrieves the structural indices and masks that are
     identical across all ensemble models.
@@ -211,17 +211,52 @@ def get_shared_structure(join_orders, n_nodes, precomputed_indexes,
     # Unique key for the topology of the batch
     structure_key = (tuple(tuple(jo) for jo in join_orders), n_nodes)
 
-    if structure_key in cache:
-        return cache[structure_key]
-
+    # if structure_key in cache:
+    #     gather_indices, conv_indexes, masks =  cache[structure_key]
+    # else:
     # Compute on MISS
     gather_indices, conv_indexes, masks = _compute_structural_indices(
-        join_orders, n_nodes, precomputed_indexes, precomputed_masks, device
+        join_orders, n_nodes, precomputed_indexes, precomputed_masks
     )
+    # cache[structure_key] = (gather_indices, conv_indexes, masks)
 
-    cache[structure_key] = (gather_indices, conv_indexes, masks)
+    gather_indices = torch.from_numpy(gather_indices).to(device)
+    conv_indexes = torch.from_numpy(conv_indexes).to(device)
+    masks = torch.from_numpy(masks).to(device)
+
     return gather_indices, conv_indexes, masks
 
+
+def apply_features_to_structure_batched(stacked_features, gather_indices):
+    """
+    Batched hot-path function: maps specific query embeddings onto the shared structure
+    for ALL ensembles at once.
+
+    Args:
+        stacked_features: (E, n_nodes, channels)
+        gather_indices: (num_plans, tree_width)
+    Returns:
+        (E, num_plans, channels, tree_width)
+    """
+    batch, _, feature_dim = stacked_features.shape
+    n_plans, _ = gather_indices.shape
+    device = stacked_features.device
+    dtype = stacked_features.dtype
+
+    # 1. Add zero vector for padding -> (batch, n_nodes+1, feature_dim)
+    zero_vec = torch.zeros((batch, 1, feature_dim), dtype=dtype, device=device)
+    features_padded = torch.cat([stacked_features, zero_vec], dim=1)
+
+    # features_expanded: (batch, n_plans, n_nodes+1, feature_dim)
+    features_expanded = features_padded.unsqueeze(1).expand(-1, n_plans, -1, -1)
+    # idx_expanded: (batch, n_plans, tree_width, feature_dim)
+    idx_expanded = gather_indices.unsqueeze(0).unsqueeze(-1).expand(batch, -1, -1, feature_dim)
+
+    # flattened_trees: (batch, n_plans, tree_width, feature_dim)
+    flattened_trees = torch.gather(features_expanded, 2, idx_expanded)
+
+    # Final shape: (batch, n_plans, feature_dim, tree_width)
+    return flattened_trees.transpose(2, 3)
 
 def apply_features_to_structure(features, gather_indices):
     """
@@ -248,78 +283,7 @@ def apply_features_to_structure(features, gather_indices):
     # Final shape: (num_plans, channels, tree_width)
     return flattened_trees.transpose(1, 2)
 
-# def build_t_cnn_input(join_orders_batched, features_batch,
-#                       precomputed_indexes, precomputed_masks, cache, device):
-#     """
-#     Optimized version of build_trees_and_indexes with caching and vectorization.
-#
-#     Args:
-#         :param join_orders_batched: List of lists of join orders (plans).
-#         :param features_batch: List of feature tensors (queries).
-#         :param precomputed_indexes: Dictionary of precomputed convolution indexes.
-#         :param precomputed_masks: Dictionary of precomputed node masks based on the number of join entries
-#         :param cache: A dictionary to store structural indices (pass self.cache here).
-#         :param device:
-#     """
-#     dtype = features_batch[0].dtype
-#
-#     # Lists to hold the final results for the whole batch
-#     batched_trees_results = []
-#     batched_indexes_results = []
-#     batched_mask_results = []
-#
-#     # Iterate over the batch (usually batch size is 1 for [plans] vs [query])
-#     for batch_idx, (join_orders, features) in enumerate(zip(join_orders_batched, features_batch)):
-#         n_nodes = features.shape[0]
-#
-#         # Create a unique key for the structure of this specific batch item
-#         # We need (tuple of join orders, number of nodes)
-#         # We convert lists to tuples to make them hashable
-#         structure_key = (tuple(tuple(jo) for jo in join_orders), n_nodes)
-#
-#         if structure_key in cache:
-#             # HIT: Retrieve pre-calculated structural tensors
-#             gather_indices, conv_indexes, mask = cache[structure_key]
-#         else:
-#             # MISS: Compute them efficiently and cache them
-#             gather_indices, conv_indexes, mask = _compute_structural_indices(
-#                 join_orders, n_nodes, precomputed_indexes, precomputed_masks, device)
-#             cache[structure_key] = (gather_indices, conv_indexes, mask)
-#
-#         if gather_indices.device != device:
-#             gather_indices = gather_indices.to(device)
-#             conv_indexes = conv_indexes.to(device)
-#
-#         # Pre-compute zero vector and append to features
-#         # Shape: (n_nodes + 1, channels)
-#         channels = features.shape[1]
-#         zero_vec = torch.zeros((1, channels), dtype=dtype, device=device)
-#         features_padded = torch.cat([features, zero_vec], dim=0)
-#
-#         # Expand features: (1, n_nodes+1, channels) -> (num_plans, n_nodes+1, channels)
-#         num_plans = gather_indices.shape[0]
-#         features_expanded = features_padded.unsqueeze(0).expand(num_plans, -1, -1)
-#
-#         # Expand indices: (num_plans, tree_width) -> (num_plans, tree_width, channels)
-#         idx_expanded = gather_indices.unsqueeze(-1).expand(-1, -1, channels)
-#
-#         # Gather: (num_plans, tree_width, channels)
-#         flattened_trees = torch.gather(features_expanded, 1, idx_expanded)
-#
-#         # Transpose to match original output: (num_plans, channels, tree_width)
-#         trees = flattened_trees.transpose(1, 2)
-#
-#         batched_trees_results.append(trees)
-#         batched_indexes_results.append(conv_indexes)
-#         batched_mask_results.append(mask)
-#
-#     final_trees = torch.cat(batched_trees_results, dim=0)
-#     final_indexes = torch.cat(batched_indexes_results, dim=0)
-#     final_masks = torch.cat(batched_mask_results, dim=0)
-#     return final_trees, final_indexes, final_masks
-
-
-def _compute_structural_indices(join_orders, n_nodes, precomputed_indexes, precomputed_masks, device):
+def _compute_structural_indices(join_orders, n_nodes, precomputed_indexes, precomputed_masks):
     """
     Internal helper to build indices using fast NumPy vectorization and avoiding GPU communication costs
     """
@@ -342,20 +306,22 @@ def _compute_structural_indices(join_orders, n_nodes, precomputed_indexes, preco
         # The right side (2*l to end) is already n_nodes
         batch_indices[i, l: l + l] = jo
 
-    gather_indices = torch.from_numpy(batch_indices).to(device)
-
     # --- 2. Build Conv Indexes ---
     # Logic from original: max size based on precomputed_indexes shapes
     max_conv_size = max([precomputed_indexes[l].shape[0] for l in lengths])
 
-    conv_indexes = torch.zeros((len(join_orders), max_conv_size, 1), dtype=torch.long, device=device)
+    conv_indexes = np.zeros((len(join_orders), max_conv_size, 1), dtype=np.int64)
 
     for i, l in enumerate(lengths):
         t = precomputed_indexes[l]
         actual_size = t.shape[0]
         conv_indexes[i, :actual_size] = t
+    #TODO: Applied fix here where when the number of max number of joins wasn't aligning with the number of nodes
+    # this broke. I think mask should always be size of max size of joins as join number decides
+    # representation size
 
-    target_width = n_nodes * 2
+    # target_width = n_nodes * 2
+    target_width = max_nodes_in_batch
 
     # Create batch mask on CPU using Numpy
     batch_mask_np = np.ones((len(join_orders), target_width), dtype=bool)
@@ -370,5 +336,4 @@ def _compute_structural_indices(join_orders, n_nodes, precomputed_indexes, preco
         mask_data = precomputed_masks[l]
         batch_mask_np[i, :mask_data.shape[0]] = mask_data
 
-    masks = torch.from_numpy(batch_mask_np).to(device)
-    return gather_indices, conv_indexes, masks
+    return batch_indices, conv_indexes, batch_mask_np

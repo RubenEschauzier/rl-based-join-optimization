@@ -1,0 +1,58 @@
+model:
+  type: GINEConv
+  embedding:
+    layers:
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 101
+            out_features: 101
+            id: gine_nn_1_lin_1
+          - type: ReLU
+            id: gine_nn_1_relu_1
+          - type: Linear
+            in_features: 101
+            out_features: 101
+            id: gine_nn_1_lin_2
+        edge_dim: 101
+        id: gine_1
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 101
+            out_features: 100
+            id: gine_nn_2_lin_1
+          - type: ReLU
+            id: gine_nn_2_relu_1
+          - type: Linear
+            in_features: 100
+            out_features: 200
+            id: gine_nn_2_lin_2
+        edge_dim: 101
+        id: gine_2
+  heads:
+    - estimation_type: cardinality
+      layers:
+        - type: SumAggregation
+          id: sum_agg
+        - type: Linear
+          in_features: 200
+          out_features: 50
+          id: card_nn_lin_1
+        - type: ReLU
+          id: card_nn_relu_1
+        - type: Linear
+          in_features: 50
+          out_features: 1
+          id: card_nn_lin_2
+    - estimation_type: triple_embedding
+      layers:
+        - type: TriplePatternPooling
+          id: tp_encoding
+
+weight_location:
+  directory: ""
+  chkp: true
+
+

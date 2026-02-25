@@ -54,7 +54,7 @@ class ExperimentWriter:
     def create_experiment_directory(self):
         if os.path.exists(self.experiment_directory):
             raise FileExistsError(f"Experiment directory already exists: {self.experiment_directory}")
-        os.mkdir(self.experiment_directory)
+        os.makedirs(self.experiment_directory)
         experiment_details = {
             "experiment_config": self.experiment_config,
             "model_config": self.model_config,
@@ -67,8 +67,7 @@ class ExperimentWriter:
 
     def write_epoch_to_file(self, val_predictions, best_values, per_epoch_values, model, epoch):
         epoch_progress_file = os.path.join(str(self.experiment_directory), "train_progress.json")
-        epoch_dir = os.path.join(str(self.experiment_directory), "epoch-{}".format(epoch))
-        os.mkdir(epoch_dir)
+        epoch_dir = self.get_epoch_dir(epoch)
         with open(epoch_progress_file, "w", encoding="utf-8") as f:
             json.dump(per_epoch_values, f, indent=2, sort_keys=True)
         with open(os.path.join(epoch_dir, "val_predictions.json"), "w", encoding="utf-8") as f1:
@@ -82,7 +81,13 @@ class ExperimentWriter:
             # If model has its own serialize_model() function we use that
             model.serialize_model(os.path.join(epoch_dir, "model"))
         except AttributeError as err:
+            print(err)
             warnings.warn("{} \n Falling back to default torch.save() call".format(err),
                 stacklevel=2
             )
             torch.save(model.state_dict(), os.path.join(epoch_dir, "model.pt"))
+
+    def get_epoch_dir(self, epoch):
+        epoch_dir = os.path.join(str(self.experiment_directory), "epoch-{}".format(epoch))
+        os.makedirs(epoch_dir, exist_ok=True)
+        return epoch_dir

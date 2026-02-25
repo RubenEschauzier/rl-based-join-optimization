@@ -13,7 +13,7 @@ from tqdm import tqdm
 from src.datastructures.post_process_data import filter_duplicate_subject_predicate_combinations, query_post_processor, \
     filter_failed_cardinality_queries
 from src.datastructures.query import Query
-from src.datastructures.query_pytorch_dataset import QueryCardinalityDataset
+from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec

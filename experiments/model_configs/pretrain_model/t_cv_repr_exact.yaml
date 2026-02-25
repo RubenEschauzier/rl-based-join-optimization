@@ -1,0 +1,37 @@
+model:
+  type: GINEConv
+  layers:
+    - type: TripleGINEConv
+      nn:
+        - type: Linear
+          in_features: 101
+          out_features: 101
+        - type: ReLU
+        - type: Linear
+          in_features: 101
+          out_features: 101
+      edge_dim: 101
+    - type: TripleGINEConv
+      nn:
+        - type: Linear
+          in_features: 101
+          out_features: 100
+        - type: ReLU
+        - type: Linear
+          in_features: 100
+          out_features: 200
+      edge_dim: 101
+    - type: SumAggregation
+    - type: Linear
+      in_features: 200
+      out_features: 50
+    - type: ReLU
+    - type: Linear
+      in_features: 50
+      out_features: 1
+
+weight_location:
+  directory: ""
+  chkp: true
+
+
