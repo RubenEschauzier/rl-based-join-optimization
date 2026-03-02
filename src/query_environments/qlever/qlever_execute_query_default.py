@@ -1,4 +1,6 @@
 import asyncio
+import math
+
 import aiohttp
 import json
 
@@ -10,8 +12,207 @@ class QLeverOptimizerClient:
         :param http_endpoint: The HTTP URL (e.g., "http://localhost:7001")
         """
         self.http_endpoint = http_endpoint
+        self.query_timeouts = {}
+        self.default_timeout = "60s"
+        self.default_timeout_s = 60
 
-    def _apply_join_order(self, query_obj, join_order: list[int]) -> str:
+
+    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s") -> dict:
+        """
+        Executes the query via HTTP and retrieves the full execution plan + costs.
+        """
+        timeout = self.default_timeout
+        if query_obj.query in self.query_timeouts:
+            timeout = self.format_latency(self.query_timeouts[query_obj.query])
+            print(timeout)
+
+        formatted_query = self._apply_join_order(query_obj, join_order)
+        # We use 'application/qlever-results+json' to get the runtimeInformation field
+        headers = {
+            "Accept": "application/qlever-results+json",
+            "Content-Type": "application/sparql-query"
+        }
+
+        params = {
+            # "query": formatted_query,
+            "timeout": timeout
+        }
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Note: Sending query as data with the sparql-query content type
+                # is the most robust way to handle large queries.
+                async with session.post(self.http_endpoint, params=params, headers=headers,
+                                        data=formatted_query) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        time_total = result.get("time", {}).get("total", "0ms")
+
+                        # Tighten bounds on successful execution
+                        if time_total != "0ms":
+                            time_in_seconds = self.decode_to_seconds(time_total)
+                            self.query_timeouts[query_obj.query] = max(min((time_in_seconds * 2), self.default_timeout_s), 5)
+
+                        return {
+                            "success": True,
+                            "results": result.get("res", []),
+                            "runtime_info": result.get("runtimeInformation", {}),
+                            "query_plan": result.get("queryExecutionPlan", ""),
+                            "time_total": result.get("time", {}).get("total", "0ms")
+                        }
+                    else:
+                        error_text = await response.text()
+                        return {"success": False, "error": error_text}
+
+            except asyncio.TimeoutError:
+                return {"success": False, "error": "Query timed out"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    def _walk_tree(self, node: dict, join_sequence: list):
+        """Recursively extracts Join operations via post-order traversal."""
+        if not node:
+            return
+
+        for child in node.get("children", []):
+            self._walk_tree(child, join_sequence)
+
+        description = node.get("description", "")
+        if description.startswith("Join"):
+            status = node.get("status", "")
+
+            # Check if the join actually finished computing its rows
+            is_completed = "completed" in status.lower()
+
+            join_sequence.append({
+                "operation": description,
+                "status": status,
+
+                # Latency of operation, even if failed, this time represents actual CPU effort spent.
+                # It serves as a great lower bound for your value function.
+                "actual_op_time_ms": node.get("operation_time", 0),
+
+                # Only trust the row count if the operation fully completed.
+                "actual_rows": node.get("result_rows", 0),
+                "is_cardinality_valid": is_completed,
+
+                "estimated_op_cost": node.get("estimated_operation_cost", 0),
+                "estimated_rows": node.get("estimated_size", 0),
+            })
+
+    def _extract_join_sequence_success(self, qlever_result: dict) -> list:
+        """Parses joins from a standard successful execution payload."""
+        if not qlever_result.get("success") or "runtime_info" not in qlever_result:
+            return []
+
+        root_node = qlever_result["runtime_info"].get("query_execution_tree", {})
+        join_sequence = []
+        self._walk_tree(root_node, join_sequence)
+        return join_sequence
+
+    def _extract_join_sequence_fallback(self, parsed_qlever_result: dict) -> list:
+        """Parses joins from an error or timeout payload."""
+        # try:
+        #     parsed_result = json.loads(qlever_result)
+        # except json.decoder.JSONDecodeError:
+        #     print("Failed to decode JSON:")
+        #     print(qlever_result)
+        #     return []
+        # if "runtimeInformation" not in parsed_result:
+        #     return []
+
+        root_node = parsed_qlever_result["runtimeInformation"]
+        join_sequence = []
+        self._walk_tree(root_node, join_sequence)
+        return join_sequence
+
+    def extract_join_sequence(self, qlever_result: dict) -> list:
+        """
+        Attempts to extract joins from a successful execution,
+        falling back to error parsing if the standard extraction fails.
+        """
+        joins = self._extract_join_sequence_success(qlever_result)
+        if not joins:
+            if not 'error' in qlever_result:
+                print(qlever_result)
+                raise ValueError("Unknown qlever result structure")
+            joins = self._extract_join_sequence_fallback(qlever_result['error'])
+            test = 5
+        return joins
+
+    def extract_query_success(self, qlever_result: dict) -> dict:
+        joins = self._extract_join_sequence_success(qlever_result)
+
+        if not joins:
+            raise ValueError("Join sequence is empty in query result")
+
+        total_rows = 0
+        per_join_rows = []
+        is_valid_join_row = []
+
+        for join in joins:
+            total_rows += join["actual_rows"]
+            per_join_rows.append(join["actual_rows"])
+            is_valid_join_row.append(True)
+
+        time_string = qlever_result['time_total']
+        latency = self.decode_to_seconds(time_string)
+
+        return {
+            "per_join_rows": per_join_rows,
+            "total_cost": total_rows,
+            "latency": latency,
+            "is_error": False,
+            "is_valid_join_row": is_valid_join_row
+        }
+
+    def extract_signal(self, qlever_result: dict) -> dict:
+        if qlever_result["success"]:
+            return self.extract_query_success(qlever_result)
+        else:
+            parsed_error_result = self._parse_error_result_qlever(qlever_result)
+            joins = self._extract_join_sequence_fallback(parsed_error_result)
+
+            if not joins:
+                raise ValueError("Join sequence is empty in query result")
+
+            total_rows = 0
+            per_join_rows = []
+            is_valid_join_row = []
+
+            for join in joins:
+                total_rows += join["actual_rows"]
+                per_join_rows.append(join["actual_rows"])
+                is_valid_join_row.append(join["is_cardinality_valid"])
+
+            latency = parsed_error_result["time"]["total"] / 1000
+
+            return {
+                "per_join_rows": per_join_rows,
+                "total_cost": total_rows,
+                "latency": latency,
+                "is_error": True,
+                "is_valid_join_row": is_valid_join_row
+            }
+
+    @staticmethod
+    def _parse_error_result_qlever(qlever_result: dict):
+        if not "error" in qlever_result:
+            raise ValueError("Unknown qlever result structure")
+
+        try:
+            parsed_result = json.loads(qlever_result["error"])
+        except json.decoder.JSONDecodeError as e:
+            print(qlever_result)
+            raise e
+
+        if "runtimeInformation" not in parsed_result:
+            print(parsed_result)
+            raise ValueError("Unknown qlever result structure")
+
+        return parsed_result
+
+    @staticmethod
+    def _apply_join_order(query_obj, join_order: list[int]) -> str:
         """
         Recursively wraps triples in {} to force the join order, with proper indentation.
         """
@@ -41,116 +242,8 @@ class QLeverOptimizerClient:
         forced_bgp = build_nested_bgp(join_order)
         return f"SELECT * WHERE {{\n{forced_bgp}\n}}"
 
-    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s") -> dict:
-        """
-        Executes the query via HTTP and retrieves the full execution plan + costs.
-        """
-        formatted_query = self._apply_join_order(query_obj, join_order)
-        print(formatted_query)
-        # We use 'application/qlever-results+json' to get the runtimeInformation field
-        headers = {
-            "Accept": "application/qlever-results+json",
-            "Content-Type": "application/sparql-query"
-        }
-
-        params = {
-            # "query": formatted_query,
-            "timeout": timeout
-        }
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                # Note: Sending query as data with the sparql-query content type
-                # is the most robust way to handle large queries.
-                async with session.post(self.http_endpoint, params=params, headers=headers,
-                                        data=formatted_query) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return {
-                            "success": True,
-                            "results": result.get("res", []),
-                            "runtime_info": result.get("runtimeInformation", {}),
-                            "query_plan": result.get("queryExecutionPlan", ""),
-                            "time_total": result.get("time", {}).get("total", "0ms")
-                        }
-                    else:
-                        error_text = await response.text()
-                        return {"success": False, "error": error_text}
-
-            except asyncio.TimeoutError:
-                return {"success": False, "error": "Query timed out"}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-
-
-    def extract_join_sequence(self, qlever_result: dict) -> list:
-        """
-        Walks the QLever runtime_info tree and extracts all Join operations
-        in chronological execution order (bottom-up).
-        """
-        if not qlever_result.get("success") or "runtime_info" not in qlever_result:
-            return []
-
-        root_node = qlever_result["runtime_info"].get("query_execution_tree", {})
-        join_sequence = []
-
-        def walk_tree(node):
-            if not node:
-                return
-
-            # 1. Post-order traversal: recurse into children first.
-            # This ensures we hit the deepest (earliest executed) joins first.
-            for child in node.get("children", []):
-                walk_tree(child)
-
-            # 2. Check if the current node is a Join
-            description = node.get("description", "")
-            if description.startswith("Join"):
-                join_sequence.append({
-                    "operation": description,
-                    "actual_op_time_ms": node.get("operation_time", 0),
-                    "actual_total_time_ms": node.get("total_time", 0),
-                    "actual_rows": node.get("result_rows", 0),
-                    "estimated_op_cost": node.get("estimated_operation_cost", 0),
-                    "estimated_total_cost": node.get("estimated_total_cost", 0),
-                    "estimated_rows": node.get("estimated_size", 0),
-                    "cache_status": node.get("cache_status", "")
-                })
-
-        walk_tree(root_node)
-        return join_sequence
-
-    def extract_rl_metrics(self, qlever_result: dict) -> dict | None:
-        """Extracts the exact metrics requested for the RL environment."""
-        joins = self.extract_join_sequence(qlever_result)
-        if not joins:
-            return None
-        total_rows = 0
-        per_join_rows = []
-
-        for join in joins:
-            total_rows += join["actual_rows"]
-            per_join_rows.append(join["actual_rows"])
-
-        time_string = qlever_result['time_total']
-        if "ms" in time_string:
-            latency = float(time_string.split("ms")[0]) / 1000
-        elif "s" in time_string:
-            print(time_string)
-            latency = float(time_string.split("ms")[0])
-        elif "m" in time_string:
-            print(time_string)
-            latency = float(time_string.split("m")[0]) * 60
-        else:
-            raise ValueError(f"Encountered unknown time_total value: {time_string}")
-
-        return {
-            "per_join_rows": per_join_rows,
-            "total_cost": total_rows,
-            "latency": latency,
-        }
-
-    def print_join_stats(self, joins: list):
+    @staticmethod
+    def print_join_stats(joins: list):
         """Prints the join sequence in a readable table format."""
         print(
             f"\n{'Step':<6} | {'Time (Op/Tot)':<15} | {'Rows (Actual / Est.)':<22} | {'Cost Est. (Op/Tot)':<22} | {'Cache'}")
@@ -162,39 +255,28 @@ class QLeverOptimizerClient:
 
             print(f"Join {i + 1:<1} | {time_str:<15} | {row_str:<22} | {cost_str:<22} | {j['cache_status']}")
 
-if __name__ == "__main__":
-    async def main():
-        # Only HTTP endpoint is needed now
-        client = QLeverOptimizerClient("http://localhost:8888")
+    @staticmethod
+    def format_latency(time_s: float) -> str:
+        """Converts milliseconds to a formatted string (e.g., '500ms' or '1.5s')."""
+        if time_s < 1:
+            return f"{math.ceil(int(time_s)*1000)}ms"
+        return f"{math.ceil(time_s)}s"
 
-        query_object = {
-            "triple_patterns": [
-                '?s <http://example.com/13000080> <http://example.com/12610595> .',
-                '?s <http://example.com/13000080> <http://example.com/12772511> .',
-                '?s <http://example.com/13000179> <http://example.com/12920312> .',
-                '?s <http://example.com/13000179> <http://example.com/12939215> .',
-                '?s <http://example.com/13000083> ?o4 .'
-            ],
-            "query": 'SELECT * WHERE { ... }'
-        }
+    @staticmethod
+    def decode_to_seconds(time_str_raw: str ) -> float:
+        """Parses a time string or number into milliseconds."""
+        # If the input is already a number, assume it is in milliseconds
 
-        # Force a specific join order
-        result = await client.execute_plan(
-            query_obj=query_object,
-            join_order=[4, 3, 2, 1, 0],
-            timeout="10s"
-        )
+        time_str = str(time_str_raw).strip().lower()
 
-        if result["success"]:
-            joins_with_runtime_info = client.extract_join_sequence(result)
-            client.print_join_stats(joins_with_runtime_info)
-            # runtime_info contains the cost estimates for every node in your join tree
-            print("Successfully retrieved cost estimates!")
-            print(f"Total Execution Time: {result['time_total']}")
-            print(f"Result object: {result}")
-            # Accessing estimates: result['runtime_info']['cost_estimate']
+        if "ms" in time_str:
+            latency = float(time_str.split("ms")[0]) / 1000
+        elif "s" in time_str:
+            print(time_str)
+            latency = float(time_str.split("ms")[0])
+        elif "m" in time_str:
+            print(time_str)
+            latency = float(time_str.split("m")[0]) * 60
         else:
-            print(f"Query Failed: {result['error']}")
-
-
-    asyncio.run(main())
+            raise ValueError(f"Encountered unknown time_total value: {time_str}")
+        return latency

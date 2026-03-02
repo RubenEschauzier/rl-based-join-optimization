@@ -14,6 +14,7 @@ from src.datastructures.post_process_data import filter_duplicate_subject_predic
     filter_failed_cardinality_queries
 from src.datastructures.query import Query
 from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
+from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
@@ -138,6 +139,23 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
     else:
         raise NotImplementedError
     return functools.partial(query_to_graph.transform_undirected)
+
+
+def prepare_data(endpoint_location,
+                 queries_location_train, queries_location_val,
+                 rdf2vec_vector_location,
+                 occurrences_location, tp_cardinality_location):
+    query_env = BlazeGraphQueryEnvironment(endpoint_location)
+    train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
+                                                           endpoint_location,
+                                                           rdf2vec_vector_location, query_env,
+                                                           "predicate_edge",
+                                                           to_load=None,
+                                                           occurrences_location=occurrences_location,
+                                                           tp_cardinality_location=tp_cardinality_location,
+                                                           shuffle_train=True, load_mappings=False
+                                                           )
+    return train_dataset, val_dataset
 
 if __name__ == '__main__':
     project_root = os.getcwd()

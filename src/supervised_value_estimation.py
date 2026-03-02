@@ -21,9 +21,12 @@ import itertools
 import os
 import sys
 
+import hydra
 import numpy as np
 import optuna
 from joblib import Parallel, delayed
+from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tqdm import tqdm
 from torchmetrics.regression import MeanAbsolutePercentageError
@@ -51,27 +54,9 @@ from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.models.model_instantiator import ModelFactory
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining
-from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
+from src.utils.training_utils.query_loading_utils import load_queries_into_dataset, prepare_data
 from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
 import torch
-
-
-
-def prepare_data(endpoint_location,
-                 queries_location_train, queries_location_val,
-                 rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location):
-    query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
-                                                           endpoint_location,
-                                                           rdf2vec_vector_location, query_env,
-                                                           "predicate_edge",
-                                                           to_load=None,
-                                                           occurrences_location=occurrences_location,
-                                                           tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle_train=True, load_mappings=False
-                                                           )
-    return train_dataset, val_dataset
 
 
 def prepare_cardinality_estimator(model_config, model_directory=None):
@@ -287,9 +272,9 @@ def validation_step(epoch_train_loss, epoch,
     best, per_epoch = train_summary.summary()
     writer.write_epoch_to_file([], best, per_epoch, epinet_cost_estimation, epoch)
     if train_epi_network:
-        return mean_metrics_val['val_joint_gaussian_nll']
+        return mean_metrics_val['val_loss_cost_scaled'], mean_metrics_val['val_joint_gaussian_nll']
     else:
-        return mean_metrics_val['val_loss_cost_scaled']
+        return mean_metrics_val['val_loss_cost_scaled'], None
 
 def train_simulated_cost_model(queries_train, query_plans_train,
                                mean_train, std_train,
@@ -330,6 +315,12 @@ def train_simulated_cost_model(queries_train, query_plans_train,
         lr=lr,
         weight_decay=weight_decay
     )
+
+    scheduler = ReduceLROnPlateau(optimizer, 'min',
+                                  patience=3,
+                                  threshold=1e-2
+                                  )
+    previous_lr = scheduler.get_last_lr()
 
     total_params_cost_estimation = 0
     for param in params_cost_estimate:
@@ -402,7 +393,7 @@ def train_simulated_cost_model(queries_train, query_plans_train,
 
 
         epoch_train_loss = np.mean(query_loss_epoch)
-        joint_nll = validation_step(epoch_train_loss, epoch, train_summary, writer,
+        val_loss, joint_nll = validation_step(epoch_train_loss, epoch, train_summary, writer,
                         queries_val, query_plans_val,
                         precomputed_indexes, precomputed_masks,
                         mean_train, std_train,
@@ -412,6 +403,12 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                         train_epi_network, n_epi_indexes_val,
                         sigma=sigma, alpha_mlp=alpha_mlp, alpha_ensemble=alpha_ensemble,
                         generator=generator)
+
+        if scheduler.get_last_lr() != previous_lr:
+            print("INFO: Lr Updated from {} to {}".format(previous_lr, scheduler.get_last_lr()))
+            previous_lr = scheduler.get_last_lr()
+
+        scheduler.step(val_loss)
 
         # Pruning for optuna hyperparameter search based on nll
         if trial:
@@ -480,152 +477,136 @@ def calculate_loss_epinet(epinet_cost_estimation,
     query_loss = loss(epinet_estimated_cost.squeeze(), perturbed_targets)
     return query_loss, unperturbed_target, epinet_estimated_cost
 
-def main_simulated_training(train_dataset, val_dataset,
+
+def main_simulated_training(cfg: DictConfig,
+                            train_dataset,
+                            val_dataset,
                             oracle_model,
                             epinet_cost_estimation,
-                            train_epi_network,
-                            device, query_batch_size,
-                            save_loc_simulated_dataset, save_loc_simulated_dataset_val,
+                            device,
                             writer):
-
-    # Hyperparameter results from tuning runs on partial data
-    n_epi_indexes_train = 16
-    n_epi_indexes_val = 1000
-    sigma = 0.60
-    alpha_mlp = 0.08
-    alpha_ensemble = 0.30
-    lr = .0001
-    weight_decay = 0.04
-    n_epochs = 25
-
     writer.create_experiment_directory()
 
-    # oracle_model = oracle_model.to(device)
-    data = prepare_simulated_dataset(train_dataset, oracle_model, device, save_loc_simulated_dataset)
+    # Prepare datasets
+    data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated)
     query_plans_dict = {k: v for d in data for k, v in d.items()}
 
-    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, save_loc_simulated_dataset_val)
+    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, cfg.dataset.save_loc_simulated_val)
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train, std_train = preprocess_plans(query_plans_dict)
     val_plans, _, _ = preprocess_plans(query_plans_dict_val)
 
-    train_simulated_cost_model(queries_train=train_dataset, query_plans_train=train_plans,
-                               mean_train=mean_train, std_train=std_train,
-                               queries_val=val_dataset, query_plans_val=val_plans,
-                               epinet_cost_estimation=epinet_cost_estimation,
-                               device=device,
-                               query_batch_size=query_batch_size,
-                               n_epi_indexes_train=n_epi_indexes_train, n_epi_indexes_val=n_epi_indexes_train,
-                               train_epi_network=train_epi_network,
-                               writer=writer,
-                               sigma=sigma, alpha_mlp=alpha_mlp, alpha_ensemble=alpha_ensemble,
-                               lr=lr, weight_decay=weight_decay, n_epochs=n_epochs)
+    # Execute training
+    train_simulated_cost_model(
+        queries_train=train_dataset,
+        query_plans_train=train_plans,
+        mean_train=mean_train,
+        std_train=std_train,
+        queries_val=val_dataset,
+        query_plans_val=val_plans,
+        epinet_cost_estimation=epinet_cost_estimation,
+        device=device,
+        writer=writer,
 
-def main_latency_training(train_dataset, val_dataset,
-                          epinet_cost_estimation,
-                          device, query_batch_size,
-                          n_beams, max_plans,
-                          writer
-                          ):
-    pass
+        # Hyperparameters
+        query_batch_size=cfg.hyperparameters.query_batch_size,
+        n_epi_indexes_train=cfg.hyperparameters.n_epi_indexes_train,
+        n_epi_indexes_val=cfg.hyperparameters.n_epi_indexes_val,
+        train_epi_network=cfg.execution.train_epi_network,
+        sigma=cfg.hyperparameters.sigma,
+        alpha_mlp=cfg.hyperparameters.alpha_mlp,
+        alpha_ensemble=cfg.hyperparameters.alpha_ensemble,
+        lr=cfg.hyperparameters.lr,
+        weight_decay=cfg.hyperparameters.weight_decay,
+        n_epochs=cfg.hyperparameters.n_epochs
+    )
 
-
-def main_supervised_value_estimation(endpoint_location,
-                                     queries_location_train, queries_location_val,
-                                     rdf2vec_vector_location,
-                                     save_loc_simulated_dataset, save_loc_simulated_val,
-                                     occurrences_location, tp_cardinality_location,
-                                     model_config_oracle, model_directory_oracle,
-                                     model_config_embedder, model_directory_embedder,
-                                     model_config_epistemic_prior,
-                                     train_epi_network,
-                                     trained_cost_model_loc,
-                                     ):
+def main_supervised_value_estimation(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
-                                              rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
-    # oracle_model = prepare_cardinality_estimator(
-    #     model_config=model_config_oracle, model_directory=model_directory_oracle
-    # )
-    mlp_dimension = 64
+    train_dataset, val_dataset = prepare_data(
+        cfg.dataset.endpoint_location,
+        cfg.dataset.queries_train,
+        cfg.dataset.queries_val,
+        cfg.dataset.rdf2vec_vector_location,
+        cfg.dataset.occurrences_location,
+        cfg.dataset.tp_cardinality_location
+    )
+
+    embedding_model = prepare_cardinality_estimator(
+        model_config=cfg.models.embedder.config,
+        model_directory=cfg.models.embedder.dir
+    )
+
     heads_config = {
         'plan_cost': {
-            'layer': torch.nn.Linear(mlp_dimension, 1),
+            'layer': torch.nn.Linear(cfg.hyperparameters.mlp_dimension, 1),
         }
     }
-    cost_net_attention_pooling = PlanCostEstimatorFull(
-        heads_config, device, mlp_output_dim=mlp_dimension
+
+    # Prepare large (20 million parameters) oracle model to estimate cardinality of join plans
+    oracle_model = prepare_cardinality_estimator(
+        model_config=cfg.models.oracle.config, model_directory=cfg.models.oracle.dir
     )
-    embedding_model = prepare_cardinality_estimator(model_config=model_config_embedder,
-                                                    model_directory=model_directory_embedder)
+
+    # Prepare plan cost estimation models and epinet
+    cost_net_attention_pooling = PlanCostEstimatorFull(
+        heads_config, device, mlp_output_dim=cfg.hyperparameters.mlp_dimension
+    )
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
+    epinet_cost_estimation = EpistemicNetwork(
+        cfg.hyperparameters.epinet_index_dim, cfg.models.epinet.prior_config, combined_model, device=device
+    )
 
-    epinet_cost_estimation = EpistemicNetwork(32, model_config_epistemic_prior, combined_model, device=device)
-    if train_epi_network:
-        print("Training epinet network")
-        if not trained_cost_model_loc:
-            raise ValueError("Training epinet requires a pretrained cost model")
-        epinet_cost_estimation.load_epinet(trained_cost_model_loc, load_only_cost_model=True)
-        writer = ExperimentWriter("experiments/experiment_outputs/yago_gnce/supervised_epinet_training",
-                                  "simulated_cost_epinet_training",
-                                  {}, {})
+    experiment_base_dir = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training"
+
+    if cfg.execution.train_epi_network:
+        if not cfg.models.epinet.trained_cost_model_file:
+            raise ValueError("Training epinet requires a pretrained cost model.")
+
+        epinet_cost_estimation.load_epinet(
+            cfg.models.epinet.trained_cost_model_file,
+            load_only_cost_model=True
+        )
+        experiment_name = "simulated_cost_epinet_training"
     else:
-        writer = ExperimentWriter("experiments/experiment_outputs/yago_gnce/supervised_epinet_training",
-                                  "simulated_cost",
-                                  {}, {})
+        experiment_name = "simulated_cost"
 
-    main_simulated_training(train_dataset, val_dataset,
-                            "Should be oracle currently not exist",
-                            epinet_cost_estimation,
-                            train_epi_network,
-                            device,
-                            8,
-                            save_loc_simulated_dataset, save_loc_simulated_val,
-                            writer)
+    writer = ExperimentWriter(experiment_base_dir, experiment_name, {}, {})
 
+
+    main_simulated_training(
+        cfg=cfg,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        oracle_model=oracle_model,
+        epinet_cost_estimation=epinet_cost_estimation,
+        device=device,
+        writer=writer
+    )
+
+
+@hydra.main(version_base=None,
+            config_path="../experiments/experiment_configs/epinet_cost_estimation",
+            config_name="simulated_supervised_cost_estimation.yaml")
+def main(cfg: DictConfig):
+    # Temporarily unlock the config to allow dynamic updates
+    OmegaConf.set_struct(cfg, False)
+
+    # Locate the best embedder and oracle directory dynamically
+    best_embedder_dir = find_best_epoch_directory(cfg.models.embedder.experiment_dir, "val_q_error")
+    best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_q_error")
+
+    # Inject the resolved path directly into the config state
+    cfg.models.embedder.dir = best_embedder_dir
+    cfg.models.oracle.dir = best_oracle_dir
+
+    # Relock the config to prevent accidental downstream modifications
+    OmegaConf.set_struct(cfg, True)
+
+    # Pass the unified config to the main setup function
+    main_supervised_value_estimation(cfg)
 
 if __name__ == "__main__":
-    endpoint_location = "http://localhost:9999/blazegraph/namespace/yago/sparql"
-    queries_location_train = "data/generated_queries/star_yago_gnce/dataset_train"
-    queries_location_val = "data/generated_queries/star_yago_gnce/dataset_val"
-    rdf2vec_vector_location = "data/rdf2vec_embeddings/yago_gnce/model.json"
-    occurrences_location = "data/term_occurrences/yago_gnce/occurrences.json"
-    tp_cardinality_location = "data/term_occurrences/yago_gnce/tp_cardinalities.json"
-
-    model_config_oracle = "experiments/model_configs/policy_networks/t_cv_repr_huge.yaml"
-    model_config_emb = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
-    model_config_emb_pair_norm = "experiments/model_configs/policy_networks/t_cv_repr_pair_norm_cardinality_head_own_embeddings.yaml"
-    model_config_emb_graph_norm = "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_cardinality_head_own_embeddings.yaml"
-
-    model_config_prior_tiny = "experiments/model_configs/prior_networks/prior_t_cv_tiny.yaml"
-    model_config_prior = "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
-
-    oracle_experiment_dir = "experiments/experiment_outputs/yago_gnce/pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars_gnce_large_pretrain-05-10-2025-18-13-40"
-    # trained_cost_model_file = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost-12-02-2026-17-17-13/epoch-25/model/epinet_model.pt"
-    trained_cost_model_file = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost-24-02-2026-17-00-05/epoch-1/model/epinet_model.pt"
-
-    emb_experiment_dir = ("experiments/experiment_outputs/yago_gnce/pretrained_models/"
-                      "pretrain_experiment_triple_conv-15-12-2025-11-10-45")
-    emb_experiment_dir_pair_norm = ("experiments/experiment_outputs/yago_gnce/pretrained_models"
-                                "/pretrain_experiment_triple_conv_pair_norm-15-12-2025-10-00-26")
-
-    emb_experiment_dir_graph_norm = ("experiments/experiment_outputs/yago_gnce/pretrained_models"
-                                "/pretrain_experiment_triple_conv_graph_norm-15-12-2025-09-12-57")
-
-    save_loc_simulated = "data/simulated_query_plan_data/star_yago_gnce/data"
-    save_loc_simulated_val = "data/simulated_query_plan_data/star_yago_gnce/val_data"
-
-    model_dir_oracle = os.path.join(oracle_experiment_dir, "epoch-39/model")
-    model_dir_embedder = find_best_epoch_directory(emb_experiment_dir, "val_q_error")
-    main_supervised_value_estimation(endpoint_location, queries_location_train, queries_location_val,
-                                     rdf2vec_vector_location,
-                                     save_loc_simulated, save_loc_simulated_val,
-                                     occurrences_location, tp_cardinality_location,
-                                     model_config_oracle, model_dir_oracle,
-                                     model_config_emb, model_dir_embedder,
-                                     model_config_prior,
-                                     True,
-                                     trained_cost_model_file
-                                     )
+    main()

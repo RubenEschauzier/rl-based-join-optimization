@@ -1,9 +1,10 @@
-import concurrent
 import os
 import sys
-import time
+
+from torch_geometric.loader import DataLoader
 
 from src.utils.epinet_utils.epinet_model_utils import inspect_ensemble_params
+from src.utils.training_utils.query_loading_utils import prepare_data
 
 # Get the path of the parent directory (the root of the project)
 # This finds the directory of the current script (__file__), goes up one level ('...'),
@@ -16,10 +17,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.models.model_instantiator import ModelFactory
-from src.utils.tree_conv_utils import get_shared_structure, apply_features_to_structure, \
-    apply_features_to_structure_batched
-from src.models.query_plan_prediction_model import QueryPlansPredictionModel, PlanCostEstimatorSmall, \
-    PlanCostEstimatorTiny
+from src.utils.tree_conv_utils import get_shared_structure, apply_features_to_structure
+from src.models.query_plan_prediction_model import QueryPlansPredictionModel, PlanCostEstimatorTiny, \
+    PlanCostEstimatorFull
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,8 @@ class EpistemicNetwork(nn.Module):
                  ensemble_prior_heads_config=None,
                  mlp_dimension=5,
                  device=torch.device('cpu'),
-                 prior_device=torch.device('cpu')):
+                 prior_device=torch.device('cpu'),
+                 verbose = 0):
         super().__init__()
         self.epi_index_dim = epi_index_dim
         self.cost_estimation_model = cost_estimation_model
@@ -69,8 +70,9 @@ class EpistemicNetwork(nn.Module):
         for plan_cost in ensemble_plan_cost:
             plan_cost.eval()
 
-        total_params_prior = inspect_ensemble_params(ensemble_gnn[0], ensemble_plan_cost[0])
-        print(f"Total parameters in ensemble gnn prior: {total_params_prior*epi_index_dim}")
+        if verbose > 0:
+            total_params_prior = inspect_ensemble_params(ensemble_gnn[0], ensemble_plan_cost[0])
+            print(f"Total parameters in ensemble gnn prior: {total_params_prior*epi_index_dim}")
 
         self.learnable_epinet = nn.Sequential()
         self.ensemble_combined_prior_models = nn.ModuleList([
@@ -122,9 +124,10 @@ class EpistemicNetwork(nn.Module):
             embedded_query_batches.append(prior_model.embed_query_batched(queries))
         return embedded_query_batches
 
-    def prepare_cost_estimation_inputs(self, plans, embedded_query, precomputed_indexes, precomputed_masks,
+    @staticmethod
+    def prepare_cost_estimation_inputs(plans, embedded_query, precomputed_indexes, precomputed_masks,
                                        target_device=None):
-        """Builds tree structures and indices. Meant to be run on CPU workers."""
+        """Builds tree structures and indices. Meant to be run on CPU with possible parallelization"""
         target_device = target_device or embedded_query.device
         join_orders = [plan[0] for plan in plans]
         n_nodes = embedded_query.shape[0]
@@ -137,7 +140,7 @@ class EpistemicNetwork(nn.Module):
         return prepared_trees, prepared_indexes, prepared_masks
 
     def estimate_cost_from_prepared(self, prepared_trees, prepared_indexes, prepared_masks, cost_name='plan_cost'):
-        """Pure PyTorch forward pass. Meant to be run on the GPU server."""
+        """Pure PyTorch forward pass. Meant to be run on the GPU"""
         # Ensure tensors are on the main device (GPU)
         prepared_trees = prepared_trees.to(self.device)
         prepared_indexes = prepared_indexes.to(self.device)
@@ -149,18 +152,54 @@ class EpistemicNetwork(nn.Module):
         )
 
     def estimate_cost_full(self, plans, embedded_query, precomputed_indexes, precomputed_masks, cost_name='plan_cost'):
+        prepared_trees, prepared_indexes, prepared_masks = self.prepare_cost_estimation_inputs(
+            plans, embedded_query, precomputed_indexes, precomputed_masks, target_device=self.device
+        )
+        return self.estimate_cost_from_prepared(prepared_trees, prepared_indexes, prepared_masks, cost_name)
+
+    def prepare_ensemble_prior_inputs(self, plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx):
+        """Builds structures for the ensemble priors. Meant to be run on CPU."""
         join_orders = [plan[0] for plan in plans]
-        n_nodes = embedded_query.shape[0]
+        n_nodes = embedded_query[0][query_idx].shape[0]
 
         gather_indices, prepared_indexes, prepared_masks = get_shared_structure(
-            join_orders, n_nodes, precomputed_indexes,
-            precomputed_masks, self.device
+            join_orders, n_nodes, precomputed_indexes, precomputed_masks, self.prior_device
         )
 
-        prepared_trees = apply_features_to_structure(embedded_query, gather_indices)
-        return self.cost_estimation_model.estimate_cost(
-            prepared_trees, prepared_indexes, prepared_masks,
-            cost_name=cost_name
+        prepared_trees_list = []
+        for i in range(self.epi_index_dim):
+            current_features = embedded_query[i][query_idx].to(self.prior_device)
+            prepared_trees = apply_features_to_structure(current_features, gather_indices)
+            prepared_trees_list.append(prepared_trees)
+
+        return prepared_trees_list, prepared_indexes, prepared_masks
+
+    def compute_ensemble_prior_from_prepared(self, prepared_trees_list, prepared_indexes, prepared_masks,
+                                             cost_name='plan_cost'):
+        """Pure PyTorch forward pass for priors. Runs on CPU, returns to main device."""
+        with torch.no_grad():
+            num_plans = prepared_trees_list[0].shape[0]
+            num_ensembles = self.epi_index_dim
+
+            # The output tensor should live on the main device (GPU) to combine with the MLP outputs later
+            estimated_cost_priors = torch.zeros((num_ensembles, num_plans), device=self.device)
+
+            for i in range(num_ensembles):
+                est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
+                    prepared_trees_list[i], prepared_indexes, prepared_masks, cost_name=cost_name
+                )
+                est_cost_t = est_cost.transpose(0, 1)
+                estimated_cost_priors[i] = est_cost_t.to(self.device)  # Move to main device here
+
+        return estimated_cost_priors
+
+    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx,
+                               cost_name='plan_cost'):
+        prepared_trees_list, prepared_indexes, prepared_masks = self.prepare_ensemble_prior_inputs(
+            plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx
+        )
+        return self.compute_ensemble_prior_from_prepared(
+            prepared_trees_list, prepared_indexes, prepared_masks, cost_name
         )
 
     def forward(self):
@@ -226,44 +265,6 @@ class EpistemicNetwork(nn.Module):
         epinet_output = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
         return epinet_output
 
-    def compute_ensemble_prior(self, plans, embedded_query,
-                               precomputed_indexes, precomputed_masks,
-                               query_idx, cost_name='plan_cost'):
-        with torch.no_grad():
-            num_plans = len(plans)
-            num_ensembles = self.epi_index_dim
-            join_orders = [plan[0] for plan in plans]
-
-            # Determine query size from the first ensemble's embedding
-            n_nodes = embedded_query[0][query_idx].shape[0]
-
-            # Each query has same gather_indices, indexes and masks. So precompute
-            gather_indices, prepared_indexes, prepared_masks = get_shared_structure(
-                join_orders, n_nodes, precomputed_indexes,
-                precomputed_masks, self.device
-            )
-
-            # (epi_index, n_plans)
-            estimated_cost_priors = torch.zeros((self.epi_index_dim, num_plans), device=self.device)
-
-            # Precompute tree structure as this is fixed between epinet dimensions
-            for i in range(num_ensembles):
-                # i-th ensemble features: (n_nodes, channels)
-                current_features = embedded_query[i][query_idx]
-
-                # Fast feature mapping using the shared 'gather_indices' blueprint
-                prepared_trees = apply_features_to_structure(current_features, gather_indices)
-
-                # Est_cost: (n_plans, 1)
-                est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
-                    prepared_trees, prepared_indexes, prepared_masks, cost_name=cost_name
-                )
-                # Est_cost: (1, n_plans)
-                est_cost_t = est_cost.transpose(0,1)
-                estimated_cost_priors[i] = est_cost_t
-
-        return estimated_cost_priors
-
     def sample_epistemic_indexes(self):
         return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
 
@@ -300,7 +301,6 @@ class EpistemicNetwork(nn.Module):
         if load_only_cost_model:
             # Scenario: We only want to load weights into self.cost_estimation_model
 
-            # Case A: The file is a full Epinet checkpoint (has 'state_dict' key)
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
                 full_state = checkpoint['state_dict']
                 prefix = "cost_estimation_model."
@@ -313,7 +313,6 @@ class EpistemicNetwork(nn.Module):
                 }
                 self.cost_estimation_model.load_state_dict(cost_model_state, strict=True)
 
-            # Case B: The file is a raw state dict for the cost model
             else:
                 self.cost_estimation_model.load_state_dict(checkpoint, strict=True)
 
@@ -324,3 +323,80 @@ class EpistemicNetwork(nn.Module):
             else:
                 raise ValueError("Checkpoint does not contain 'state_dict'. It might be a raw cost model file.")
 
+
+def prepare_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_dimension, device,
+                  model_weights=None, cost_only=False):
+    heads_config = {
+        'query_total_rows': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        },
+        'join_rows': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        },
+        'latency': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        }
+    }
+    heads_config_prior = {
+        'query_total_rows': {
+            'layer': nn.Linear(5, 1),
+        },
+        'join_rows': {
+            'layer': nn.Linear(5, 1),
+        },
+        'latency': {
+            'layer': nn.Linear(5, 1),
+        }
+    }
+
+    model_factory_gine_conv = ModelFactory(full_gnn_config)
+    embedding_model_full = model_factory_gine_conv.load_gine_conv()
+
+    # Training on frozen backbone (we still train the plan estimator gnns)
+    embedding_model_full.freeze_model()
+
+    cost_net_full = PlanCostEstimatorFull(
+        heads_config, device, mlp_output_dim=mlp_dimension
+    )
+    combined_model_full = QueryPlansPredictionModel(embedding_model_full, cost_net_full, device)
+    epinet_cost_estimation = EpistemicNetwork(epinet_index_dim, config_ensemble_prior, combined_model_full,
+                                              ensemble_prior_heads_config=heads_config_prior, device=device)
+    epinet_cost_estimation.to(device)
+    if model_weights:
+        epinet_cost_estimation.load_epinet(model_weights, load_only_cost_model=cost_only)
+        print(f"Initialized weights from {model_weights}")
+    return epinet_cost_estimation
+
+if __name__ == "__main__":
+    queries_loc = "data/generated_queries/star_yago_gnce/dataset_train"
+    endpoint_location = "http://localhost:8888"
+    queries_location_train = "data/generated_queries/star_yago_gnce/dataset_train"
+    queries_location_val = "data/generated_queries/star_yago_gnce/dataset_val"
+    rdf2vec_vector_location = "data/rdf2vec_embeddings/yago_gnce/model.json"
+    occurrences_location = "data/term_occurrences/yago_gnce/occurrences.json"
+    tp_cardinality_location = "data/term_occurrences/yago_gnce/tp_cardinalities.json"
+
+    model_config_emb = "experiments/model_configs/policy_networks/t_cv_repr_exact_cardinality_head_own_embeddings.yaml"
+
+    model_config_prior = "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
+    trained_cost_model_file = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost-12-02-2026-17-17-13/epoch-25/model/epinet_model.pt"
+
+    train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
+                                              rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
+    loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+
+    def find_query(query_loader, query_str):
+        for query in loader:
+            if query.query[0] == query_str:
+                return query
+        raise ValueError(f"Query {query_str} not found")
+
+    find_str = "SELECT * WHERE {  ?s <http://example.com/13000080> <http://example.com/6957478> .  ?s <http://example.com/13000080> <http://example.com/7052642> .  ?s <http://example.com/13000080> <http://example.com/11351711> .  ?s <http://example.com/13000089> <http://example.com/1916054> .  ?s <http://example.com/13000080> ?o4 . ?s <http://example.com/13000080> ?o5 . ?s <http://example.com/13000080> ?o6 . ?s ?p7 ?o7 . }"
+    query_to_investigate = find_query(loader, find_str)
+    query_to_investigate_as_list = query_to_investigate[0]
+    plans_to_investigate = [[4,7,5,6,0,2,1,3], [4,7,5,6,2,0,1,3]]
+
+    epinet_cost_estimation = prepare_model(model_config_emb, model_config_prior, 32, 64, 'cpu')
+    embedded = epinet_cost_estimation.embed_query_batched(query_to_investigate)
+    embedded_numpy = embedded[0].detach().numpy()
+    test = 5
