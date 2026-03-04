@@ -1,30 +1,9 @@
-# First train the model on (query, plan, estimated_cost) tuples (like we already do), use those epistemic neural nets
-#   - Create an entire dataset in advance and then normalize it to be between 0 and 1
-#   - Use only optimal reward for a given sub plan after augmentation
-# Then create candidate plans in batches for real query latency prediction based on quantiles of the epistemic
-# neural nets and quantile beam search.
-#   - Select k beams per quantile with z full plans per beam
-#   - Select n quantiles to search, so for n=3 highest 25 quantile performance, highest 50 quantile,
-#   and highest 75 quantile and highest average value.
-# We will use an adapted version of safe exploration from balsa:
-#   - Prefer plans with highest 75 quantile performance
-#   - Then investigate plans with 50 quantile
-#   - Etc
-# Execute these queries, record latency.
-#   - Cache (query, plan, latency)
-#   - Track execution times found for normalization between 0 and 1
-#   - Augment data for sub plans, but ensure the best plan is used for reward of that sub plan
-#   - Do adaptive timeouts by tracking execution times per query
-import time
-from datetime import datetime
-import itertools
 import os
 import sys
 
 import hydra
 import numpy as np
 import optuna
-from joblib import Parallel, delayed
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -50,9 +29,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from main import find_best_epoch_directory
-from src.baselines.enumeration import build_adj_list, JoinOrderEnumerator
 from src.models.model_instantiator import ModelFactory
-from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset, prepare_data
 from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
@@ -349,7 +326,7 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                         sigma=sigma, alpha_mlp=alpha_mlp, alpha_ensemble=alpha_ensemble,
                         generator=generator)
 
-    for epoch in range(1,n_epochs+1):
+    for epoch in range(1, n_epochs+1):
         query_loss_epoch = []
         for k, queries in tqdm(enumerate(loader), total=len(loader)):
             optimizer.zero_grad()

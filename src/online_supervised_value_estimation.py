@@ -7,9 +7,7 @@ from typing import List, Tuple, Any, TypedDict
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
-from src.models.epistemic_neural_network import EpistemicNetwork, prepare_model
-from src.models.model_instantiator import ModelFactory
-from src.models.query_plan_prediction_model import PlanCostEstimatorFull, QueryPlansPredictionModel
+from src.models.epistemic_neural_network import prepare_epinet_model
 from src.query_environments.qlever.qlever_execute_query_default import QLeverOptimizerClient
 from src.utils.epinet_utils.disk_cache_frozen_representations import DiskCacheFrozenRepresentations
 from src.utils.training_utils.query_loading_utils import prepare_data
@@ -244,7 +242,6 @@ def prepare_experiment(endpoint_location, queries_location_train, queries_locati
 
 
 def beam_search(query: Any, agent: AbstractCostAgent, beam_width: int) -> List[Candidate]:
-    test = query.query[0]
     # Get all variables per triple pattern to filter out cross-products
     tp_query = query.triple_patterns[0]
     variables_query = []
@@ -415,7 +412,7 @@ def main_train(queries_train,
     num_workers = 1
 
     # Create the model here once to obtain the state_dict to pass to the workers
-    initial_model = prepare_model(**model_kwargs, device=gpu_device)
+    initial_model = prepare_epinet_model(**model_kwargs, device=gpu_device)
     shared_state_dict = initial_model.state_dict()
 
     # create the queue passing query to cpu workers
@@ -431,7 +428,7 @@ def main_train(queries_train,
 
     handler_kwargs = {
         # Function that builds the model
-        "model_builder_fn": prepare_model,
+        "model_builder_fn": prepare_epinet_model,
         "model_kwargs": model_kwargs,
         "state_dict": shared_state_dict,
         # GPU to run on
@@ -449,7 +446,7 @@ def main_train(queries_train,
     for i in range(num_workers):
         p = mp.Process(
             target=cpu_search_worker_epinet,
-            args=(prepare_model, model_kwargs, shared_state_dict,
+            args=(prepare_epinet_model, model_kwargs, shared_state_dict,
                   i, query_queue, plan_queue, inference_queue, result_queues[i],
                   disk_cache, precomputed_indexes, precomputed_masks,
                   alpha_mlp, alpha_ensemble, beam_width)
@@ -545,13 +542,40 @@ def main_online_estimation_experiment(endpoint_location, queries_location_train,
     embedded_query_cache = DiskCacheFrozenRepresentations('frozen_query_embeddings.h5')
     query_plan_cache = DiskCacheFrozenRepresentations('frozen_query_plans.h5')
 
+    heads_config = {
+        'query_total_rows': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        },
+        'join_rows': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        },
+        'latency': {
+            'layer': nn.Linear(mlp_dimension, 1),
+        }
+    }
+    heads_config_prior = {
+        'query_total_rows': {
+            'layer': nn.Linear(5, 1),
+        },
+        'join_rows': {
+            'layer': nn.Linear(5, 1),
+        },
+        'latency': {
+            'layer': nn.Linear(5, 1),
+        }
+    }
+
+
     model_kwargs = {
         "full_gnn_config": full_gnn_config,
         "config_ensemble_prior": config_ensemble_prior,
+        "heads_config": heads_config,
+        "heads_config_prior": heads_config_prior,
         "epinet_index_dim": epinet_index_dim,
         "mlp_dimension": mlp_dimension,
         "model_weights": trained_epinet_location
     }
+
     main_train(queries_train,
                client,
                model_kwargs,

@@ -324,36 +324,17 @@ class EpistemicNetwork(nn.Module):
                 raise ValueError("Checkpoint does not contain 'state_dict'. It might be a raw cost model file.")
 
 
-def prepare_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_dimension, device,
-                  model_weights=None, cost_only=False):
-    heads_config = {
-        'query_total_rows': {
-            'layer': nn.Linear(mlp_dimension, 1),
-        },
-        'join_rows': {
-            'layer': nn.Linear(mlp_dimension, 1),
-        },
-        'latency': {
-            'layer': nn.Linear(mlp_dimension, 1),
-        }
-    }
-    heads_config_prior = {
-        'query_total_rows': {
-            'layer': nn.Linear(5, 1),
-        },
-        'join_rows': {
-            'layer': nn.Linear(5, 1),
-        },
-        'latency': {
-            'layer': nn.Linear(5, 1),
-        }
-    }
-
+def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_dimension,
+                         heads_config, heads_config_prior,
+                         device,
+                         model_weights=None, cost_only=False,
+                         freeze_embedding=True):
     model_factory_gine_conv = ModelFactory(full_gnn_config)
     embedding_model_full = model_factory_gine_conv.load_gine_conv()
 
-    # Training on frozen backbone (we still train the plan estimator gnns)
-    embedding_model_full.freeze_model()
+    if freeze_embedding:
+        # Training on frozen backbone (we still train the plan estimator gnns)
+        embedding_model_full.freeze_model()
 
     cost_net_full = PlanCostEstimatorFull(
         heads_config, device, mlp_output_dim=mlp_dimension
@@ -364,7 +345,10 @@ def prepare_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_
     epinet_cost_estimation.to(device)
     if model_weights:
         epinet_cost_estimation.load_epinet(model_weights, load_only_cost_model=cost_only)
-        print(f"Initialized weights from {model_weights}")
+        if cost_only:
+            print(f"Initialized cost model weights from {model_weights}")
+        else:
+            print(f"Initialized weights from {model_weights}")
     return epinet_cost_estimation
 
 if __name__ == "__main__":
@@ -396,7 +380,7 @@ if __name__ == "__main__":
     query_to_investigate_as_list = query_to_investigate[0]
     plans_to_investigate = [[4,7,5,6,0,2,1,3], [4,7,5,6,2,0,1,3]]
 
-    epinet_cost_estimation = prepare_model(model_config_emb, model_config_prior, 32, 64, 'cpu')
-    embedded = epinet_cost_estimation.embed_query_batched(query_to_investigate)
+    epinet_cost_estimation_test = prepare_epinet_model(model_config_emb, model_config_prior, 32, 64, 'cpu')
+    embedded = epinet_cost_estimation_test.embed_query_batched(query_to_investigate)
     embedded_numpy = embedded[0].detach().numpy()
     test = 5
