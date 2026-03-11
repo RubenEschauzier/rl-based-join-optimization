@@ -199,3 +199,5 @@ data/*
 /large_data
 
 !/data/rdf2vec_embeddings/*/.keep
+
+/.prior_cache

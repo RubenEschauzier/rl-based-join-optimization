@@ -179,6 +179,45 @@ class PlanCostEstimatorFull(BasePlanCostEstimator):
 
         return plan_embedding_nn, attn_pool, mlp, heads
 
+    # # Alternative heavily regularized plan prediction model
+    # def init_model(self, feature_dim, device):
+    #     gate_nn = nn.Sequential(
+    #         nn.Linear(feature_dim, feature_dim // 2),
+    #         nn.LayerNorm(feature_dim // 2),  # Added normalization
+    #         nn.ReLU(),
+    #         nn.Linear(feature_dim // 2, 1)
+    #     ).to(device)
+    #
+    #     plan_embedding_nn = nn.Sequential(
+    #         BinaryTreeConv(200, 200),
+    #         TreeLayerNorm(),
+    #         TreeActivation(nn.ReLU()),
+    #         BinaryTreeConv(200, 100),
+    #         TreeLayerNorm(),
+    #         TreeActivation(nn.ReLU()),
+    #         BinaryTreeConv(100, feature_dim),
+    #         TreeLayerNorm(),  # Added to normalize final encoder output before pooling
+    #     ).to(device)
+    #
+    #     attn_pool = AttentionalAggregation(gate_nn=gate_nn, nn=None).to(device)
+    #
+    #     # Input size is double feature_dim because we concat [Root, Attention_Pool]
+    #     mlp = nn.Sequential(
+    #         nn.Linear(feature_dim * 2, 128),
+    #         nn.LayerNorm(128),  # Added normalization
+    #         nn.ReLU(),
+    #         nn.Linear(128, self.mlp_output_dim),
+    #         nn.LayerNorm(self.mlp_output_dim),  # Added normalization
+    #         nn.ReLU(),  # Note: Ensure downstream heads are purely linear
+    #     ).to(device)
+    #
+    #     heads = nn.ModuleDict()
+    #     for head_name, config in self.heads_config.items():
+    #         heads[head_name] = config['layer'].to(device)
+    #
+    #     return plan_embedding_nn, attn_pool, mlp, heads
+
+
 class PlanCostEstimatorSmall(BasePlanCostEstimator):
     def init_model(self, feature_dim, device):
         gate_nn = nn.Sequential(

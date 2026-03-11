@@ -63,3 +63,4 @@ def plot_calibration(observed, expected, error, save_location=None):
         plt.savefig(save_location)
     else:
         plt.show()
+    plt.close()
