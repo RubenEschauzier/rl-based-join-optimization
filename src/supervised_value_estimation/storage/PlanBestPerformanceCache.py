@@ -1,38 +1,39 @@
-from typing import List
+from typing import List, Optional
 
 
 class PlanBestPerformanceCache:
     def __init__(self):
         self.plan_performance_cache = {}
 
-    def add_execution(self, plan: List[int], query: str, latency: float, total_rows: int):
+    def add_execution(self, plan: List[int], query: str, latency: float, total_rows: int, is_censored: bool = False):
         plan_identifier = self.create_plan_identifier(plan, query)
-        self.add_execution_raw(plan_identifier, latency, total_rows)
+        self.add_execution_raw(plan_identifier, latency, total_rows, is_censored)
 
-    def add_execution_raw(self, plan_identifier, latency: float, total_rows: int):
+    def add_execution_raw(self, plan_identifier, latency: float, total_rows: int, is_censored: bool = False):
         """
-        Function that registers an execution, if it is not the best execution in some way it does nothing
-        :param plan_identifier:
-        :param latency:
-        :param total_rows:
-        :return:
+        Registers an execution. Retains the execution with the lowest latency.
         """
         if plan_identifier in self.plan_performance_cache:
             performance = self.plan_performance_cache[plan_identifier]
-            # Our target is latency, so best plan is determined by this
+
+            # Update if the new execution is strictly faster
             if performance["latency"] > latency:
                 performance["latency"] = latency
-                performance["total_rows"] = total_rows
+                performance["total_cost"] = total_rows
+                performance["is_censored"] = is_censored
+
         else:
-            self.plan_performance_cache[plan_identifier] = { "latency": latency, "total_rows": total_rows }
+            self.plan_performance_cache[plan_identifier] = {
+                "latency": latency,
+                "total_cost": total_rows,
+                "is_censored": is_censored
+            }
 
     def get_target(self, plan: List[int], query: str) -> dict:
         plan_identifier = self.create_plan_identifier(plan, query)
         return self.get_target_raw(plan_identifier)
 
     def get_target_raw(self, plan_identifier) -> dict:
-        # The cache content must always be set as you can only try to construct latencies from plans
-        # that have been executed
         if plan_identifier not in self.plan_performance_cache:
             raise KeyError(f"No plan: {plan_identifier}")
         return self.plan_performance_cache[plan_identifier]

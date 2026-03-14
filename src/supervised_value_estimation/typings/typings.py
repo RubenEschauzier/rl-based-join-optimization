@@ -3,7 +3,7 @@ import numpy as np
 
 Plan = List[int]
 EnvState = TypedDict('EnvState', {
-    'unweighted_ensemble_prior': np.ndarray,
+    'unweighted_ensemble_prior': dict[str, np.ndarray],
     "prepared_trees": np.ndarray,
     "prepared_idx": np.ndarray,
     "prepared_masks": np.ndarray,

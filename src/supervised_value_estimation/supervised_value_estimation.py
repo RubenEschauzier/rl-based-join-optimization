@@ -11,7 +11,7 @@ from tqdm import tqdm
 from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
 
-from src.models.epistemic_neural_network import EpistemicNetwork
+from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork
 from src.models.query_plan_prediction_model import PlanCostEstimatorFull, QueryPlansPredictionModel
 from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
@@ -35,6 +35,7 @@ from src.utils.training_utils.query_loading_utils import load_queries_into_datas
 from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
 import torch
 
+#TODO: Remove all training related to epinet here. Optimize cache-based version should be used.
 
 def prepare_cardinality_estimator(model_config, model_directory=None):
     model_factory_gine_conv = ModelFactory(model_config)
@@ -256,7 +257,7 @@ def validation_step(epoch_train_loss, epoch,
 def train_simulated_cost_model(queries_train, query_plans_train,
                                mean_train, std_train,
                                queries_val, query_plans_val,
-                               epinet_cost_estimation: EpistemicNetwork,
+                               epinet_cost_estimation: MultiHeadEpistemicNetwork,
                                device,
                                query_batch_size, n_epi_indexes_train,
                                # Hyperparameters
@@ -430,7 +431,10 @@ def calculate_loss_epinet(epinet_cost_estimation,
 
     # Both return shape: [n_epi_indexes * n_plans, 1]
     mlp_prior = epinet_cost_estimation.compute_mlp_prior_batched(last_feature, epinet_indexes)
+    mlp_prior = mlp_prior["plan_cost"]
+
     learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp_batched(last_feature, epinet_indexes)
+    learnable_mlp_prior = learnable_mlp_prior["plan_cost"]
 
     # Repeat base network estimates: [n_plans, 1] -> [n_epi_indexes * n_plans, 1]
     estimated_cost_exp = estimated_cost.repeat(n_epi_indexes, 1)
@@ -532,7 +536,7 @@ def main_supervised_value_estimation(cfg: DictConfig):
         heads_config, device, mlp_output_dim=cfg.hyperparameters.mlp_dimension
     )
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
-    epinet_cost_estimation = EpistemicNetwork(
+    epinet_cost_estimation = MultiHeadEpistemicNetwork(
         cfg.hyperparameters.epinet_index_dim, cfg.models.epinet.prior_config, combined_model, device=device
     )
 

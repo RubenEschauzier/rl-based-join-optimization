@@ -9,7 +9,8 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
                  inference_queue, result_queue, worker_id,
                  disk_cache,
                  precomputed_indexes, precomputed_masks,
-                 alpha_mlp, alpha_ensemble):
+                 alpha_mlp, alpha_ensemble,
+                 head_name = "plan_cost"):
         self.model = model
         self.inference_queue = inference_queue
         self.result_queue = result_queue
@@ -19,6 +20,7 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         self.precomputed_masks = precomputed_masks
         self.alpha_mlp = alpha_mlp
         self.alpha_ensemble = alpha_ensemble
+        self.head_name = head_name
 
     def setup_episode(self, query):
         """
@@ -61,18 +63,17 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
             self.precomputed_masks, query_idx=query_state["query_idx"]
         )
 
-        # TODO: These priors should return all heads or at least latency and query_total_rows
         unweighted_priors = self.model.compute_ensemble_prior_from_prepared(
-            prior_trees, prior_idx, prior_masks, cost_name='plan_cost'
+            prior_trees, prior_idx, prior_masks
         )
 
-        ensemble_prior = torch.matmul(query_state["z"], unweighted_priors).view(-1, 1)
+        ensemble_prior = torch.matmul(query_state["z"], unweighted_priors[self.head_name]).view(-1, 1)
 
         # Get GPU cost estimates
         gpu_results = self.result_queue.get()
-        est_cost = gpu_results["est_cost"]
-        mlp_prior = gpu_results["mlp_prior"]
-        learnable_mlp = gpu_results["learnable_mlp"]
+        est_cost = gpu_results["est_cost"][self.head_name]
+        mlp_prior = gpu_results["mlp_prior"][self.head_name]
+        learnable_mlp = gpu_results["learnable_mlp"][self.head_name]
 
         # Combine for total output
         epinet_cost = est_cost + learnable_mlp + (self.alpha_mlp * mlp_prior) + (self.alpha_ensemble * ensemble_prior)
@@ -81,7 +82,7 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         environment_state: List[EnvState] = []
         for i, plan in enumerate(formatted_plans):
             environment_state.append({
-                "unweighted_ensemble_prior": unweighted_priors.cpu().numpy()[:,i],
+                "unweighted_ensemble_prior": { key: output.cpu().numpy()[:,i] for key, output in unweighted_priors.items() },
                 "prepared_trees": prep_trees.cpu().numpy()[i],
                 "prepared_idx": prep_idx.cpu().numpy()[i],
                 "prepared_masks": prep_masks.cpu().numpy()[i],

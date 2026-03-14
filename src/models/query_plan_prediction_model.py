@@ -316,10 +316,7 @@ class QueryPlansPredictionModel(nn.Module):
 
     def estimate_cost(self, prepared_trees, prepared_indexes, prepared_masks, cost_name='plan_cost'):
         heads_output, feature = self.query_plan_model.forward(prepared_trees, prepared_indexes, prepared_masks)
-        return heads_output[cost_name], feature
-
-    def estimate_all_heads(self, prepared_trees, prepared_indexes, prepared_masks):
-        return self.query_plan_model.forward(prepared_trees, prepared_indexes,  prepared_masks)
+        return heads_output, feature
 
     def serialize_model(self, model_dir):
         self.query_emb_model.serialize_model(model_dir)

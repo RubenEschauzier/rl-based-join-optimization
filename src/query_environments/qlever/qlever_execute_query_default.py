@@ -15,7 +15,20 @@ class QLeverOptimizerClient:
         self.query_timeouts = {}
         self.default_timeout = "60s"
         self.default_timeout_s = 60
+        self._session: aiohttp.ClientSession | None = None
 
+    async def create_session(self):
+        self._session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            raise RuntimeError("Session not initialized — call create_session() first")
+        return self._session
 
     async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s") -> dict:
         """
@@ -37,36 +50,36 @@ class QLeverOptimizerClient:
             # "query": formatted_query,
             "timeout": timeout
         }
-        async with aiohttp.ClientSession() as session:
-            try:
-                # Note: Sending query as data with the sparql-query content type
-                # is the most robust way to handle large queries.
-                async with session.post(self.http_endpoint, params=params, headers=headers,
-                                        data=formatted_query) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        time_total = result.get("time", {}).get("total", "0ms")
+        session = await self._get_session()
+        try:
+            # Note: Sending query as data with the sparql-query content type
+            # is the most robust way to handle large queries.
+            async with session.post(self.http_endpoint, params=params, headers=headers,
+                                    data=formatted_query) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    time_total = result.get("time", {}).get("total", "0ms")
 
-                        # Tighten bounds on successful execution
-                        if time_total != "0ms":
-                            time_in_seconds = self.decode_to_seconds(time_total)
-                            self.query_timeouts[query_obj.query] = max(min((time_in_seconds * 2), self.default_timeout_s), 5)
+                    # Tighten bounds on successful execution
+                    if time_total != "0ms":
+                        time_in_seconds = self.decode_to_seconds(time_total)
+                        self.query_timeouts[query_obj.query] = max(min((time_in_seconds * 2), self.default_timeout_s), 5)
 
-                        return {
-                            "success": True,
-                            "results": result.get("res", []),
-                            "runtime_info": result.get("runtimeInformation", {}),
-                            "query_plan": result.get("queryExecutionPlan", ""),
-                            "time_total": result.get("time", {}).get("total", "0ms")
-                        }
-                    else:
-                        error_text = await response.text()
-                        return {"success": False, "error": error_text}
+                    return {
+                        "success": True,
+                        "results": result.get("res", []),
+                        "runtime_info": result.get("runtimeInformation", {}),
+                        "query_plan": result.get("queryExecutionPlan", ""),
+                        "time_total": result.get("time", {}).get("total", "0ms")
+                    }
+                else:
+                    error_text = await response.text()
+                    return {"success": False, "error": error_text}
 
-            except asyncio.TimeoutError:
-                return {"success": False, "error": "Query timed out"}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Query timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def _walk_tree(self, node: dict, join_sequence: list):
         """Recursively extracts Join operations via post-order traversal."""
@@ -111,15 +124,6 @@ class QLeverOptimizerClient:
 
     def _extract_join_sequence_fallback(self, parsed_qlever_result: dict) -> list:
         """Parses joins from an error or timeout payload."""
-        # try:
-        #     parsed_result = json.loads(qlever_result)
-        # except json.decoder.JSONDecodeError:
-        #     print("Failed to decode JSON:")
-        #     print(qlever_result)
-        #     return []
-        # if "runtimeInformation" not in parsed_result:
-        #     return []
-
         root_node = parsed_qlever_result["runtimeInformation"]
         join_sequence = []
         self._walk_tree(root_node, join_sequence)

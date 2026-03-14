@@ -6,8 +6,8 @@ from typing import Tuple, Union, NamedTuple, Any
 
 from numpy.dtypes import StringDType
 
-@dataclass
-class ExecutionBufferSamples(NamedTuple):
+@dataclass(frozen=True)
+class ExecutionBufferSamples:
     queries: np.ndarray
     join_plans: np.ndarray
     prepared_trees: np.ndarray
@@ -16,15 +16,17 @@ class ExecutionBufferSamples(NamedTuple):
     unweighted_ensemble_priors: np.ndarray
     episode_zs: torch.Tensor
     intermediate_join_sizes: torch.Tensor
-    is_valid_sizes: torch.Tensor
+    is_valid_size: torch.Tensor
+    is_valid_episode: torch.Tensor
     c_vectors: torch.Tensor
     weights: torch.Tensor
     indices: torch.Tensor
 
-@dataclass
+@dataclass(frozen=True)
 class ExecutionBufferSamplesWithTargets(ExecutionBufferSamples):
     total_cost: torch.Tensor
     latencies: torch.Tensor
+    is_censored: torch.Tensor
 
 class ExecutionReplayBuffer:
 
@@ -57,16 +59,17 @@ class ExecutionReplayBuffer:
         self.query_strings = np.empty((self.buffer_size,), dtype=StringDType())
         self.episode_zs = np.zeros((self.buffer_size, epi_index_dim), dtype=np.float32)
         self.intermediate_join_sizes = np.zeros((self.buffer_size, 1), dtype=np.float32)
-        self.is_valid_sizes = np.zeros((self.buffer_size, 1), dtype=bool)
+        self.is_valid_size = np.zeros((self.buffer_size, 1), dtype=bool)
+        self.is_valid_episode = np.zeros((self.buffer_size, 1), dtype=bool)
         self.c_vectors = np.zeros((self.buffer_size, 2, 1, epi_index_dim), dtype=np.float32)
         self.priorities = np.zeros((self.buffer_size,), dtype=np.float32)
-        self.unweighted_ensemble_priors = np.empty((self.buffer_size, epi_index_dim), dtype=np.float32)
 
         # Variable-size NumPy arrays (Object pointers)
         self.join_plans = np.empty((self.buffer_size,), dtype=object)
         self.prepared_trees = np.empty((self.buffer_size,), dtype=object)
         self.prepared_idx = np.empty((self.buffer_size,), dtype=object)
         self.prepared_masks = np.empty((self.buffer_size,), dtype=object)
+        self.unweighted_ensemble_priors = np.empty((self.buffer_size,), dtype=object)
 
         self.pos = 0
         self.full = False
@@ -82,6 +85,7 @@ class ExecutionReplayBuffer:
             episode_z: np.ndarray,
             intermediate_join_size: float,
             is_valid_size: bool,
+            is_valid_episode: bool,
             c_vectors_observation: np.ndarray,
             error: float = None,
             uncertainty: float = None,
@@ -98,7 +102,8 @@ class ExecutionReplayBuffer:
         self.query_strings[self.pos] = query_string
         self.episode_zs[self.pos] = episode_z
         self.intermediate_join_sizes[self.pos] = intermediate_join_size
-        self.is_valid_sizes[self.pos] = is_valid_size
+        self.is_valid_size[self.pos] = is_valid_size
+        self.is_valid_episode[self.pos] = is_valid_episode
         self.c_vectors[self.pos] = c_vectors_observation
 
         if self.use_per and error is not None and uncertainty is not None:
@@ -125,7 +130,7 @@ class ExecutionReplayBuffer:
             weights = np.ones(batch_size, dtype=np.float32)
 
         return ExecutionBufferSamples(
-            queries = self.query_strings[indices],
+            queries=self.query_strings[indices],
             join_plans=self.join_plans[indices],
             prepared_trees=self.prepared_trees[indices],
             prepared_idx=self.prepared_idx[indices],
@@ -133,7 +138,8 @@ class ExecutionReplayBuffer:
             unweighted_ensemble_priors=self.unweighted_ensemble_priors[indices],
             episode_zs=self._to_torch(self.episode_zs[indices]),
             intermediate_join_sizes=self._to_torch(self.intermediate_join_sizes[indices]),
-            is_valid_sizes=self._to_torch(self.is_valid_sizes[indices]),
+            is_valid_size=self._to_torch(self.is_valid_size[indices]),
+            is_valid_episode=self._to_torch(self.is_valid_episode[indices]),
             c_vectors=self._to_torch(self.c_vectors[indices]),
             weights=self._to_torch(weights),
             indices=self._to_torch(indices)

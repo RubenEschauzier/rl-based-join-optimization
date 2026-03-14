@@ -24,14 +24,14 @@ from src.models.query_plan_prediction_model import QueryPlansPredictionModel, Pl
 import torch
 import torch.nn as nn
 
-class EpistemicNetwork(nn.Module):
+class MultiHeadEpistemicNetwork(nn.Module):
     def __init__(self,
                  epi_index_dim, prior_config,
                  cost_estimation_model: QueryPlansPredictionModel,
                  ensemble_prior_heads_config=None,
+                 head_names=None,
                  mlp_dimension=5,
                  device=torch.device('cpu'),
-                 prior_device=torch.device('cpu'),
                  verbose = 0):
         super().__init__()
         self.epi_index_dim = epi_index_dim
@@ -58,6 +58,7 @@ class EpistemicNetwork(nn.Module):
                     'layer': torch.nn.Linear(mlp_dimension, 1),
                 }
             }
+        self.head_names = list(ensemble_prior_heads_config.keys())
 
         ensemble_gnn = [model_factory_gine_conv.load_gine_conv().to(device) for _ in range(epi_index_dim)]
         for gnn in ensemble_gnn:
@@ -74,46 +75,56 @@ class EpistemicNetwork(nn.Module):
             total_params_prior = inspect_ensemble_params(ensemble_gnn[0], ensemble_plan_cost[0])
             print(f"Total parameters in ensemble gnn prior: {total_params_prior*epi_index_dim}")
 
-        self.learnable_epinet = nn.Sequential()
         self.ensemble_combined_prior_models = nn.ModuleList([
             QueryPlansPredictionModel(ensemble_gnn[i], ensemble_plan_cost[i], device)
             for i in range(epi_index_dim)
         ])
         self.ensemble_combined_prior_models.apply(init_weights)
-
-        # The learnable and fixed MLPs should have same config all three parts should have same output dimension
-        self.learnable_epinet = nn.Sequential(
-            nn.Linear(self.mlp_output_dim_cost_model+epi_index_dim, self.mlp_output_dim_cost_model//2),
-            nn.ReLU(),
-        ).to(device)
-
-        # Initialize the last layer to always output zero from learnable.
-        last_layer = nn.Linear(self.mlp_output_dim_cost_model//2, epi_index_dim)
-        nn.init.zeros_(last_layer.weight)
-        nn.init.zeros_(last_layer.bias)
-        self.learnable_epinet.apply(init_weights)
-        self.learnable_epinet.add_module("last_layer", last_layer)
-
-        # Prior MLP should just be Glorot initialized
-        self.prior_epinet = nn.Sequential(
-            nn.Linear(self.mlp_output_dim_cost_model+epi_index_dim, self.mlp_output_dim_cost_model//2),
-            nn.ReLU(),
-            nn.Linear(self.mlp_output_dim_cost_model//2, epi_index_dim),
-        ).to(device)
-
-        # self.prior_epinet = nn.Sequential(
-        #     nn.Linear(200 + epi_index_dim, 10),
-        #     nn.ReLU(),
-        #     nn.Linear(10, 1)
-        # ).to(device)
-        self.prior_epinet.apply(init_weights)
-
-        for param in self.prior_epinet.parameters():
-            param.requires_grad = False
-
         for combined_prior in self.ensemble_combined_prior_models:
             for param in combined_prior.parameters():
                 param.requires_grad = False
+
+        # Initialize learnable epinet with bae feature extractor and multiple heads
+        self.learnable_epinet_features = nn.Sequential(
+            nn.Linear(self.mlp_output_dim_cost_model + epi_index_dim, self.mlp_output_dim_cost_model // 2),
+            nn.ReLU(),
+        ).to(device)
+        self.learnable_epinet_features.apply(init_weights)
+
+        self.learnable_epinet_heads = nn.ModuleDict()
+        for head_name in self.head_names:
+            head_layer = nn.Linear(self.mlp_output_dim_cost_model // 2, epi_index_dim)
+            nn.init.zeros_(head_layer.weight)
+            nn.init.zeros_(head_layer.bias)
+            self.learnable_epinet_heads[head_name] = head_layer.to(device)
+        # # Initialize the last layer to always output zero from learnable.
+        # last_layer = nn.Linear(self.mlp_output_dim_cost_model//2, epi_index_dim)
+        # nn.init.zeros_(last_layer.weight)
+        # nn.init.zeros_(last_layer.bias)
+        # self.learnable_epinet.apply(init_weights)
+        # self.learnable_epinet.add_module("last_layer", last_layer)
+
+        # Prior MLP should just be Glorot initialized
+        self.prior_epinet_features = nn.Sequential(
+            nn.Linear(self.mlp_output_dim_cost_model + epi_index_dim, self.mlp_output_dim_cost_model // 2),
+            nn.ReLU(),
+        ).to(device)
+        self.prior_epinet_features.apply(init_weights)
+
+        # Freeze prior features
+        for param in self.prior_epinet_features.parameters():
+            param.requires_grad = False
+
+        self.prior_epinet_heads = nn.ModuleDict()
+        for head_name in self.head_names:
+            prior_head = nn.Linear(self.mlp_output_dim_cost_model // 2, epi_index_dim)
+            prior_head.apply(init_weights)
+
+            # Freeze prior head
+            for param in prior_head.parameters():
+                param.requires_grad = False
+
+            self.prior_epinet_heads[head_name] = prior_head.to(device)
 
     def embed_query_batched(self, queries):
         return self.cost_estimation_model.embed_query_batched(queries)
@@ -139,23 +150,26 @@ class EpistemicNetwork(nn.Module):
         prepared_trees = apply_features_to_structure(embedded_query, gather_indices)
         return prepared_trees, prepared_indexes, prepared_masks
 
-    def estimate_cost_from_prepared(self, prepared_trees, prepared_indexes, prepared_masks, cost_name='plan_cost'):
-        """Pure PyTorch forward pass. Meant to be run on the GPU"""
-        # Ensure tensors are on the main device (GPU)
-        prepared_trees = prepared_trees.to(self.device)
-        prepared_indexes = prepared_indexes.to(self.device)
-        prepared_masks = prepared_masks.to(self.device)
-
-        return self.cost_estimation_model.estimate_cost(
-            prepared_trees, prepared_indexes, prepared_masks,
-            cost_name=cost_name
+    def _move_to_device(self, trees, indexes, masks):
+        return (
+            trees.to(self.device),
+            indexes.to(self.device),
+            masks.to(self.device)
         )
 
-    def estimate_cost_full(self, plans, embedded_query, precomputed_indexes, precomputed_masks, cost_name='plan_cost'):
+    def estimate_cost_from_prepared(self, prepared_trees, prepared_indexes, prepared_masks):
+        """Forward pass for a specific head."""
+        trees, indexes, masks = self._move_to_device(prepared_trees, prepared_indexes, prepared_masks)
+
+        return self.cost_estimation_model.estimate_cost(
+            trees, indexes, masks
+        )
+
+    def estimate_cost_full(self, plans, embedded_query, precomputed_indexes, precomputed_masks):
         prepared_trees, prepared_indexes, prepared_masks = self.prepare_cost_estimation_inputs(
             plans, embedded_query, precomputed_indexes, precomputed_masks, target_device=self.device
         )
-        return self.estimate_cost_from_prepared(prepared_trees, prepared_indexes, prepared_masks, cost_name)
+        return self.estimate_cost_from_prepared(prepared_trees, prepared_indexes, prepared_masks)
 
     def prepare_ensemble_prior_inputs(self, plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx):
         """Builds structures for the ensemble priors. Meant to be run on CPU."""
@@ -174,32 +188,31 @@ class EpistemicNetwork(nn.Module):
 
         return prepared_trees_list, prepared_indexes, prepared_masks
 
-    def compute_ensemble_prior_from_prepared(self, prepared_trees_list, prepared_indexes, prepared_masks,
-                                             cost_name='plan_cost'):
+    def compute_ensemble_prior_from_prepared(self, prepared_trees_list, prepared_indexes, prepared_masks):
         """Pure PyTorch forward pass for priors. Runs on CPU, returns to main device."""
         with torch.no_grad():
             num_plans = prepared_trees_list[0].shape[0]
             num_ensembles = self.epi_index_dim
 
-            # The output tensor should live on the main device (GPU) to combine with the MLP outputs later
-            estimated_cost_priors = torch.zeros((num_ensembles, num_plans), device=self.device)
+            estimated_cost_priors = { key: torch.zeros((num_ensembles, num_plans), device=self.device)
+                                     for key in self.head_names }
 
             for i in range(num_ensembles):
                 est_cost, _ = self.ensemble_combined_prior_models[i].estimate_cost(
-                    prepared_trees_list[i], prepared_indexes, prepared_masks, cost_name=cost_name
+                    prepared_trees_list[i], prepared_indexes, prepared_masks
                 )
-                est_cost_t = est_cost.transpose(0, 1)
-                estimated_cost_priors[i] = est_cost_t.to(self.device)  # Move to main device here
+                for key, output in est_cost.items():
+                    output_t = output.transpose(0, 1)
+                    estimated_cost_priors[key][i] = output_t.to(self.device)
 
         return estimated_cost_priors
 
-    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx,
-                               cost_name='plan_cost'):
+    def compute_ensemble_prior(self, plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx):
         prepared_trees_list, prepared_indexes, prepared_masks = self.prepare_ensemble_prior_inputs(
             plans, embedded_query, precomputed_indexes, precomputed_masks, query_idx
         )
         return self.compute_ensemble_prior_from_prepared(
-            prepared_trees_list, prepared_indexes, prepared_masks, cost_name
+            prepared_trees_list, prepared_indexes, prepared_masks
         )
 
     def forward(self):
@@ -221,36 +234,46 @@ class EpistemicNetwork(nn.Module):
 
     def compute_mlp_prior(self, last_feature, epi_index):
         concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
-        mlp_output = self.prior_epinet(concat_input)
-        epinet_output = mlp_output @ epi_index.T
-        return epinet_output
+        shared_features = self.prior_epinet_features(concat_input)
+
+        epinet_outputs = {}
+        for head_name, head_layer in self.prior_epinet_heads.items():
+            mlp_output = head_layer(shared_features)
+            epinet_outputs[head_name] = mlp_output @ epi_index.T
+
+        return epinet_outputs
 
     def compute_learnable_mlp(self, last_feature, epi_index):
         concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
-        mlp_output = self.learnable_epinet(concat_input)
-        epinet_output = mlp_output @ epi_index.T
-        return epinet_output
+        shared_features = self.learnable_epinet_features(concat_input)
 
-    # TODO: Validate this generated code.
+        epinet_outputs = {}
+        for head_name, head_layer in self.learnable_epinet_heads.items():
+            mlp_output = head_layer(shared_features)
+            epinet_outputs[head_name] = mlp_output @ epi_index.T
+
+        return epinet_outputs
+
     def compute_mlp_prior_batched(self, last_feature, epi_indexes):
         n = last_feature.shape[0]
         k = epi_indexes.shape[0]
 
-        # 1. Repeat features K times: [N, F] -> [K*N, F]
-        # Results in: [feat_0, ..., feat_N, feat_0, ..., feat_N, ...]
+        # Repeat features K times: [N, F] -> [K*N, F]
         last_feature_exp = last_feature.repeat(k, 1)
 
-        # 2. Interleave indexes N times: [K, D] -> [K*N, D]
-        # Results in: [z_0, ..., z_0, z_1, ..., z_1, ...]
+        # Interleave indexes N times: [K, D] -> [K*N, D]
         epi_indexes_exp = epi_indexes.repeat_interleave(n, dim=0)
 
-        # 3. Concatenate and pass through MLP
+        # Concatenate and pass through shared feature extractor
         concat_input = torch.cat([last_feature_exp, epi_indexes_exp], dim=1)
-        mlp_output = self.prior_epinet(concat_input)
+        shared_features = self.prior_epinet_features(concat_input)
 
-        # 4. Batched dot product: element-wise multiply then sum along feature dimension
-        epinet_output = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
-        return epinet_output
+        epinet_outputs = {}
+        for head_name, head_layer in self.prior_epinet_heads.items():
+            mlp_output = head_layer(shared_features)
+            epinet_outputs[head_name] = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
+
+        return epinet_outputs
 
     def compute_learnable_mlp_batched(self, last_feature, epi_indexes):
         n = last_feature.shape[0]
@@ -260,10 +283,14 @@ class EpistemicNetwork(nn.Module):
         epi_indexes_exp = epi_indexes.repeat_interleave(n, dim=0)
 
         concat_input = torch.cat([last_feature_exp, epi_indexes_exp], dim=1)
-        mlp_output = self.learnable_epinet(concat_input)
+        shared_features = self.learnable_epinet_features(concat_input)
 
-        epinet_output = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
-        return epinet_output
+        epinet_outputs = {}
+        for head_name, head_layer in self.learnable_epinet_heads.items():
+            mlp_output = head_layer(shared_features)
+            epinet_outputs[head_name] = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
+
+        return epinet_outputs
 
     def sample_epistemic_indexes(self):
         return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
@@ -271,6 +298,19 @@ class EpistemicNetwork(nn.Module):
     def sample_epistemic_indexes_batched(self, n_epi_indexes):
         return torch.randn((n_epi_indexes, self.epi_index_dim), device=self.device)
 
+    def get_learnable_epinet_params(self):
+        """Returns parameters for the learnable MLP features and heads of the Epinet."""
+        params = list(self.learnable_epinet_features.parameters())
+        for head in self.learnable_epinet_heads.values():
+            params.extend(list(head.parameters()))
+        return params
+
+    def get_query_embedding_model_params(self):
+        """Returns parameters for the base GNN query embedding model."""
+        return self.cost_estimation_model.query_emb_model.parameters()
+
+    def get_plan_cost_estimation_model_params(self):
+        return self.cost_estimation_model.query_plan_model.parameters()
 
     def serialize_model(self, model_dir, save_only_cost_model=False):
         """
@@ -291,7 +331,7 @@ class EpistemicNetwork(nn.Module):
             }
             torch.save(checkpoint, os.path.join(model_dir, "epinet_model.pt"))
 
-    def load_epinet(self, path, load_only_cost_model=False):
+    def load_epinet(self, path, load_only_cost_model=False, strict=True):
         """
         Loads the model weights. Can selectively load just the cost model
         even from a full Epinet checkpoint.
@@ -300,7 +340,6 @@ class EpistemicNetwork(nn.Module):
 
         if load_only_cost_model:
             # Scenario: We only want to load weights into self.cost_estimation_model
-
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
                 full_state = checkpoint['state_dict']
                 prefix = "cost_estimation_model."
@@ -311,23 +350,26 @@ class EpistemicNetwork(nn.Module):
                     for k, v in full_state.items()
                     if k.startswith(prefix)
                 }
-                self.cost_estimation_model.load_state_dict(cost_model_state, strict=True)
+                missing, unexpected = self.cost_estimation_model.load_state_dict(cost_model_state, strict=strict)
 
             else:
-                self.cost_estimation_model.load_state_dict(checkpoint, strict=True)
+                missing, unexpected = self.cost_estimation_model.load_state_dict(checkpoint, strict=strict)
 
         else:
             # Scenario: Load the full Epinet
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                self.load_state_dict(checkpoint['state_dict'], strict=True)
+                missing, unexpected = self.load_state_dict(checkpoint['state_dict'], strict=strict)
             else:
                 raise ValueError("Checkpoint does not contain 'state_dict'. It might be a raw cost model file.")
+        if not strict:
+            print(f"Unexpected keys: ${unexpected}")
+            print(f"Missing keys: ${missing}")
 
 
 def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_dimension,
                          heads_config, heads_config_prior,
                          device,
-                         model_weights=None, cost_only=False,
+                         model_weights=None, cost_only=False, strict=True,
                          freeze_embedding=True):
     model_factory_gine_conv = ModelFactory(full_gnn_config)
     embedding_model_full = model_factory_gine_conv.load_gine_conv()
@@ -340,11 +382,11 @@ def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_di
         heads_config, device, mlp_output_dim=mlp_dimension
     )
     combined_model_full = QueryPlansPredictionModel(embedding_model_full, cost_net_full, device)
-    epinet_cost_estimation = EpistemicNetwork(epinet_index_dim, config_ensemble_prior, combined_model_full,
-                                              ensemble_prior_heads_config=heads_config_prior, device=device)
+    epinet_cost_estimation = MultiHeadEpistemicNetwork(epinet_index_dim, config_ensemble_prior, combined_model_full,
+                                                       ensemble_prior_heads_config=heads_config_prior, device=device)
     epinet_cost_estimation.to(device)
     if model_weights:
-        epinet_cost_estimation.load_epinet(model_weights, load_only_cost_model=cost_only)
+        epinet_cost_estimation.load_epinet(model_weights, load_only_cost_model=cost_only, strict=strict)
         if cost_only:
             print(f"Initialized cost model weights from {model_weights}")
         else:

@@ -6,7 +6,7 @@ from datetime import datetime
 from functools import partial
 
 from main import find_best_epoch_directory
-from src.models.epistemic_neural_network import EpistemicNetwork
+from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork
 from src.models.query_plan_prediction_model import PlanCostEstimatorFull, QueryPlansPredictionModel
 from src.supervised_value_estimation import train_simulated_cost_model, prepare_data, prepare_cardinality_estimator
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
@@ -27,7 +27,7 @@ def objective(trial, train_dataset, train_plans, mean_train, std_train,
     print(f"Testing params: {trial.params}")
 
     # 2. Instantiate a fresh epinet for this specific run, wrapping the shared frozen base model
-    epinet_cost_estimation = EpistemicNetwork(
+    epinet_cost_estimation = MultiHeadEpistemicNetwork(
         epi_index_dim=epi_index_dim,
         prior_config=model_config_epistemic_prior,
         cost_estimation_model=combined_model,

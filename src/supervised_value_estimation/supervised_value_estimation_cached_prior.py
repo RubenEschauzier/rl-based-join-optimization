@@ -17,7 +17,7 @@ from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
 
 from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
-from src.models.epistemic_neural_network import EpistemicNetwork, prepare_epinet_model
+from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork, prepare_epinet_model
 from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
@@ -111,6 +111,7 @@ def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epin
                 unweighted_ensemble_prior = epinet.compute_ensemble_prior(
                     plans_current_query, embedded_prior, precomputed_indexes, precomputed_masks, i
                 )
+                unweighted_ensemble_prior = unweighted_ensemble_prior["plan_cost"]
                 cache[q_id] = unweighted_ensemble_prior.cpu()
                 priors[i] = unweighted_ensemble_prior.to(device)
 
@@ -187,6 +188,7 @@ def validate_cached(val_loader, query_plans_val, epinet_cost_estimation, val_cac
                     estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
                         plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
                     )
+                    estimated_cost = estimated_cost['plan_cost']
 
                     val_loss_epinet, repeated_target, epinet_cost_estimates = loss_epinet(
                         unweighted_ensemble_prior,
@@ -252,6 +254,7 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
         estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
             plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
         )
+        estimated_cost = estimated_cost["plan_cost"]
 
         loss_epinet_val, _, _ = loss_epinet(
             unweighted_ensemble_prior,
@@ -284,7 +287,7 @@ def loss_epinet(unweighted_ensemble_priors,
 
     generator.manual_seed(plans[0][2])
     c_vectors = torch.randn((n_plans, epinet_cost_estimation.epi_index_dim), generator=generator, device=device)
-    c_vectors = torch.nn.functional.normalize(c_vectors, dim=1)
+    c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
 
     epinet_indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(n_epi_indexes)
     ensemble_prior = torch.matmul(epinet_indexes, unweighted_ensemble_priors)
@@ -292,7 +295,10 @@ def loss_epinet(unweighted_ensemble_priors,
     ensemble_prior_flat = ensemble_prior.view(-1, 1)
 
     mlp_prior = epinet_cost_estimation.compute_mlp_prior_batched(last_feature, epinet_indexes)
+    mlp_prior = mlp_prior["plan_cost"]
+
     learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp_batched(last_feature, epinet_indexes)
+    learnable_mlp_prior = learnable_mlp_prior["plan_cost"]
 
     estimated_cost_exp = estimated_cost.repeat(n_epi_indexes, 1)
     epinet_estimated_cost = estimated_cost_exp + (
@@ -316,7 +322,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                                   mean_train, std_train,
                                   queries_val, query_plans_val,
                                   model_builder_fn, model_kwargs, model_state_dict,
-                                  epinet_cost_estimation: EpistemicNetwork,
+                                  epinet_cost_estimation: MultiHeadEpistemicNetwork,
                                   device,
                                   query_batch_size, n_epi_indexes_train,
                                   sigma, alpha_mlp, alpha_ensemble, lr, weight_decay, n_epochs,
