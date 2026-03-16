@@ -1,17 +1,15 @@
 import faulthandler
-import math
 
 import numpy as np
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm
 
 from src.models.model_instantiator import ModelFactory
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
 from src.utils.training_utils.training_tracking import TrainSummary
-from src.utils.training_utils.utils import q_error_fn, mixed_mae_q_error_loss
+from src.utils.training_utils.utils import q_error_fn
 
 
 def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
@@ -86,11 +84,6 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
                                            edge_index=batch.edge_index.to(device),
                                            edge_attr=batch.edge_attr.to(device),
                                            batch = batch.batch.to(device))
-
-            # pred = gine_conv_model.forward(x=batch.x.double(),
-            #                                edge_index=batch.edge_index,
-            #                                edge_attr=batch.edge_attr.double(),
-            #                                batch = batch.batch)
             # Assume only one cardinality estimation head
             pred = pred[0]['output'].to(device)
             y = torch.log(batch.y.to(device) + 1)
@@ -128,7 +121,7 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
 def main_pretraining_dataset(queries_location_train, queries_location_val,
                              endpoint_location, rdf2vec_vector_location, writer,
                              feature_type, model_config_location, n_epoch, batch_size, lr, seed,
-                             occurrences_location = None, tp_cardinality_location = None,
+                             occurrences_location = None, tp_cardinality_location = None, multiplicity_location=None,
                              test_queries=None, test_cardinalities=None,
                              to_load=None, device='cpu'
                              ):
@@ -141,7 +134,8 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                                                            to_load=to_load,
                                                            load_mappings=False,
                                                            occurrences_location=occurrences_location,
-                                                           tp_cardinality_location=tp_cardinality_location)
+                                                           tp_cardinality_location=tp_cardinality_location,
+                                                           multiplicity_location=multiplicity_location)
     run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
                             seed, test_queries=test_queries, test_cardinalities=test_cardinalities)
     return train_dataset, val_dataset

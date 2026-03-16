@@ -245,10 +245,12 @@ def main_simulated_training(cfg: DictConfig,
     writer.create_experiment_directory()
 
     # Prepare datasets
-    data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated)
+    data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated,
+                                     max_plans_per_relation=50)
     query_plans_dict = {k: v for d in data for k, v in d.items()}
 
-    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, cfg.dataset.save_loc_simulated_val)
+    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, cfg.dataset.save_loc_simulated_val,
+                                         max_plans_per_relation=50)
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train, std_train = preprocess_plans(query_plans_dict)
@@ -300,7 +302,7 @@ def main_supervised_value_estimation(cfg: DictConfig):
     # Prepare large (20 million parameters) oracle model to estimate cardinality of join plans
     oracle_model = prepare_cardinality_estimator(
         model_config=cfg.models.oracle.config, model_directory=cfg.models.oracle.dir
-    )
+    ).to(device)
 
     # Prepare plan cost estimation models and epinet
     cost_net_attention_pooling = PlanCostEstimatorFull(
@@ -308,22 +310,11 @@ def main_supervised_value_estimation(cfg: DictConfig):
     )
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
     epinet_cost_estimation = MultiHeadEpistemicNetwork(
-        cfg.hyperparameters.epinet_index_dim, cfg.models.epinet.prior_config, combined_model, device=device
+        2, cfg.models.epinet.prior_config, combined_model, device=device
     )
 
     experiment_base_dir = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training"
-
-    if cfg.execution.train_epi_network:
-        if not cfg.models.epinet.model_file:
-            raise ValueError("Training epinet requires a pretrained cost model.")
-
-        epinet_cost_estimation.load_epinet(
-            cfg.models.epinet.model_file,
-            load_only_cost_model=True
-        )
-        experiment_name = "simulated_cost_epinet_training"
-    else:
-        experiment_name = "simulated_cost"
+    experiment_name = "simulated_cost"
 
     writer = ExperimentWriter(experiment_base_dir, experiment_name, {}, {})
 
@@ -339,23 +330,19 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
 
 @hydra.main(version_base=None,
-            config_path="../experiments/experiment_configs/epinet_cost_estimation",
-            config_name="simulated_supervised_cost_estimation_train_epinet.yaml")
+            config_path="../../experiments/experiment_configs/epinet_cost_estimation",
+            config_name="simulated_supervised_cost_estimation_v2.yaml")
 def main(cfg: DictConfig):
     # Temporarily unlock the config to allow dynamic updates
     OmegaConf.set_struct(cfg, False)
 
     # Locate the best directories of pretrained models dynamically
-    best_epinet_dir = find_best_epoch_directory(cfg.models.epinet.experiment_dir, "val_loss_cost_unscaled")
     best_embedder_dir = find_best_epoch_directory(cfg.models.embedder.experiment_dir, "val_q_error")
     best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_q_error")
 
     # Inject the resolved path directly into the config state
     cfg.models.embedder.dir = best_embedder_dir
     cfg.models.oracle.dir = best_oracle_dir
-
-    cfg.models.epinet.dir = str(best_epinet_dir)
-    cfg.models.epinet.model_file = str(os.path.join(best_epinet_dir, "epinet_model.pt"))
 
     # Relock the config to prevent accidental downstream modifications
     OmegaConf.set_struct(cfg, True)

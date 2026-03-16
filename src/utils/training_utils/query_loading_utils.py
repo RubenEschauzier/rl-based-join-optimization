@@ -90,13 +90,14 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
                               load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,
+                              multiplicity_location = None,
                               shuffle_train=True, shuffle_val=False):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
-
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
                                                     vectors, env,
-                                                    rdf2vec_vector_location, endpoint_location,
-                                                    occurrences_location, tp_cardinality_location)
+                                                    occurrences_location,
+                                                    tp_cardinality_location,
+                                                    multiplicity_location)
     post_processor = filter_failed_cardinality_queries
 
     train_dataset = QueryCardinalityDataset(root=queries_location_train,
@@ -121,7 +122,7 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
 
 def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge"],
                     vectors, query_env,
-                    rdf2vec_vector_location, endpoint_location, occurrences_location=None, tp_cardinality_location=None):
+                    occurrences_location=None, tp_cardinality_location=None, multiplicity_location=None):
 
     occurrences = None
     tp_cardinality = None
@@ -131,11 +132,17 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
     if tp_cardinality_location:
         with open(tp_cardinality_location, 'r') as f:
             tp_cardinality = json.load(f)
+    if multiplicity_location:
+        with open(multiplicity_location, 'r') as f:
+            predicate_multiplicities = json.load(f)
+    else:
+        predicate_multiplicities = None
 
     if featurizer_type == "labeled_edge":
         query_to_graph = QueryToEdgeLabeledGraph(vectors, query_env, tp_cardinalities=tp_cardinality)
     elif featurizer_type == "predicate_edge":
-        query_to_graph = QueryToEdgePredicateGraph(vectors, query_env, term_occurrences=occurrences)
+        query_to_graph = QueryToEdgePredicateGraph(vectors, query_env, term_occurrences=occurrences,
+                                                   predicate_multiplicities=predicate_multiplicities)
     else:
         raise NotImplementedError
     return functools.partial(query_to_graph.transform_undirected)
@@ -153,7 +160,7 @@ def prepare_data(endpoint_location,
                                                            to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle_train=True, load_mappings=False
+                                                           shuffle_train=True, load_mappings=True
                                                            )
     return train_dataset, val_dataset
 

@@ -3,6 +3,8 @@ import math
 import os
 import sys
 import numpy as np
+import concurrent.futures
+from threading import Lock
 
 from functools import partial
 
@@ -92,15 +94,54 @@ def attach_unique_id_to_plan(simulated_query_plans):
     return simulated_query_plans
 
 
+def _process_single_query(query, oracle_model, max_plans_per_relation, estimate_is_log, device, output_loc_raw,
+                          write_lock):
+    """Processes a single query and writes the generated plans safely to disk."""
+    batch_query = query.batch
+
+    un_batched_query = query[0]
+    un_batched_query.batch = batch_query
+    un_batched_query.to(device)
+
+    # Subsample plans to prevent combinatorial explosion
+    plans = sample_orders(
+        un_batched_query,
+        oracle_model,
+        max_plans_per_relation,
+        estimate_is_log=estimate_is_log,
+        device=device
+    )
+    orders = [plan.get_order() for plan in plans]
+
+    best_plan_per_sub_plan = {}
+
+    for k, order in enumerate(orders):
+        cost = plans[k].cost
+        sub = []
+        for step in order[:-1]:
+            sub.append(step)
+            if len(sub) < 2:
+                continue
+            sub_order = tuple(sub)
+            prev = best_plan_per_sub_plan.get(sub_order)
+            if prev is None or cost < prev[0]:
+                best_plan_per_sub_plan[sub_order] = (cost, k)
+
+    # Group sub plans under their best full plan, applying logarithmic scaling to the cost
+    plan_to_sub_plans = [([plan.get_order()], math.log(plan.cost)) for plan in plans]
+    for sub_order, (_, k) in best_plan_per_sub_plan.items():
+        plan_to_sub_plans[k][0].append(sub_order)
+
+    # Ensure thread-safe file I/O
+    with write_lock:
+        write_plans_to_file({un_batched_query.query: plan_to_sub_plans}, output_loc_raw)
+
 
 def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
                               output_loc_raw,
-                              max_plans_per_relation=50):
-    # Dataset contains: [(Query, [(plans, cost for plans), ...]
-    # Training is done over batches of Queries, to amortize the query embedding step. For each sub plan we create
-    # tree-based embedding
-    # Use different model for estimating cost and estimating plan (plan estimation smaller, big model can act as oracle)
-
+                              estimate_is_log=True,
+                              max_plans_per_relation=50,
+                              max_workers=4):
     data = []
     if os.path.exists(output_loc_raw + '.jsonl'):
         k = 0
@@ -111,48 +152,92 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
         return data
 
     loader = DataLoader(dataset_to_prepare, batch_size=1, shuffle=False)
-    for query in tqdm(loader):
-        # Hack workaround due to the batch attribute disappearing when unbatching the data. Although it is
-        # technically not needed, the GNN expects it, so we reattach it
-        batch_query = query.batch
+    write_lock = Lock()
 
-        un_batched_query = query[0]
-        un_batched_query.batch = batch_query
-        un_batched_query.to(device)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for query in tqdm(loader):
+            futures.append(
+                executor.submit(
+                    _process_single_query,
+                    query,
+                    oracle_model,
+                    max_plans_per_relation,
+                    estimate_is_log,
+                    device,
+                    output_loc_raw,
+                    write_lock
+                )
+            )
 
-        # To prevent combinatorial explosion, we subsample the plans
-        plans = sample_orders(un_batched_query, oracle_model, max_plans_per_relation, device)
-        # random.shuffle(plans)
-        # plans = plans[:max_plans_per_relation]
-        orders = [plan.get_order() for plan in plans]
-
-        best_plan_per_sub_plan = {}
-
-        for k, order in enumerate(orders):
-            cost = plans[k].cost
-            # Build tuple incrementally (no slicing)
-            sub = []
-            for step in order[:-1]:
-                sub.append(step)
-                if len(sub) < 2:
-                    continue
-                sub_order = tuple(sub)
-                prev = best_plan_per_sub_plan.get(sub_order)
-                if prev is None or cost < prev[0]:
-                    best_plan_per_sub_plan[sub_order] = (cost, k)
-
-        # Group sub plans under their best full plan
-        plan_to_sub_plans = [([plan.get_order()], plan.cost) for plan in plans]
-        for sub_order, (_, k) in best_plan_per_sub_plan.items():
-            plan_to_sub_plans[k][0].append(sub_order)
-
-        write_plans_to_file({query[0].query: plan_to_sub_plans}, output_loc_raw)
+        # Iterate over futures as they complete to maintain the progress bar and catch exceptions
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+            future.result()
 
     return data
 
+# def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
+#                               output_loc_raw,
+#                               estimate_is_log = True,
+#                               max_plans_per_relation=50):
+#     # Dataset contains: [(Query, [(plans, cost for plans), ...]
+#     # Training is done over batches of Queries, to amortize the query embedding step. For each sub plan we create
+#     # tree-based embedding
+#     # Use different model for estimating cost and estimating plan (plan estimation smaller, big model can act as oracle)
+#
+#     data = []
+#     if os.path.exists(output_loc_raw + '.jsonl'):
+#         k = 0
+#         with open(output_loc_raw + '.jsonl', 'r', encoding="utf-8") as f:
+#             for line in tqdm(f):
+#                 data.append(json.loads(line))
+#                 k += 1
+#         return data
+#
+#     loader = DataLoader(dataset_to_prepare, batch_size=1, shuffle=False)
+#     for query in tqdm(loader):
+#         # Hack workaround due to the batch attribute disappearing when unbatching the data. Although it is
+#         # technically not needed, the GNN expects it, so we reattach it
+#         batch_query = query.batch
+#
+#         un_batched_query = query[0]
+#         un_batched_query.batch = batch_query
+#         un_batched_query.to(device)
+#
+#         # To prevent combinatorial explosion, we subsample the plans
+#         plans = sample_orders(un_batched_query, oracle_model, max_plans_per_relation, estimate_is_log=estimate_is_log,
+#                               device=device)
+#         # random.shuffle(plans)
+#         # plans = plans[:max_plans_per_relation]
+#         orders = [plan.get_order() for plan in plans]
+#
+#         best_plan_per_sub_plan = {}
+#
+#         for k, order in enumerate(orders):
+#             cost = plans[k].cost
+#             # Build tuple incrementally (no slicing)
+#             sub = []
+#             for step in order[:-1]:
+#                 sub.append(step)
+#                 if len(sub) < 2:
+#                     continue
+#                 sub_order = tuple(sub)
+#                 prev = best_plan_per_sub_plan.get(sub_order)
+#                 if prev is None or cost < prev[0]:
+#                     best_plan_per_sub_plan[sub_order] = (cost, k)
+#
+#         # Group sub plans under their best full plan
+#         plan_to_sub_plans = [([plan.get_order()], math.log(plan.cost)) for plan in plans]
+#         for sub_order, (_, k) in best_plan_per_sub_plan.items():
+#             plan_to_sub_plans[k][0].append(sub_order)
+#
+#         write_plans_to_file({query[0].query: plan_to_sub_plans}, output_loc_raw)
+#
+#     return data
 
 
-def sample_orders(query, model, max_samples_per_relation, device):
+
+def sample_orders(query, model, max_samples_per_relation, estimate_is_log, device):
     bound_predict_partial = partial(
         OrderDynamicProgramming.predict_cardinality,
         model,
@@ -161,7 +246,7 @@ def sample_orders(query, model, max_samples_per_relation, device):
     )
     bound_predict = lambda join_order: bound_predict_partial(list(join_order), len(join_order))
     adjacency_list = build_adj_list(query)
-    return (JoinOrderEnumerator(adjacency_list, bound_predict, len(query.triple_patterns))
+    return (JoinOrderEnumerator(adjacency_list, bound_predict, len(query.triple_patterns), estimate_is_log)
             .sample_left_deep_plans(max_samples_per_relation))
 
 

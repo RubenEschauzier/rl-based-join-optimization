@@ -66,6 +66,7 @@ def main(cfg: DictConfig):
             feature_type=c1.feature_type,
             occurrences_location=c1.occurrences_location,
             tp_cardinality_location=c1.tp_cardinality_location,
+            multiplicity_location=c1.multiplicity_location,
             writer=writer,
             model_config_location=c1.model_config,
             n_epoch=c1.n_epoch,

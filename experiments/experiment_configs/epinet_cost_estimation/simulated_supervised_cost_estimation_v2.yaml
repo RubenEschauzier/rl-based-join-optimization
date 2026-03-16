@@ -10,8 +10,8 @@ dataset:
   rdf2vec_vector_location: "data/rdf2vec_embeddings/yago_gnce/model.json"
   occurrences_location: "data/term_occurrences/yago_gnce/occurrences.json"
   tp_cardinality_location: "data/term_occurrences/yago_gnce/tp_cardinalities.json"
-  save_loc_simulated: "data/simulated_query_plan_data/star_yago_gnce/data"
-  save_loc_simulated_val: "data/simulated_query_plan_data/star_yago_gnce/val_data"
+  save_loc_simulated: "data/simulated_query_plan_data/star_yago_gnce_log_sum/data"
+  save_loc_simulated_val: "data/simulated_query_plan_data/star_yago_gnce_log_sum/val_data"
 
 models:
   oracle:

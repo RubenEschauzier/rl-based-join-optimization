@@ -5,7 +5,6 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 
-# TODO: Run this again and see what it does to performance to have undirected graph
 class QueryToEdgeLabeledGraph:
     def __init__(self, entity_embeddings, env, tp_cardinalities = None):
         self.entity_embeddings = entity_embeddings

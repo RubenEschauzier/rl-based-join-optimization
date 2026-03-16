@@ -3,13 +3,17 @@ import os
 import json
 import glob
 
-from src.datastructures.prepare_feature_data import read_queries, get_occurrences, \
-    get_query_triple_pattern_cardinalities
+from src.datastructures.prepare_feature_data import (
+    read_queries,
+    calculate_occurrences,
+    calculate_query_triple_pattern_cardinalities,
+    calculate_multiplicities_queries
+)
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Process SPARQL queries for a dataset.")
+    parser = argparse.ArgumentParser(description="Process SPARQL queries and calculate specified metrics.")
     parser.add_argument(
         "--dataset",
         required=True,
@@ -24,19 +28,22 @@ def main():
     parser.add_argument(
         "--output",
         required=True,
-        help="Output directory for occurrences and cardinalities."
+        help="Output directory for calculated metrics."
     )
     parser.add_argument(
         "--endpoint",
         default="http://localhost:9999/blazegraph/namespace/{}/sparql",
         help="SPARQL endpoint template. Must contain {} for dataset name."
     )
+    parser.add_argument(
+        "--mode",
+        choices=["all", "occurrences", "cardinalities", "multiplicities"],
+        default="all",
+        help="Specify which metric to calculate. Defaults to 'all'."
+    )
     args = parser.parse_args()
 
-    # Setup
-    output_location = args.output
-    os.makedirs(output_location, exist_ok=True)
-
+    os.makedirs(args.output, exist_ok=True)
     query_env = BlazeGraphQueryEnvironment(args.endpoint.format(args.dataset))
 
     # Expand glob patterns and load queries
@@ -44,17 +51,26 @@ def main():
     for qpattern in args.queries:
         for qpath in glob.glob(qpattern):
             loaded_queries.extend(read_queries(qpath))
-    print(f"Loaded {len(loaded_queries)} queries")
-    # Extract occurrences and cardinalities
-    loaded_occurrences = get_occurrences(loaded_queries, query_env)
-    loaded_tp_cardinalities = get_query_triple_pattern_cardinalities(loaded_queries, query_env)
+    print(f"Loaded {len(loaded_queries)} queries.")
 
-    # Save results
-    with open(os.path.join(output_location, 'occurrences.json'), 'w') as f0:
-        json.dump(loaded_occurrences, f0)
+    # Execute requested calculations
+    if args.mode in ["all", "occurrences"]:
+        occurrences = calculate_occurrences(loaded_queries, query_env)
+        with open(os.path.join(args.output, 'occurrences.json'), 'w') as f:
+            json.dump(occurrences, f)
+        print("Saved occurrences.")
 
-    with open(os.path.join(output_location, 'tp_cardinalities.json'), 'w') as f1:
-        json.dump(loaded_tp_cardinalities, f1)
+    if args.mode in ["all", "cardinalities"]:
+        tp_cardinalities = calculate_query_triple_pattern_cardinalities(loaded_queries, query_env)
+        with open(os.path.join(args.output, 'tp_cardinalities.json'), 'w') as f:
+            json.dump(tp_cardinalities, f)
+        print("Saved cardinalities.")
+
+    if args.mode in ["all", "multiplicities"]:
+        predicate_multiplicities = calculate_multiplicities_queries(loaded_queries, args.endpoint)
+        with open(os.path.join(args.output, 'multiplicities.json'), 'w') as f:
+            json.dump(predicate_multiplicities, f)
+        print("Saved multiplicities.")
 
 
 if __name__ == "__main__":

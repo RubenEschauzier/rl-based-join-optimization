@@ -8,14 +8,20 @@ class JoinPlan:
     """Represents a join plan with cost estimation"""
 
     def __init__(self, left: Optional['JoinPlan'], right: Optional['JoinPlan'],
-                 entries: Set[int], estimated_size: float, left_deep: bool):
+                 entries: Set[int], estimated_size: float, left_deep: bool, cardinality_is_log_scale: bool):
         self.left = left
         self.right = right
         self.entries = entries
         self.estimated_size = estimated_size
+
+        # Turn back to non-log scale
+        if cardinality_is_log_scale:
+            self.estimated_size = math.exp(self.estimated_size)
+
         self.left_deep = left_deep
         self.is_leaf = self.left is None or self.right is None
         self.cost = self._calculate_cost()
+        self.cardinality_is_log_scale = cardinality_is_log_scale
 
     def _calculate_cost(self) -> float:
         """
@@ -90,12 +96,15 @@ class JoinOrderEnumerator:
     """
 
     def __init__(self, adjacency_list: Dict[int, List[int]],
-                 estimated_cardinality: Callable[[tuple], float], n_entries: int):
+                 estimated_cardinality: Callable[[tuple], float],
+                 n_entries: int,
+                 cardinality_is_log_scale=False):
         self.adjacency_list = adjacency_list
         self.estimated_cardinality = estimated_cardinality
         self.n_entries = n_entries
+        self.cardinality_is_log_scale = cardinality_is_log_scale
 
-    def search(self) -> [JoinPlan, JoinPlan]:
+    def search(self) -> tuple[JoinPlan, JoinPlan]:
         """Main search method that finds the optimal join plan"""
         best_plan: Dict[tuple, JoinPlan] = {}
         best_plan_left_deep: Dict[tuple, JoinPlan] = {}
@@ -105,8 +114,17 @@ class JoinOrderEnumerator:
             singleton = {i}
             singleton_key = (i,)
             estimated_cardinality = self.estimated_cardinality(singleton_key)
-            best_plan[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, False)
-            best_plan_left_deep[singleton_key] = JoinPlan(None, None, singleton, estimated_cardinality, True)
+            best_plan[singleton_key] = JoinPlan(left=None, right=None,
+                                                entries=singleton,
+                                                estimated_size=estimated_cardinality,
+                                                left_deep=False,
+                                                cardinality_is_log_scale=self.cardinality_is_log_scale)
+            best_plan_left_deep[singleton_key] = JoinPlan(left=None, right=None,
+                                                          entries=singleton,
+                                                          estimated_size=estimated_cardinality,
+                                                          left_deep=True,
+                                                          cardinality_is_log_scale=self.cardinality_is_log_scale
+                                                          )
 
         # Enumerate all connected subgraph-complement pairs
         csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
@@ -134,17 +152,19 @@ class JoinOrderEnumerator:
         all_entries_key = tuple(list(range(self.n_entries)))
         return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
 
-
     def enumerate_left_deep_plans(self):
         cardinality_cache = {}
         for i in range(self.n_entries):
             cardinality_cache[(i,)] = self.estimated_cardinality((i,))
         plans = []
         for j in range(self.n_entries):
-            singleton_plan = JoinPlan(None, None, {j}, cardinality_cache[(j,)], True)
+            singleton_plan = JoinPlan(left=None, right=None,
+                                      entries={j},
+                                      estimated_size=cardinality_cache[(j,)],
+                                      left_deep=True,
+                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
             self.recurse_left_deep(plans, [j], singleton_plan, cardinality_cache, self.n_entries)
         return plans
-
 
     def recurse_left_deep(self, plans, current_order, current_plan: JoinPlan, cardinality_cache, total_entries):
         current_entries = current_plan.entries
@@ -154,7 +174,10 @@ class JoinOrderEnumerator:
         for neighbour in neighbours:
             if neighbour not in current_entries:
                 estimated_cardinality_singleton = cardinality_cache[(neighbour,)]
-                right_leave_plan = JoinPlan(None, None, {neighbour}, estimated_cardinality_singleton, True)
+                right_leave_plan = JoinPlan(left=None, right=None, entries={neighbour},
+                                            estimated_size=estimated_cardinality_singleton,
+                                            left_deep=True,
+                                            cardinality_is_log_scale=self.cardinality_is_log_scale)
                 new_entries = current_entries | {neighbour}
 
                 estimate_key = tuple(self.sort_array_asc(list(new_entries)))
@@ -166,15 +189,17 @@ class JoinOrderEnumerator:
                 else:
                     estimate_new_plan = cardinality_cache[estimate_key]
 
-                new_plan = JoinPlan(current_plan, right_leave_plan,
-                                    new_entries,
-                                    estimate_new_plan, True)
+                new_plan = JoinPlan(left=current_plan, right=right_leave_plan,
+                                    entries=new_entries,
+                                    estimated_size=estimate_new_plan,
+                                    left_deep=True,
+                                    cardinality_is_log_scale=self.cardinality_is_log_scale)
                 self.recurse_left_deep(plans, current_order + [neighbour], new_plan, cardinality_cache,
                                        total_entries)
 
     def sample_left_deep_plans(
-        self,
-        max_samples_per_start_relation,
+            self,
+            max_samples_per_start_relation,
     ):
         """
         Depth-first sampling of left-deep plans.
@@ -182,7 +207,7 @@ class JoinOrderEnumerator:
         Args:
             :param max_samples_per_start_relation: Number of samples to get for each start relation (triple)
         """
-        max_samples = min(math.factorial(self.n_entries-1), max_samples_per_start_relation)
+        max_samples = min(math.factorial(self.n_entries - 1), max_samples_per_start_relation)
         cardinality_cache = {}
         for i in range(self.n_entries):
             cardinality_cache[(i,)] = self.estimated_cardinality((i,))
@@ -191,7 +216,7 @@ class JoinOrderEnumerator:
             # self.recurse_left_deep(plans, [j], singleton_plan, cardinality_cache, self.n_entries)
 
             plans.extend(self._sample_plans(j, cardinality_cache, self.n_entries,
-                               max_samples))
+                                            max_samples))
         return plans
 
     def _sample_plans(self, start_entry, cardinality_cache, total_entries, max_samples):
@@ -213,7 +238,12 @@ class JoinOrderEnumerator:
                 cardinality_cache[start_key] = self.estimated_cardinality(start_key)
             start_card = cardinality_cache[start_key]
 
-            current_plan = JoinPlan(None, None, {start_entry}, start_card, True)
+            current_plan = JoinPlan(left=None,
+                                    right=None,
+                                    entries={start_entry},
+                                    estimated_size=start_card,
+                                    left_deep=True,
+                                    cardinality_is_log_scale=self.cardinality_is_log_scale)
             current_entries = {start_entry}
 
             # Build one complete plan
@@ -233,7 +263,12 @@ class JoinOrderEnumerator:
                     cardinality_cache[right_key] = self.estimated_cardinality(right_key)
                 right_card = cardinality_cache[right_key]
 
-                right_leaf = JoinPlan(None, None, {next_neighbour}, right_card, True)
+                right_leaf = JoinPlan(left=None,
+                                      right=None,
+                                      entries={next_neighbour},
+                                      estimated_size=right_card,
+                                      left_deep=True,
+                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
                 new_entries = current_entries | {next_neighbour}
 
                 estimate_key = tuple(self.sort_array_asc(list(new_entries)))
@@ -241,7 +276,12 @@ class JoinOrderEnumerator:
                     cardinality_cache[estimate_key] = self.estimated_cardinality(estimate_key)
                 new_card = cardinality_cache[estimate_key]
 
-                current_plan = JoinPlan(current_plan, right_leaf, new_entries, new_card, True)
+                current_plan = JoinPlan(left=current_plan,
+                                        right=right_leaf,
+                                        entries=new_entries,
+                                        estimated_size=new_card,
+                                        left_deep=True,
+                                        cardinality_is_log_scale=self.cardinality_is_log_scale)
                 current_entries = new_entries
 
             if len(current_entries) == total_entries:
@@ -310,8 +350,18 @@ class JoinOrderEnumerator:
                          best_plan, best_plan_left_deep,
                          left_deep: bool):
         if left_deep:
-            curr_plan_left = JoinPlan(tree1, tree2, new_entries, estimate_size, True)
-            curr_plan_right = JoinPlan(tree2, tree1, new_entries, estimate_size, True)
+            curr_plan_left = JoinPlan(left=tree1,
+                                      right=tree2,
+                                      entries=new_entries,
+                                      estimated_size=estimate_size,
+                                      left_deep=True,
+                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
+            curr_plan_right = JoinPlan(left=tree2,
+                                       right=tree1,
+                                       entries=new_entries,
+                                       estimated_size=estimate_size,
+                                       left_deep=True,
+                                       cardinality_is_log_scale=self.cardinality_is_log_scale)
             if len(tree1.entries) == 1 and len(tree2.entries) == 1:
                 curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
                              else curr_plan_left)
@@ -327,8 +377,18 @@ class JoinOrderEnumerator:
                 best_plan_left_deep[curr_plan_key] = curr_plan
 
         else:
-            curr_plan_left = JoinPlan(tree1, tree2, new_entries, estimate_size, False)
-            curr_plan_right = JoinPlan(tree2, tree1, new_entries, estimate_size, False)
+            curr_plan_left = JoinPlan(left=tree1,
+                                      right=tree2,
+                                      entries=new_entries,
+                                      estimated_size=estimate_size,
+                                      left_deep=False,
+                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
+            curr_plan_right = JoinPlan(left=tree2,
+                                       right=tree1,
+                                       entries=new_entries,
+                                       estimated_size=estimate_size,
+                                       left_deep=False,
+                                       cardinality_is_log_scale=self.cardinality_is_log_scale)
             curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
                          else curr_plan_left)
 
@@ -342,8 +402,18 @@ class JoinOrderEnumerator:
     def store_plan(self, trees1, trees2, new_entries, plan_key, estimate_size, stored_plans):
         for tree1 in trees1:
             for tree2 in trees2:
-                left_plan = JoinPlan(tree1, tree2, new_entries, estimate_size, False)
-                right_plan = JoinPlan(tree2, tree1, new_entries, estimate_size, False)
+                left_plan = JoinPlan(left=tree1,
+                                     right=tree2,
+                                     entries=new_entries,
+                                     estimated_size=estimate_size,
+                                     left_deep=False,
+                                     cardinality_is_log_scale=self.cardinality_is_log_scale)
+                right_plan = JoinPlan(left=tree2,
+                                      right=tree1,
+                                      entries=new_entries,
+                                      estimated_size=estimate_size,
+                                      left_deep=False,
+                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
                 if plan_key not in stored_plans:
                     stored_plans[plan_key] = []
                 stored_plans[plan_key].append(left_plan)

@@ -337,8 +337,8 @@ def train_step(model, optimizer, client_default_timeout,
                lambda_aux_task,
                alpha_mlp, alpha_ensemble, sigma, device):
     #TODO:
-    # - Apply normalization to the target variables.
     # - Apply log to all targets before they get passed to normalization to update stats (so in process_exec_results)
+    # - Apply normalization to the target variables.
     # - Fix simulated query plans / cost estimation to use log of total cost instead of sum of log(cost). As
     # (as I should know) sum(log(x)) = log(prod(x)) giving too much penalty to big queries
     samples_with_targets = retrieve_buffer_samples(batch_size=train_step_batch_size,
@@ -542,12 +542,25 @@ def main_train(queries_train,
     async_loop.close()
     print("Training Complete.")
 
-    # TODO: Every x queries do training run
-    # TODO: Annealing method to slowly switch from exploration with epinet on cost to epinet on latency
-    # TODO: For robust query planning use: Conditional Value at Risk (CVaR / Expected Shortfall)
-    # TODO: This should be when the agent is set to eval mode
-    # TODO: For optimization of eval mode we can look into incremental tree building. Where you just append
-    # TODO: some tensors to current representation
+    #TODO:
+    # - Every x queries do training run
+    # - Annealing method to slowly switch from exploration with epinet on cost to epinet on latency
+    # - For robust query planning use: Conditional Value at Risk (CVaR / Expected Shortfall)
+    # - This should be when the agent is set to eval mode
+    # - Add scaffolding to run GNCE, base-cost estimation, epinet-cost estimation, and live epinet cost estimation
+    # in eval mode with beam search (by implementing the AbstractAgentClass, building a script that takes as input
+    # an agent and some queries and runs them)
+    # - For optimization of eval mode we can look into incremental tree building. Where you just append
+    # - some tensors to current representation
+
+    #TODO:
+    # Once that works we test our new generated queries on pretrained on other generated queries to see performance deg
+    # then we argue
+    # 1. Not sufficient to generate queries
+    # 2. Generalization gap
+    # 3. We need better query generation and better generalization
+    # Proceed to next TODO:
+
 
     #TODO: For generalization we can look into two things
     # 1. MoE in GNN based on graph structural embedding. Or other MoE mechanism. Maybe use epinet to determine
