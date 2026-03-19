@@ -1,5 +1,6 @@
 import queue
 
+import numpy as np
 import torch
 from typing import List
 from src.supervised_value_estimation.agents.AbstractAgent import AbstractCostAgent
@@ -30,6 +31,7 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         self.uncertainty_queue = uncertainty_queue
         self.head_uncertainties = {}
         self.ema_alpha = ema_alpha
+        self.blending_weight = 0
 
     def setup_episode(self, query):
         """
@@ -122,6 +124,8 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
 
     def get_annealing_coefficients(self):
         if self.annealing_method == "epistemic_uncertainty":
+            #TODO: Validate the shape of this function and its values in practice
+            self.blending_weight = np.exp(-1 * self.head_uncertainties["latency"])
             pass
         else:
             raise NotImplementedError("Annealing Method Not Implemented")
