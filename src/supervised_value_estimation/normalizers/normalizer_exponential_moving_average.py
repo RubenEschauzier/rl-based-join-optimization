@@ -1,5 +1,6 @@
 import torch
 
+#TODO Look into PopArt?
 class NormalizerExponentialMovingAverage:
     def __init__(self, device, ema_momentum=0.05):
         self.mean = torch.tensor(0.0, device=device)

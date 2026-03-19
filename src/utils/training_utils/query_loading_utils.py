@@ -160,7 +160,7 @@ def prepare_data(endpoint_location,
                                                            to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle_train=True, load_mappings=True
+                                                           shuffle_train=True, load_mappings=False
                                                            )
     return train_dataset, val_dataset
 

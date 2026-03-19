@@ -1,3 +1,5 @@
+import queue
+
 import torch
 from typing import List
 from src.supervised_value_estimation.agents.AbstractAgent import AbstractCostAgent
@@ -6,21 +8,28 @@ from src.supervised_value_estimation.typings.typings import EnvState
 
 class EpinetMultiprocessAgent(AbstractCostAgent):
     def __init__(self, model,
-                 inference_queue, result_queue, worker_id,
-                 disk_cache,
+                 inference_queue, result_queue, uncertainty_queue, worker_id,
                  precomputed_indexes, precomputed_masks,
                  alpha_mlp, alpha_ensemble,
-                 head_name = "plan_cost"):
+                 head_name = "plan_cost",
+                 annealing_method = "epistemic_uncertainty", ema_alpha=.05):
         self.model = model
         self.inference_queue = inference_queue
         self.result_queue = result_queue
         self.worker_id = worker_id
-        self.disk_cache = disk_cache
+
         self.precomputed_indexes = precomputed_indexes
         self.precomputed_masks = precomputed_masks
+
         self.alpha_mlp = alpha_mlp
         self.alpha_ensemble = alpha_ensemble
+
         self.head_name = head_name
+
+        self.annealing_method = annealing_method
+        self.uncertainty_queue = uncertainty_queue
+        self.head_uncertainties = {}
+        self.ema_alpha = ema_alpha
 
     def setup_episode(self, query):
         """
@@ -31,12 +40,16 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         self.model.eval()
         z = torch.randn((1, self.model.epi_index_dim), device=torch.device('cpu'))
 
-        # TODO: This + any other cache on disk should use a one write many read architecture
-        # if query.query[0] not in self.disk_cache:
         embedded, embedded_prior = self.model.embed_query_batched(query)[0], self.model.embed_query_batched_prior(query)
-            # self.disk_cache.store_embeddings(query.query[0], (embedded, embedded_prior))
-        # else:
-        #     embedded, embedded_prior = self.disk_cache.get_embeddings(query.query[0], torch.device('cpu'))
+
+        # TODO: Validate this
+        # At start of new episode, check if the agent has new uncertainty estimates to update annealing parameters
+        try:
+            while True:
+                estimate_variances = self.uncertainty_queue.get_nowait()
+                self.update_uncertainty(estimate_variances)
+        except queue.Empty:
+            pass
 
         return {"embedded": embedded, "embedded_prior": embedded_prior, "z": z, "query_idx": 0}
 
@@ -90,3 +103,26 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
             })
 
         return epinet_cost.view(-1).tolist(), environment_state
+
+    def update_uncertainty(self, estimate_variances):
+        for key, variance in estimate_variances.items():
+            if key not in self.head_uncertainties:
+                self.head_uncertainties[key] = { "average": variance, "min": variance, "max": variance}
+            else:
+                current_uncertainty = self.head_uncertainties[key]["average"]
+                new_uncertainty = (1-self.ema_alpha) * current_uncertainty + self.ema_alpha * variance
+                self.head_uncertainties[key]["average"] = new_uncertainty
+
+                if self.head_uncertainties[key]["min"] > new_uncertainty:
+                    self.head_uncertainties[key]["min"] = new_uncertainty
+
+                if self.head_uncertainties[key]["max"] < new_uncertainty:
+                    self.head_uncertainties[key]["max"] = new_uncertainty
+
+
+    def get_annealing_coefficients(self):
+        if self.annealing_method == "epistemic_uncertainty":
+            pass
+        else:
+            raise NotImplementedError("Annealing Method Not Implemented")
+        pass

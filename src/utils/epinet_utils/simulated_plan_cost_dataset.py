@@ -143,12 +143,21 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
                               max_plans_per_relation=50,
                               max_workers=4):
     data = []
+    queries_loaded = set()
     if os.path.exists(output_loc_raw + '.jsonl'):
         k = 0
         with open(output_loc_raw + '.jsonl', 'r', encoding="utf-8") as f:
-            for line in tqdm(f):
-                data.append(json.loads(line))
-                k += 1
+            for line in f:
+                query_to_plans = json.loads(line)
+                query_string = next(iter(query_to_plans.keys()))
+                if query_string not in queries_loaded:
+                    data.append(query_to_plans)
+                    queries_loaded.add(query_string)
+                    k += 1
+
+    print(f"Loaded {len(data)}/{len(dataset_to_prepare)} plan entries ({len(queries_loaded)} unique queries)")
+
+    if len(dataset_to_prepare) == len(data):
         return data
 
     loader = DataLoader(dataset_to_prepare, batch_size=1, shuffle=False)
@@ -157,18 +166,20 @@ def prepare_simulated_dataset(dataset_to_prepare, oracle_model, device,
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for query in tqdm(loader):
-            futures.append(
-                executor.submit(
-                    _process_single_query,
-                    query,
-                    oracle_model,
-                    max_plans_per_relation,
-                    estimate_is_log,
-                    device,
-                    output_loc_raw,
-                    write_lock
+            # Get plans for queries not in (partially) loaded dataset
+            if query.query[0] not in queries_loaded:
+                futures.append(
+                    executor.submit(
+                        _process_single_query,
+                        query,
+                        oracle_model,
+                        max_plans_per_relation,
+                        estimate_is_log,
+                        device,
+                        output_loc_raw,
+                        write_lock
+                    )
                 )
-            )
 
         # Iterate over futures as they complete to maintain the progress bar and catch exceptions
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):

@@ -71,7 +71,7 @@ def validate(queries_val, query_plans_val,
 
             query_metrics = {}
 
-            estimated_cost = estimated_cost.squeeze()
+            estimated_cost = estimated_cost["plan_cost"].squeeze()
             original_cost = (estimated_cost * std_cost) + mean_cost
 
             target = torch.tensor([plan[1] for plan in plans], device=device)
@@ -210,7 +210,7 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                 )
 
                 target = torch.tensor([plan[1] for plan in plans], device=device).squeeze()
-                total_loss_tensor += loss(estimated_cost.squeeze(), target)
+                total_loss_tensor += loss(estimated_cost["plan_cost"].squeeze(), target)
 
             total_loss_tensor.backward()
             optimizer.step()

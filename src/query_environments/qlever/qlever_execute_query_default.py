@@ -37,7 +37,6 @@ class QLeverOptimizerClient:
         timeout = self.default_timeout
         if query_obj.query in self.query_timeouts:
             timeout = self.format_latency(self.query_timeouts[query_obj.query])
-            print(timeout)
 
         formatted_query = self._apply_join_order(query_obj, join_order)
         # We use 'application/qlever-results+json' to get the runtimeInformation field
@@ -63,7 +62,8 @@ class QLeverOptimizerClient:
                     # Tighten bounds on successful execution
                     if time_total != "0ms":
                         time_in_seconds = self.decode_to_seconds(time_total)
-                        self.query_timeouts[query_obj.query] = max(min((time_in_seconds * 2), self.default_timeout_s), 5)
+                        self.query_timeouts[query_obj.query] = max(min((time_in_seconds * 2), self.default_timeout_s),
+                                                                   1)
 
                     return {
                         "success": True,
@@ -207,6 +207,7 @@ class QLeverOptimizerClient:
             parsed_result = json.loads(qlever_result["error"])
         except json.decoder.JSONDecodeError as e:
             print(qlever_result)
+            print()
             raise e
 
         if "runtimeInformation" not in parsed_result:
