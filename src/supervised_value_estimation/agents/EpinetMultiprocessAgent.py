@@ -50,6 +50,7 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
             while True:
                 estimate_variances = self.uncertainty_queue.get_nowait()
                 self.update_uncertainty(estimate_variances)
+                self.get_annealing_coefficients()
         except queue.Empty:
             pass
 
@@ -82,16 +83,18 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
             prior_trees, prior_idx, prior_masks
         )
 
-        ensemble_prior = torch.matmul(query_state["z"], unweighted_priors[self.head_name]).view(-1, 1)
-
         # Get GPU cost estimates
         gpu_results = self.result_queue.get()
-        est_cost = gpu_results["est_cost"][self.head_name]
-        mlp_prior = gpu_results["mlp_prior"][self.head_name]
-        learnable_mlp = gpu_results["learnable_mlp"][self.head_name]
+        gpu_results = self.inference_result_to_torch(gpu_results)
 
-        # Combine for total output
-        epinet_cost = est_cost + learnable_mlp + (self.alpha_mlp * mlp_prior) + (self.alpha_ensemble * ensemble_prior)
+        # Anneal the latency and cost estimates according to their respective uncertainties.
+        # As cost estimation is through a pretrained epinet, this will slowly anneal from cost to latency once
+        # the latency epinet gets trained
+        epinet_latency = self.estimate_cost_head(gpu_results, query_state, unweighted_priors, "latency")
+        epinet_cost = self.estimate_cost_head(gpu_results, query_state, unweighted_priors, "plan_cost")
+
+        combined_value_estimate = (self.blending_weight * epinet_latency.view(-1)
+                                   + (1 - self.blending_weight) * epinet_cost.view(-1))
 
         # Combine relevant (frozen) environment states and return. This will be stored in the buffer
         environment_state: List[EnvState] = []
@@ -104,7 +107,20 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
                 "z": query_state["z"].cpu().numpy()
             })
 
-        return epinet_cost.view(-1).tolist(), environment_state
+        if self.blending_weight != 0:
+            #TODO: Validate this blending weight to be a 'normal' value
+            pass
+        return combined_value_estimate.tolist(), environment_state
+
+    def estimate_cost_head(self, results, query_state, unweighted_priors, head_name):
+        est_cost = results["est_cost"][head_name]
+        mlp_prior = results["mlp_prior"][head_name]
+        learnable_mlp = results["learnable_mlp"][head_name]
+        ensemble_prior = torch.matmul(query_state["z"], unweighted_priors[head_name]).view(-1, 1)
+
+        # Combine for total output
+        return est_cost + learnable_mlp + (self.alpha_mlp * mlp_prior) + (
+                    self.alpha_ensemble * ensemble_prior)
 
     def update_uncertainty(self, estimate_variances):
         for key, variance in estimate_variances.items():
@@ -125,8 +141,15 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
     def get_annealing_coefficients(self):
         if self.annealing_method == "epistemic_uncertainty":
             #TODO: Validate the shape of this function and its values in practice
-            self.blending_weight = np.exp(-1 * self.head_uncertainties["latency"])
+            self.blending_weight = np.exp(-1 * self.head_uncertainties["latency"]["average"])
             pass
         else:
             raise NotImplementedError("Annealing Method Not Implemented")
         pass
+
+    @staticmethod
+    def inference_result_to_torch(result):
+        for key, heads in result.items():
+            for head, output in heads.items():
+                result[key][head] = torch.tensor(output)
+        return result

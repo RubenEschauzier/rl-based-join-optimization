@@ -548,7 +548,7 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
 @hydra.main(version_base=None,
             config_path="../../experiments/experiment_configs/epinet_cost_estimation",
-            config_name="simulated_supervised_cost_estimation_train_epinet.yaml")
+            config_name="simulated_supervised_cost_estimation_train_epinet_v2.yaml")
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 

@@ -87,9 +87,6 @@ class ExecutionReplayBuffer:
             is_valid_size: bool,
             is_valid_episode: bool,
             c_vectors_observation: np.ndarray,
-            error: float = None,
-            uncertainty: float = None,
-            lambda_val: float = 1.0
     ) -> None:
         # Assign variable-length objects
         self.join_plans[self.pos] = join_plan
@@ -106,10 +103,10 @@ class ExecutionReplayBuffer:
         self.is_valid_episode[self.pos] = is_valid_episode
         self.c_vectors[self.pos] = c_vectors_observation
 
-        if self.use_per and error is not None and uncertainty is not None:
-            self.priorities[self.pos] = abs(error) + (lambda_val * uncertainty) + 1e-6
-        else:
+        if self.use_per:
             self.priorities[self.pos] = self.max_priority
+        else:
+            self.priorities[self.pos] = 1.0
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -144,6 +141,25 @@ class ExecutionReplayBuffer:
             weights=self._to_torch(weights),
             indices=self._to_torch(indices)
         )
+
+    def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor) -> None:
+        """
+        Updates the priorities of sampled transitions.
+        Call this after computing the loss/error in the training loop.
+        """
+        if not self.use_per:
+            return
+
+        indices_np = indices.cpu().numpy()
+        priorities_np = priorities.detach().cpu().numpy()
+
+        # Add small epsilon to guarantee non-zero probability
+        self.priorities[indices_np] = priorities_np + 1e-6
+
+        # Track the maximum priority for new additions
+        self.max_priority = max(self.max_priority, np.max(priorities_np))
+
+        print(self.priorities)
 
     def _to_torch(self, array: np.ndarray) -> torch.Tensor:
         return torch.tensor(array, device=self.device)

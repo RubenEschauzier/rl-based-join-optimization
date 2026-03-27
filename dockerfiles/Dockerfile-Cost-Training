@@ -1,0 +1,24 @@
+# Use the development image to provide nvcc and build tools matching your PyTorch version
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
+
+# Install build tools required for compiling Python C-extensions
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory to match the GPULab storage mount
+WORKDIR /project_ghent/rl-based-join-optimization
+
+# Install PyTorch Geometric dependencies via pre-compiled wheels to avoid build failures
+RUN pip install --no-cache-dir pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
+
+# Copy the cleaned requirements file into the image
+COPY requirements-docker.txt .
+
+# Install the remaining dependencies
+RUN pip install --no-cache-dir -r requirements-docker.txt
+
+ENV PYTHONPATH="/project_ghent/rl-based-join-optimization"
+
+CMD ["python", "src/supervised_value_estimation/supervised_value_estimation.py"]

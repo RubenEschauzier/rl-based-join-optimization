@@ -120,6 +120,30 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
 
     return train_dataset, val_dataset
 
+def load_queries_into_dataset_single(queries_location,
+                              endpoint_location, rdf2vec_vector_location,
+                              env,
+                              feature_type: typing.Literal["labeled_edge", "predicate_edge"],
+                              load_mappings = True,
+                              to_load=None, occurrences_location=None, tp_cardinality_location=None,
+                              multiplicity_location = None):
+    vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
+    featurizer_edge_labeled_graph = load_featurizer(feature_type,
+                                                    vectors, env,
+                                                    occurrences_location,
+                                                    tp_cardinality_location,
+                                                    multiplicity_location)
+    post_processor = filter_failed_cardinality_queries
+
+    dataset = QueryCardinalityDataset(root=queries_location,
+                                      featurizer=featurizer_edge_labeled_graph,
+                                      post_processor=post_processor,
+                                      to_load=to_load,
+                                      load_mappings=load_mappings,
+                                      )
+    return dataset
+
+
 def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge"],
                     vectors, query_env,
                     occurrences_location=None, tp_cardinality_location=None, multiplicity_location=None):

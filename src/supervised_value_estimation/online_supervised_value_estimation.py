@@ -1,11 +1,15 @@
 import os
 import queue
+import sys
 from dataclasses import asdict
 import asyncio
 import numpy as np
 from typing import List
 
+import ray
+from ray.util import ActorPool
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
 import torch
@@ -24,15 +28,130 @@ from src.supervised_value_estimation.loss_functions.hinge_mse_loss import right_
 from src.supervised_value_estimation.normalizers.normalizer_exponential_moving_average import \
     NormalizerExponentialMovingAverage
 from src.supervised_value_estimation.storage.PlanBestPerformanceCache import PlanBestPerformanceCache
-from src.supervised_value_estimation.search_algorithms.beam_search import beam_search
+from src.supervised_value_estimation.search_algorithms.beam_search_left_deep import beam_search
 from src.supervised_value_estimation.storage.ExecutionReplayBuffer import ExecutionReplayBuffer, ExecutionBufferSamples, \
     ExecutionBufferSamplesWithTargets
 
-from src.utils.epinet_utils.disk_cache_frozen_representations import DiskCacheFrozenRepresentations
 from src.utils.training_utils.query_loading_utils import prepare_data
 from src.utils.training_utils.training_tracking import ExperimentWriter
 from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
 
+
+class AsyncExecutionStrategy:
+    """Handles standard single-endpoint execution via asyncio."""
+
+    def __init__(self, endpoint_location: str, max_concurrent: int = 4):
+        self.client = QLeverOptimizerClient(endpoint_location)
+        self.max_concurrent = max_concurrent
+        self.async_loop = None
+
+    def setup(self):
+        self.async_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.async_loop)
+        self.async_loop.run_until_complete(self.client.create_session())
+
+    def execute(self, plans: list):
+        return self.async_loop.run_until_complete(
+            self._evaluate_batch_async(plans)
+        )
+
+    def teardown(self):
+        if self.async_loop:
+            self.async_loop.run_until_complete(self.client.close())
+            self.async_loop.close()
+
+    @property
+    def default_timeout_s(self) -> float:
+        return self.client.default_timeout_s
+
+    async def _evaluate_batch_async(self, training_buffer):
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        async def _bounded_execute(item):
+            query = item["query"].to_data_list()[0]
+            best_plan = item["plan"]["plan"]
+
+            async with semaphore:
+                raw_result = await self.client.execute_plan(query, join_order=best_plan)
+                metrics = self.client.extract_signal(raw_result)
+                item["rl_metrics"] = metrics
+                return item
+
+        tasks = [_bounded_execute(item) for item in training_buffer]
+        return await asyncio.gather(*tasks)
+
+
+class RayExecutionStrategy:
+    """Handles distributed execution across multiple baremetal servers via Ray."""
+
+    def __init__(self, ray_endpoints: list[str]):
+        if not ray.is_initialized():
+            context = ray.init()
+            print(context.dashboard_url)
+
+        from src.query_environments.qlever.qlever_execute_query_ray import QLeverOptimizerClientRay as RayClient
+
+        # 1. Instantiate the actors
+        self.actors = [RayClient.remote(url) for url in ray_endpoints]
+
+        # 2. Wrap them in a Ray ActorPool for dynamic load balancing
+        self.pool = ActorPool(self.actors)
+
+        # 3. Local dummy parser to avoid remote execution overhead for simple dictionary extraction
+        self.local_parser = QLeverOptimizerClient("dummy_endpoint")
+
+    def setup(self):
+        pass
+
+    def execute(self, plans: list):
+        """Executes plans using load-aware scheduling."""
+
+        # Define the execution instruction for the pool
+        def submit_query(actor, item):
+            query_data = item["query"].to_data_list()[0]
+
+            query_payload = {
+                "query": query_data.query,
+                "triple_patterns": query_data.triple_patterns
+            }
+
+            best_plan = item["plan"]["plan"]
+
+            return actor.execute_plan.remote(query_payload, join_order=best_plan)
+
+        # pool.map automatically routes tasks to idle actors.
+        # It guarantees the output list matches the order of the input 'plans' list,
+        # ensuring zip() aligns the metrics perfectly with the original items.
+        raw_results = list(self.pool.map(submit_query, plans))
+
+        # Parse results locally
+        for item, raw_result in zip(plans, raw_results):
+            item["rl_metrics"] = self.local_parser.extract_signal(raw_result)
+
+        return plans
+
+    def teardown(self):
+        pass
+
+    @property
+    def default_timeout_s(self) -> float:
+        return self.local_parser.default_timeout_s
+
+def tensors_to_numpy(obj):
+    """
+    Recursively converts all PyTorch tensors in a dictionary, list, or tuple
+    to NumPy arrays to prevent file descriptor leaks in multiprocessing queues.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().numpy()
+    elif isinstance(obj, dict):
+        return {k: tensors_to_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [tensors_to_numpy(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(tensors_to_numpy(v) for v in obj)
+    else:
+        return obj
 
 def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor,
                     valid_mask: torch.Tensor) -> torch.Tensor:
@@ -49,7 +168,8 @@ def generic_gpu_server(inference_queue, result_queues, weights_queue, handler_cl
     while True:
         try:
             while True:
-                new_state_dict = weights_queue.get_nowait()
+                new_state_dict_numpy = weights_queue.get_nowait()
+                new_state_dict = {k: torch.from_numpy(v) for k, v in new_state_dict_numpy.items()}
                 model_handler.model.load_state_dict(new_state_dict)
         except queue.Empty:
             pass
@@ -60,6 +180,7 @@ def generic_gpu_server(inference_queue, result_queues, weights_queue, handler_cl
         worker_id, payload = request
 
         result = model_handler.process(payload)
+        result = tensors_to_numpy(result)
         result_queues[worker_id].put(result)
 
 
@@ -97,14 +218,23 @@ class EpinetServerHandler:
 
 
 def prepare_experiment(endpoint_location, queries_location_train, queries_location_val,
-                       rdf2vec_vector_location, occurrences_location, tp_cardinality_location):
+                       rdf2vec_vector_location, occurrences_location, tp_cardinality_location,
+                       use_ray=False, ray_endpoints=None):
     train_dataset, val_dataset = prepare_data(endpoint_location, queries_location_train, queries_location_val,
                                               rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
-    client = QLeverOptimizerClient("http://localhost:8888")
+    # client = QLeverOptimizerClient("http://localhost:8888")
+    # Initialize the selected execution strategy
+    if use_ray:
+        if not ray_endpoints:
+            raise ValueError("ray_endpoints must be provided when use_ray is True")
+        execution_strategy = RayExecutionStrategy(ray_endpoints)
+    else:
+        execution_strategy = AsyncExecutionStrategy(endpoint_location)
+
     writer = ExperimentWriter("experiments/experiment_outputs/yago_gnce/online_epinet_training",
                               "actual_cost_epinet_training",
                               {}, {})
-    return train_dataset, val_dataset, client, writer
+    return train_dataset, val_dataset, execution_strategy, writer
 
 
 def cpu_search_worker_epinet(model_builder_fn, model_kwargs, state_dict,
@@ -130,15 +260,25 @@ def cpu_search_worker_epinet(model_builder_fn, model_kwargs, state_dict,
     )
 
     while True:
-        query = query_queue.get()
-        if query is None:  # Poison pill to shut down
+        safe_query = query_queue.get()
+        if safe_query is None:  # Poison pill to shut down
             print("SHUTDOWN?")
             break
+
+        # Reconstruct PyTorch tensors
+        query_tensors = {
+            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+            for k, v in safe_query.items()
+        }
+
+        # Rebuild PyG Batch
+        query_data = Data.from_dict(query_tensors)
+        query = Batch.from_data_list([query_data])
 
         top_k_plans = beam_search(query, agent, beam_width)
 
         plan_queue.put({
-            "query": query,
+            "query": safe_query,
             "top_k_plans": top_k_plans
         })
 
@@ -246,6 +386,8 @@ def process_execution_results(
         valid_mask=torch.tensor(valid_joins_mask, dtype=torch.bool, device=device)
     )
 
+    return np.mean(latencies), np.ma.array(data=total_costs, mask=~np.array(valid_costs_mask)).mean()
+
 
 def retrieve_buffer_samples(batch_size,
                             execution_buffer: ExecutionReplayBuffer,
@@ -303,17 +445,22 @@ def get_intermediate_join_targets(sample_with_targets: ExecutionBufferSamples, e
 
 
 def perturb_vector(raw_targets, c_vectors, epinet_indexes, sigma):
+    # (n_epinet_indexes, batch_size)
     anchor_matrix = torch.matmul(epinet_indexes, c_vectors.T)
+    # (n_epinet_indexes * batch_size) in n_epinet_indexes blocks of batch_size
     anchor_term_flat = anchor_matrix.view(-1)
     raw_targets_expanded = raw_targets.repeat(epinet_indexes.shape[0])
+    # (n_epinet_indexes * batch_size) in n_epinet_indexes blocks of batch_size
     return raw_targets_expanded + sigma * anchor_term_flat
 
-def get_variance_estimates(estimates, heads_to_extract_variance = ('latency', 'plan_cost')):
+
+def get_variance_estimates(estimates, heads_to_extract_variance=('latency', 'plan_cost')):
     variances = {}
     for head_name in heads_to_extract_variance:
         estimated_variance = torch.var(estimates[head_name], dim=0)
         variances[head_name] = estimated_variance.mean().item()
     return variances
+
 
 def estimate_cost(epinet_latency_estimation, sample_with_targets: ExecutionBufferSamples, epinet_indexes,
                   alpha_mlp, alpha_ensemble, device,
@@ -362,8 +509,9 @@ def train_step(model, optimizer, normalizers,
     #TODO:
     # - Fix simulated query plans / cost estimation to use log of total cost instead of sum of log(cost). As
     # (as I should know) sum(log(x)) = log(prod(x)) giving too much penalty to big queries
+    # - If this doesn't work (making worse or whatever) investigate the alignment of predictions and targets over epi
+    # indexes
     # - Investigate the popart normalization approach
-    # - Return distribution of estimations per plan in batch
     samples_with_targets = retrieve_buffer_samples(batch_size=train_step_batch_size,
                                                    execution_buffer=executions_buffer,
                                                    reward_cache=execution_result_cache)
@@ -391,6 +539,9 @@ def train_step(model, optimizer, normalizers,
 
     # # Right censored loss to reflect that timeouts mean the plan would take at least timeout seconds
     normalized_threshold = normalizers["latency"].normalize(torch.tensor(np.log1p(client_default_timeout))).item()
+
+    # All perturbed targets have shape (n_epinet_indexes * batch_size) in n_epinet_indexes blocks of batch_size
+    # Estimated cost is shape (n_epinet_indexes, batch_size), which flattens into n_epinet_indexes blocks of batch_size
     loss_latency = right_censored_hinge_loss(estimated_costs["latency"].flatten(),
                                              perturbed_targets["perturbed_latency"],
                                              is_censored,
@@ -405,11 +556,15 @@ def train_step(model, optimizer, normalizers,
     optimizer.step()
     optimizer.zero_grad()
 
+    # per_abs_error = torch.abs(estimated_costs["latency"].flatten() - perturbed_targets["perturbed_latency"])
+    # mean_per_abs_error = torch.mean(per_abs_error.view(n_epi_indexes_train, -1).T, dim = 1)
+    # executions_buffer.update_priorities(samples_with_targets.indices, mean_per_abs_error)
+
     return total_loss.detach().cpu().item(), estimated_variances
 
 
 def main_train(queries_train,
-               client,
+               execution_strategy,
                model_kwargs,
                precomputed_indexes, precomputed_masks,
                alpha_mlp, alpha_ensemble, sigma, lambda_aux_task,
@@ -417,18 +572,21 @@ def main_train(queries_train,
                beam_width, n_epochs,
                samples_per_train, train_step_batch_size, n_batches_per_train_step, n_steps_before_train,
                gpu_device):
-    async_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(async_loop)
-    async_loop.run_until_complete(client.create_session())
+
+    # async_loop = asyncio.new_event_loop()
+    # asyncio.set_event_loop(async_loop)
+    # async_loop.run_until_complete(client.create_session())
+
+    execution_strategy.setup()
+    client_default_timeout = execution_strategy.default_timeout_s
 
     execution_result_cache = PlanBestPerformanceCache()
     executions_buffer = ExecutionReplayBuffer(buffer_size=50000,
                                               epi_index_dim=model_kwargs["epinet_index_dim"],
                                               device=gpu_device)
-    client_default_timeout = client.default_timeout_s
 
     mp.set_start_method('spawn', force=True)
-    num_workers = 1
+    num_workers = 4
 
     # Create the model here once and obtain the state_dict to pass to the workers
     epinet_latency_estimation = prepare_epinet_model(**model_kwargs, device=gpu_device)
@@ -517,10 +675,11 @@ def main_train(queries_train,
 
         # Backpressure
         queries_in_flight = 0
-        max_in_flight = samples_per_train + (num_workers * beam_width)
+        max_in_flight = (samples_per_train * 2) + (num_workers * beam_width)
 
         # Metric tracking
         epoch_train_losses = []
+        epoch_latencies = []
 
         with tqdm(total=len(loader)) as pbar:
             while completed_queries < len(loader):
@@ -529,29 +688,45 @@ def main_train(queries_train,
                 while queries_in_flight < max_in_flight:
                     try:
                         query = next(loader_iter)
-                        query_queue.put(query)
+
+                        # Deconstruct PyG Batch to a dictionary, then convert tensors to NumPy
+                        safe_query = tensors_to_numpy(query.to_data_list()[0].to_dict())
+                        query_queue.put(safe_query)
+
                         queries_in_flight += 1
                     except StopIteration:
                         break
 
                 result = plan_queue.get()
                 queries_in_flight -= 1
+
+                query_tensors = {
+                    k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+                    for k, v in result["query"].items()
+                }
+                # Build standard Data object, then collate properly
+                query_data = Data.from_dict(query_tensors)
+                reconstructed_query = Batch.from_data_list([query_data])
+
                 for plan in result['top_k_plans']:
-                    train_buffer.append({"query": result["query"], "plan": plan})
+                    train_buffer.append({"query": reconstructed_query, "plan": plan})
 
                 completed_queries += 1
                 queries_since_last_train += 1
 
                 pbar.update(1)
                 if queries_since_last_train >= samples_per_train and completed_queries > n_steps_before_train:
-                    execution_results = execute_plans(client, train_buffer, async_loop, 1)
-                    process_execution_results(execution_results,
-                                              client_default_timeout=client_default_timeout,
-                                              result_cache=execution_result_cache,
-                                              executions_buffer=executions_buffer,
-                                              normalizers=normalizers,
-                                              epi_index_dim=epinet_latency_estimation.epi_index_dim,
-                                              device=gpu_device)
+                    execution_results = execution_strategy.execute(train_buffer)
+                    # execution_results = execute_plans(client, train_buffer, async_loop, 1)
+                    avg_latency, avg_total_cost = process_execution_results(
+                        execution_results=execution_results,
+                        client_default_timeout=client_default_timeout,
+                        result_cache=execution_result_cache,
+                        executions_buffer=executions_buffer,
+                        normalizers=normalizers,
+                        epi_index_dim=epinet_latency_estimation.epi_index_dim,
+                        device=gpu_device
+                    )
 
                     for i in range(n_batches_per_train_step):
                         train_loss, estimates_variance = train_step(
@@ -570,19 +745,24 @@ def main_train(queries_train,
                             device=gpu_device,
                         )
                         epoch_train_losses.append(train_loss)
+                        epoch_latencies.append(avg_latency)
 
                         for uncertainty_queue in uncertainty_queues:
+                            # Move updated weights to the forward pass executor process
                             uncertainty_queue.put(estimates_variance)
 
                     # Update running average
                     running_avg_loss = sum(epoch_train_losses) / len(epoch_train_losses)
+                    running_avg_latency = sum(epoch_latencies) / len(epoch_latencies)
                     pbar.set_postfix({
                         "Epoch Avg Loss": f"{running_avg_loss:.4f}",
-                        "Recent Loss": f"{train_loss:.4f}"
+                        "Epoch Avg Latency": f"{running_avg_latency:.4f}",
+                        "Recent Loss": f"{train_loss:.4f}",
+                        "Recent Latency": f"{avg_latency:.4f}"
                     })
 
                     # Move updated weights to the forward pass executor process
-                    updated_state_dict = {k: v.cpu() for k, v in epinet_latency_estimation.state_dict().items()}
+                    updated_state_dict = {k: v.cpu().numpy() for k, v in epinet_latency_estimation.state_dict().items()}
                     weights_queue.put(updated_state_dict)
 
                     queries_since_last_train = 0
@@ -596,21 +776,18 @@ def main_train(queries_train,
     inference_queue.put(None)
     gpu_process.join()
 
-    async_loop.run_until_complete(client.close())
-    async_loop.close()
+    execution_strategy.teardown()
+    # async_loop.run_until_complete(client.close())
+    # async_loop.close()
     print("Training Complete.")
 
     #TODO:
-    # - Implement validation step after each epoch
     # - Annealing method to slowly switch from exploration with epinet on cost to epinet on latency
+    # - Investigate the difference between batch mean and total mean as annealing value for both latency and cost.
+    #   So basically a measure of how stable the uncertainty is, where if latency is equally stable it will switch
+    #   entirely to latency based exploration
     # - PER instead of on-policy learning
-    # - Add scaffolding to run GNCE, base-cost estimation, epinet-cost estimation, and live epinet cost estimation
-    # in eval mode with beam search (by implementing the AbstractAgentClass, building a script that takes as input
-    # an agent and some queries and runs them)
-    # - For robust query planning use: Conditional Value at Risk (CVaR / Expected Shortfall)
-    # - This should be when the agent is set to eval mode
-    # - For optimization of eval mode we can look into incremental tree building. Where you just append
-    # some tensors to current representation. Only do this when it actually is publication ready
+    # - Ray-based round-robin scheduling of queries to multiple machines on LAN
 
     #TODO: Experiments default
     # - Experiment on same queries
@@ -634,8 +811,6 @@ def main_train(queries_train,
     #  prevent forgetting in some smart way.
     #  Or we could even do generation through an endpoint and ranking possible next walks by epistemic uncertainty.
     #  so not only guide plan generation but also training data generation through uncertainty estimates
-    # 3. Train an epinet on the standard optimizer??? What if we could make that bad boy robust?
-    # What is replacement for last_feature
 
 
 def main_online_estimation_experiment(endpoint_location, queries_location_train, queries_location_val,
@@ -650,10 +825,12 @@ def main_online_estimation_experiment(endpoint_location, queries_location_train,
                                       train_step_batch_size,
                                       n_batches_per_train_step,
                                       n_steps_before_train,
-                                      device):
-    queries_train, queries_val, client, writer = \
+                                      device,
+                                      use_ray=False, ray_endpoints=None):
+    queries_train, queries_val, execution_strategy, writer = \
         prepare_experiment(endpoint_location, queries_location_train, queries_location_val,
-                           rdf2vec_vector_location, occurrences_location, tp_cardinality_location)
+                           rdf2vec_vector_location, occurrences_location, tp_cardinality_location,
+                           use_ray=use_ray, ray_endpoints=ray_endpoints)
 
     precomputed_indexes = precompute_left_deep_tree_conv_index(20)
     precomputed_masks = precompute_left_deep_tree_node_mask(20)
@@ -690,10 +867,12 @@ def main_online_estimation_experiment(endpoint_location, queries_location_train,
         "mlp_dimension": mlp_dimension,
         "model_weights": trained_epinet_location,
         "strict": False,
+        #TODO: Change to false when we have trained epinet
+        "cost_only": True,
     }
 
     main_train(queries_train,
-               client,
+               execution_strategy,
                model_kwargs,
                precomputed_indexes,
                precomputed_masks,
@@ -738,6 +917,9 @@ def parameter_train_wrapper():
     weight_decay = 0.04
     n_epochs = 25
 
+    use_ray = True
+    ray_endpoints = [f"http://127.0.0.2:{8888 + i}" for i in range(1)]
+
     endpoint_location = "http://localhost:8888"
     queries_location_train = "data/generated_queries/star_yago_gnce/dataset_train"
     queries_location_val = "data/generated_queries/star_yago_gnce/dataset_val"
@@ -748,8 +930,9 @@ def parameter_train_wrapper():
     model_config_emb = "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_separate_head.yaml"
 
     model_config_prior = "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
+    #TODO: This should be a trained epinet
     trained_cost_model_dir = ("experiments/experiment_outputs/yago_gnce/supervised_epinet_training/"
-                              "simulated_cost-03-03-2026-08-56-11")
+                              "simulated_cost-24-03-2026-16-36-28")
     best_epinet_dir = find_best_epoch_directory(trained_cost_model_dir, "val_loss_cost_unscaled")
     trained_model_file = str(os.path.join(best_epinet_dir, "epinet_model.pt"))
 
@@ -777,6 +960,8 @@ def parameter_train_wrapper():
                                       train_step_batch_size=train_step_batch_size,
                                       n_batches_per_train_step=n_batches_per_train_step,
                                       n_steps_before_train=n_steps_before_train,
+                                      use_ray=use_ray,
+                                      ray_endpoints=ray_endpoints,
                                       )
 
 

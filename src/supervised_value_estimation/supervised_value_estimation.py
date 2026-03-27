@@ -310,7 +310,7 @@ def main_supervised_value_estimation(cfg: DictConfig):
     )
     combined_model = QueryPlansPredictionModel(embedding_model, cost_net_attention_pooling, device)
     epinet_cost_estimation = MultiHeadEpistemicNetwork(
-        2, cfg.models.epinet.prior_config, combined_model, device=device
+        32, cfg.models.epinet.prior_config, combined_model, device=device
     )
 
     experiment_base_dir = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training"

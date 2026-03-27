@@ -1,0 +1,42 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+dataset:
+  endpoint_location: "http://localhost:9999/blazegraph/namespace/yago/sparql"
+  queries_train: "data/generated_queries/star_yago_gnce/dataset_train"
+  queries_val: "data/generated_queries/star_yago_gnce/dataset_val"
+  rdf2vec_vector_location: "data/rdf2vec_embeddings/yago_gnce/model.json"
+  occurrences_location: "data/term_occurrences/yago_gnce/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/yago_gnce/tp_cardinalities.json"
+  save_loc_simulated: "data/simulated_query_plan_data/star_yago_gnce_log_sum/data"
+  save_loc_simulated_val: "data/simulated_query_plan_data/star_yago_gnce_log_sum/val_data"
+
+models:
+  oracle:
+    config: "experiments/model_configs/pretrain_model/t_cv_repr_huge_graph_norm.yaml"
+    experiment_dir: "experiments/experiment_outputs/yago_gnce/pretrain_experiment_huge_oracle_graph_norm-02-03-2026-12-37-06"
+  embedder:
+    config: "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_separate_head.yaml"
+    experiment_dir: "experiments/experiment_outputs/yago_gnce/pretrained_models/pretrain_experiment_triple_conv_graph_norm-02-03-2026-10-52-01"
+  epinet:
+    prior_config: "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
+    experiment_dir: "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost-25-03-2026-12-43-43"
+
+hyperparameters:
+  query_batch_size: 8
+  n_epi_indexes_train: 16
+  n_epi_indexes_val: 200
+  sigma: 0.60
+  alpha_mlp: 0.08
+  alpha_ensemble: 0.30
+  lr: 0.0001
+  weight_decay: 0.04
+  n_epochs: 25
+  mlp_dimension: 64
+  epinet_index_dim: 32
+  num_workers: 6
+
+execution:
+  train_epi_network: True

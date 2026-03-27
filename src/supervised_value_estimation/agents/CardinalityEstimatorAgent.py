@@ -10,16 +10,10 @@ from src.supervised_value_estimation.agents.AbstractAgent import AbstractCostAge
 
 
 class CardinalityEstimatorValidationAgent(AbstractCostAgent):
-    def __init__(self, model,
-                 inference_queue, result_queue, worker_id,
+    def __init__(self,
                  estimator_fn,
                  estimator_requires_features = True,
                  ):
-        self.model = model
-        self.inference_queue = inference_queue
-        self.result_queue = result_queue
-        self.worker_id = worker_id
-
         self.current_query = None
         self.estimator_requires_features = estimator_requires_features
         self.estimator_fn = estimator_fn
@@ -34,20 +28,17 @@ class CardinalityEstimatorValidationAgent(AbstractCostAgent):
         return
 
     def estimate_costs(self, possible_next, query_state):
-        # Format the plans
-        formatted_plans = [(p,) for p in possible_next]
-
         # Construct subqueries from plans
-        sub_queries = [self.reduced_form_query(self.current_query, plan) for plan in formatted_plans]
+        sub_queries = [self.reduced_form_query(self.current_query.to_data_list()[0], plan) for plan in possible_next]
 
         # For ML-based methods (like GNCE) we pass the features as batch
         if self.estimator_requires_features:
             batch = Batch.from_data_list(sub_queries)
             estimates = self.estimator_fn(batch)
-            return estimates, []
+            return estimates, [None for _ in range(len(possible_next))]
 
         # For cardinality estimators in G-Care we pass the subqueries to the estimator
-        return self.estimator_fn(sub_queries)
+        return self.estimator_fn(sub_queries), [None for _ in range(len(possible_next))]
 
     def reduced_form_query(self, query, join_order, device=torch.device('cpu')):
         # Only get set join_order, slice out all unset 0 padding entries of join order array

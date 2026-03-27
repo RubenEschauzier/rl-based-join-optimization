@@ -112,17 +112,3 @@ def get_size_data(data):
 
 if __name__ == "__main__":
     pass
-    # path_to_data = os.path.join(ROOT_DIR, 'data', 'pretrain_data', 'generated_queries',
-    #                             'sub_sampled_predicate_edge_undirected')
-    # endpoint_location = "http://localhost:9999/blazegraph/namespace/watdiv/sparql"
-    #
-    # rdf2vec_vector_location = os.path.join(ROOT_DIR, "data/input/rdf2vec_vectors_gnce/vectors_gnce.json")
-    # vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
-    # query_env = BlazeGraphQueryEnvironment(endpoint_location)
-    #
-    # query_to_graph = QueryToEdgePredicateGraph(vectors, query_env)
-    # featurizer_edge_labeled_graph = functools.partial(query_to_graph.transform_undirected)
-    # dataset = QueryCardinalityDataset(root=path_to_data,
-    #                                   featurizer=featurizer_edge_labeled_graph,
-    #                                   to_load=500
-    #                                   )
