@@ -18,7 +18,6 @@ from src.query_environments.blazegraph.query_environment_blazegraph import Blaze
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
-from src.query_featurizers.quad_views import FeaturizeQueryGraphQuadViews
 
 
 def load_data_txt_file(location, to_load=None):

@@ -507,11 +507,9 @@ def train_step(model, optimizer, normalizers,
                lambda_aux_task,
                alpha_mlp, alpha_ensemble, sigma, device):
     #TODO:
-    # - Fix simulated query plans / cost estimation to use log of total cost instead of sum of log(cost). As
-    # (as I should know) sum(log(x)) = log(prod(x)) giving too much penalty to big queries
-    # - If this doesn't work (making worse or whatever) investigate the alignment of predictions and targets over epi
-    # indexes
     # - Investigate the popart normalization approach
+    # - Validate annealing works by logging it
+    # - Validate PER
     samples_with_targets = retrieve_buffer_samples(batch_size=train_step_batch_size,
                                                    execution_buffer=executions_buffer,
                                                    reward_cache=execution_result_cache)
@@ -782,12 +780,9 @@ def main_train(queries_train,
     print("Training Complete.")
 
     #TODO:
-    # - Annealing method to slowly switch from exploration with epinet on cost to epinet on latency
     # - Investigate the difference between batch mean and total mean as annealing value for both latency and cost.
     #   So basically a measure of how stable the uncertainty is, where if latency is equally stable it will switch
     #   entirely to latency based exploration
-    # - PER instead of on-policy learning
-    # - Ray-based round-robin scheduling of queries to multiple machines on LAN
 
     #TODO: Experiments default
     # - Experiment on same queries

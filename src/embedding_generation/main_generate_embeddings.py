@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 
-from onehot_entity_embedding import main_onehot_embedding
 from rdf2vec_entity_embedding import main_rdf2vec, rdf2vec_embedding_low_memory, train_model
 
 if __name__ == "__main__":
@@ -13,7 +12,6 @@ if __name__ == "__main__":
 
     project_root = os.getcwd()
     use_saved_walks = False
-    onehot_embed = False
     rdf2vec_embed = True
     memory_save = False
 
@@ -38,11 +36,6 @@ if __name__ == "__main__":
             vector_dict[word] = vector
         with open(rdf2vec_vector_save_location.replace('.txt', '.json'), 'w', encoding='utf-8') as f:
             json.dump(vector_dict, f, ensure_ascii=False, indent=2)
-
-    elif onehot_embed:
-        onehot_embedding_save_location = os.path.join(project_root, "output", "entity_embeddings",
-                                                      "embeddings_onehot_encoded.txt")
-        main_onehot_embedding(instantiation_benchmark_location, onehot_embedding_save_location)
 
     elif rdf2vec_embed and memory_save:
 

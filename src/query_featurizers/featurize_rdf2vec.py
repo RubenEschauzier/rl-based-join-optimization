@@ -15,7 +15,7 @@ class FeaturizeQueriesRdf2Vec:
         self.vector_size = len(list(self.vectors.values())[0])
         pass
 
-    def run(self, queries: [Query], disable_progress_bar=False):
+    def run(self, queries: list[Query], disable_progress_bar=False):
         estimates = self.get_cardinality_estimates_query_set(queries, disable_progress_bar=disable_progress_bar)
         for i in tqdm(range(len(queries)), disable=disable_progress_bar):
             featurized = self.featurize_query(queries[i], estimates[i])
