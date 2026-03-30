@@ -1,25 +1,13 @@
 import asyncio
 import math
-import os
-
 import aiohttp
 import json
-
-import memray
 import ray
 
 
 @ray.remote
 class QLeverOptimizerClientRay:
     def __init__(self, http_endpoint: str):
-        # 1. Define one output file per worker process
-        self.output_file = f"worker_{os.getpid()}_continuous_profile.bin"
-
-        # 2. Initialize the tracker
-        self.tracker = memray.Tracker(self.output_file)
-
-        # 3. Manually enter the context to start profiling
-        self.tracker.__enter__()
         """
         Initializes the client as a stateful Ray Actor.
         :param http_endpoint: The HTTP URL (e.g., "http://localhost:7001")
@@ -151,7 +139,6 @@ class QLeverOptimizerClientRay:
         joins = self._extract_join_sequence_success(qlever_result)
         if not joins:
             if 'error' not in qlever_result:
-                print(qlever_result)
                 raise ValueError("Unknown qlever result structure")
             joins = self._extract_join_sequence_fallback(qlever_result['error'])
         return joins

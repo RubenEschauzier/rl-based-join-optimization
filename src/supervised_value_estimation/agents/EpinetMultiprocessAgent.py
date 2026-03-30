@@ -9,7 +9,7 @@ from src.supervised_value_estimation.typings.typings import EnvState
 
 class EpinetMultiprocessAgent(AbstractCostAgent):
     def __init__(self, model,
-                 inference_queue, result_queue, uncertainty_queue, worker_id,
+                 inference_queue, result_queue, blending_weight_queue, worker_id,
                  precomputed_indexes, precomputed_masks,
                  alpha_mlp, alpha_ensemble,
                  head_name = "plan_cost",
@@ -28,10 +28,10 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         self.head_name = head_name
 
         self.annealing_method = annealing_method
-        self.uncertainty_queue = uncertainty_queue
+        self.blending_weight_queue = blending_weight_queue
         self.head_uncertainties = {}
         self.ema_alpha = ema_alpha
-        self.blending_weight = 0
+        self.blending_weight = 0.0
 
     def setup_episode(self, query):
         """
@@ -48,9 +48,8 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         # At start of new episode, check if the agent has new uncertainty estimates to update annealing parameters
         try:
             while True:
-                estimate_variances = self.uncertainty_queue.get_nowait()
-                self.update_uncertainty(estimate_variances)
-                self.get_annealing_coefficients()
+                self.blending_weight = self.blending_weight_queue.get_nowait()
+
         except queue.Empty:
             pass
 
@@ -93,8 +92,8 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         epinet_latency = self.estimate_cost_head(gpu_results, query_state, unweighted_priors, "latency")
         epinet_cost = self.estimate_cost_head(gpu_results, query_state, unweighted_priors, "plan_cost")
 
-        combined_value_estimate = (self.blending_weight * epinet_latency.view(-1)
-                                   + (1 - self.blending_weight) * epinet_cost.view(-1))
+        combined_value_estimate = (self.blending_weight * epinet_latency.view(-1) +
+                                   (1-self.blending_weight) * epinet_cost.view(-1))
 
         # Combine relevant (frozen) environment states and return. This will be stored in the buffer
         environment_state: List[EnvState] = []
@@ -107,9 +106,6 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
                 "z": query_state["z"].cpu().numpy()
             })
 
-        if self.blending_weight != 0:
-            #TODO: Validate this blending weight to be a 'normal' value
-            pass
         return combined_value_estimate.tolist(), environment_state
 
     def estimate_cost_head(self, results, query_state, unweighted_priors, head_name):
@@ -121,31 +117,6 @@ class EpinetMultiprocessAgent(AbstractCostAgent):
         # Combine for total output
         return est_cost + learnable_mlp + (self.alpha_mlp * mlp_prior) + (
                     self.alpha_ensemble * ensemble_prior)
-
-    def update_uncertainty(self, estimate_variances):
-        for key, variance in estimate_variances.items():
-            if key not in self.head_uncertainties:
-                self.head_uncertainties[key] = { "average": variance, "min": variance, "max": variance}
-            else:
-                current_uncertainty = self.head_uncertainties[key]["average"]
-                new_uncertainty = (1-self.ema_alpha) * current_uncertainty + self.ema_alpha * variance
-                self.head_uncertainties[key]["average"] = new_uncertainty
-
-                if self.head_uncertainties[key]["min"] > new_uncertainty:
-                    self.head_uncertainties[key]["min"] = new_uncertainty
-
-                if self.head_uncertainties[key]["max"] < new_uncertainty:
-                    self.head_uncertainties[key]["max"] = new_uncertainty
-
-
-    def get_annealing_coefficients(self):
-        if self.annealing_method == "epistemic_uncertainty":
-            #TODO: Validate the shape of this function and its values in practice
-            self.blending_weight = np.exp(-1 * self.head_uncertainties["latency"]["average"])
-            pass
-        else:
-            raise NotImplementedError("Annealing Method Not Implemented")
-        pass
 
     @staticmethod
     def inference_result_to_torch(result):

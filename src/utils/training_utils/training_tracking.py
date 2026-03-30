@@ -34,6 +34,8 @@ class TrainSummary:
 
     def update_best(self, values, epoch):
         for key, value in values.items():
+            if self.best_values[key]["type"] == "list":
+                continue
             best_value = getattr(builtins, self.best_values[key]["type"])(value, self.best_values[key]["value"])
             # We found a better value
             if best_value == value:

@@ -104,7 +104,8 @@ class ExecutionReplayBuffer:
         self.c_vectors[self.pos] = c_vectors_observation
 
         if self.use_per:
-            self.priorities[self.pos] = self.max_priority
+            current_max = np.max(self.priorities[:self.pos]) if self.pos > 0 else 1.0
+            self.priorities[self.pos] = current_max
         else:
             self.priorities[self.pos] = 1.0
 
@@ -155,11 +156,7 @@ class ExecutionReplayBuffer:
 
         # Add small epsilon to guarantee non-zero probability
         self.priorities[indices_np] = priorities_np + 1e-6
-
-        # Track the maximum priority for new additions
-        self.max_priority = max(self.max_priority, np.max(priorities_np))
-
-        print(self.priorities)
+        return
 
     def _to_torch(self, array: np.ndarray) -> torch.Tensor:
         return torch.tensor(array, device=self.device)

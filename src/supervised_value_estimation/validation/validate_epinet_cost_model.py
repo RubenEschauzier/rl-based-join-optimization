@@ -1,3 +1,4 @@
+import json
 import os
 from functools import partial
 
@@ -57,7 +58,7 @@ def run_validation(model_kwargs, epinet_hyperparams, locations_dict):
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
     # Set weights dir to best epoch result
-    best = find_best_epoch_directory(model_kwargs["model_weights"], "val_loss_cost_unscaled")
+    best = find_best_epoch_directory(model_kwargs["model_weights"], "val_joint_gaussian_nll")
     model_kwargs["model_weights"] = str(os.path.join(best, "epinet_model.pt"))
 
     # Precompute some fixed values
@@ -88,7 +89,6 @@ def run_validation(model_kwargs, epinet_hyperparams, locations_dict):
     return metrics
 
 if __name__ == "__main__":
-    #TODO: Adjust this to load epinet fully and correctly
     locations = {
         "endpoint": "http://localhost:9999/blazegraph/namespace/yago/sparql",
         "endpoint_query_execution": "http://localhost:8888",
@@ -97,18 +97,20 @@ if __name__ == "__main__":
         "occurrences_location": "data/term_occurrences/yago_gnce/occurrences.json",
         "tp_cardinality_location": "data/term_occurrences/yago_gnce/tp_cardinalities.json",
     }
+    output_location = "experiments/experiment_outputs/yago_gnce/validation/epinet_cost_model.json"
     model_kwargs_dict = {
         "full_gnn_config": "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_separate_head.yaml",
         "config_ensemble_prior": "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml",
         "model_weights": "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/"
-                         "simulated_cost-24-03-2026-18-06-08",
+                         "simulated_cost_epinet_training-25-03-2026-22-26-33",
         "mlp_dimension": 64,
         "epinet_index_dim": 32,
-        "cost_only": True,
     }
     epinet_hyperparams_dict = {
         "alpha_mlp": 0.08,
         "alpha_ensemble": .3,
         "n_epinet_samples": 64,
     }
-    run_validation(model_kwargs_dict, epinet_hyperparams_dict, locations)
+    metrics_val = run_validation(model_kwargs_dict, epinet_hyperparams_dict, locations)
+    with open(os.path.join(output_location), 'w') as f:
+        json.dump(metrics_val, f)

@@ -35,6 +35,8 @@ class QLeverOptimizerClient:
         Executes the query via HTTP and retrieves the full execution plan + costs.
         """
         timeout = self.default_timeout
+        test = query_obj.query
+        test1 = 5
         if query_obj.query in self.query_timeouts:
             timeout = self.format_latency(self.query_timeouts[query_obj.query])
 

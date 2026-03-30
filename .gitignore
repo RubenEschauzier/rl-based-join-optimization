@@ -201,3 +201,6 @@ data/*
 !/data/rdf2vec_embeddings/*/.keep
 
 /.prior_cache
+
+!/data_supervised_only/.keep
+/data_supervised_only

@@ -148,3 +148,5 @@ Werkzeug==3.1.4
 wrapt==2.0.1
 yappi==1.7.3
 yarl==1.22.0
+aiohttp
+ray

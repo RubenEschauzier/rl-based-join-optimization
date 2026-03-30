@@ -1,3 +1,5 @@
+import json
+import os
 from functools import partial
 
 import torch
@@ -6,6 +8,8 @@ from torch_geometric.data import DataLoader
 from main import find_best_epoch_directory
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_environments.qlever.qlever_execute_query_default import QLeverOptimizerClient
+from src.supervised_value_estimation.online_supervised_value_estimation import AsyncExecutionStrategy, \
+    RayExecutionStrategy
 from src.supervised_value_estimation.supervised_value_estimation import prepare_cardinality_estimator
 from src.supervised_value_estimation.agents.CardinalityEstimatorAgent import CardinalityEstimatorValidationAgent
 from src.supervised_value_estimation.validation.validation_runner import multiprocess_validate_agent
@@ -51,7 +55,9 @@ def build_cardinality_agent(estimator_builder_fn, estimator_kwargs, estimator_re
 
 def run_validation(model_parameters, locations_dict):
     query_env_data_prep = BlazeGraphQueryEnvironment(locations_dict["endpoint"])
-    client = QLeverOptimizerClient(locations_dict["endpoint_query_execution"])
+    execution_strategy = RayExecutionStrategy([locations_dict["endpoint_query_execution"]])
+    execution_strategy.setup()
+    # client = QLeverOptimizerClient(locations_dict["endpoint_query_execution"])
 
     val_dataset = load_queries_into_dataset_single(
         locations_dict["queries_loc"],
@@ -82,20 +88,19 @@ def run_validation(model_parameters, locations_dict):
     # Execute validation using the generic pipeline
     metrics = multiprocess_validate_agent(
         val_loader=val_loader,
-        client=client,
+        execution_strategy=execution_strategy,
         agent_builder_fn=build_cardinality_agent,
         agent_kwargs=agent_kwargs,
         beam_width=8,
-        num_workers=8,
-        max_concurrent_db_queries=4,
+        num_workers=4,
         samples_per_execution_batch=32,
-        client_default_timeout=30.0
     )
-
+    execution_strategy.teardown()
     return metrics
 
 
 if __name__ == "__main__":
+    output_location = "experiments/experiment_outputs/yago_gnce/validation/epinet_cost_model.json"
     locations = {
         "endpoint": "http://localhost:9999/blazegraph/namespace/yago/sparql",
         "endpoint_query_execution": "http://localhost:8888",
@@ -109,4 +114,6 @@ if __name__ == "__main__":
         "trained_model_dir": "experiments/experiment_outputs/yago_gnce/pretrained_models/"
                              "pretrain_experiment_triple_conv_graph_norm-02-03-2026-10-52-01",
     }
-    run_validation(model_configs, locations)
+    metrics_val = run_validation(model_configs, locations)
+    with open(os.path.join(output_location), 'w') as f:
+        json.dump(metrics_val, f)

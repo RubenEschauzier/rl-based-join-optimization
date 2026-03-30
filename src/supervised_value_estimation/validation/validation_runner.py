@@ -4,12 +4,13 @@ from collections import defaultdict
 
 import torch
 import torch.multiprocessing as mp
-import asyncio
+
+from torch_geometric.data import Data, Batch
 from tqdm import tqdm
 import numpy as np
 
-from src.supervised_value_estimation.online_supervised_value_estimation import evaluate_batch_async
 from src.supervised_value_estimation.search_algorithms.beam_search_left_deep import beam_search
+from src.supervised_value_estimation.utils.utils import tensors_to_numpy
 
 
 def cpu_search_worker(query_queue, plan_queue,
@@ -27,16 +28,27 @@ def cpu_search_worker(query_queue, plan_queue,
     )
 
     while True:
-        query = query_queue.get()
-        if query is None:  # Poison pill to shut down
+        safe_query = query_queue.get()
+        # Poison pill to shut down
+        if safe_query is None:
             break
+
+        # Reconstruct PyTorch tensors
+        query_tensors = {
+            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+            for k, v in safe_query.items()
+        }
+
+        # Rebuild PyG Batch
+        query_data = Data.from_dict(query_tensors)
+        query = Batch.from_data_list([query_data])
 
         start_time = time.perf_counter()
         top_k_plans = beam_search(query, agent, beam_width)
         planning_time = time.perf_counter() - start_time
 
         plan_queue.put({
-            "query": query,
+            "query": safe_query,
             "top_k_plans": top_k_plans,
             "planning_time": planning_time
         })
@@ -44,27 +56,21 @@ def cpu_search_worker(query_queue, plan_queue,
 
 def multiprocess_validate_agent(
         val_loader,
-        client,
+        execution_strategy,
         agent_builder_fn,
         agent_kwargs,
         beam_width=4,
         num_workers=4,
-        max_concurrent_db_queries=4,
-        samples_per_execution_batch=32,
-        client_default_timeout=60.0
+        samples_per_execution_batch=8,
+        display_metrics = False,
 ):
     """
     Executes a multiprocess validation pipeline for a generic search agent.
     """
-    async_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(async_loop)
-    async_loop.run_until_complete(client.create_session())
-
     mp.set_start_method('spawn', force=True)
 
     query_queue = mp.Queue()
     plan_queue = mp.Queue()
-
 
     workers = []
     for i in range(num_workers):
@@ -88,12 +94,12 @@ def multiprocess_validate_agent(
 
     with tqdm(total=len(val_loader), desc="Validating") as pbar:
         while completed_queries < len(val_loader):
-
-            # Maintain backpressure
             while queries_in_flight < max_in_flight:
                 try:
                     query = next(loader_iter)
-                    query_queue.put(query)
+                    # Convert to numpy for safe multiprocessing transport
+                    safe_query = tensors_to_numpy(query.to_data_list()[0].to_dict())
+                    query_queue.put(safe_query)
                     queries_in_flight += 1
                 except StopIteration:
                     break
@@ -104,47 +110,47 @@ def multiprocess_validate_agent(
 
             if result['top_k_plans']:
                 best_plan = result['top_k_plans'][0]
-                execution_plans.append({"query": result["query"], "plan": best_plan})
+
+                # Reconstruct PyG batch
+                query_tensors = {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in
+                                 result["query"].items()}
+
+                query_data = Data.from_dict(query_tensors)
+                reconstructed_query = Batch.from_data_list([query_data])
+                execution_plans.append({"query": reconstructed_query, "plan": best_plan})
 
             completed_queries += 1
             pbar.update(1)
 
-            # Execute database queries in batches
             if len(execution_plans) >= samples_per_execution_batch or completed_queries == len(val_loader):
-                batch_results = async_loop.run_until_complete(
-                    evaluate_batch_async(client, execution_plans, max_concurrent=max_concurrent_db_queries)
-                )
+                # Abstracted execution handles Ray vs Async automatically
+                batch_results = execution_strategy.execute(execution_plans)
                 execution_results.extend(batch_results)
                 execution_plans.clear()
-
-            # Early stopping condition (adjust or parameterize as needed)
-            if completed_queries > 1000:
                 break
-
-    # Initiate shutdown
     for _ in range(num_workers):
         query_queue.put(None)
 
-    # Drain the plan queue
+    # Drain the results queue to unblock workers waiting to .put()
     while queries_in_flight > 0:
         try:
-            plan_queue.get(timeout=5)
+            # Timeout prevents infinite hangs if a worker crashed
+            plan_queue.get(timeout=5.0)
             queries_in_flight -= 1
         except queue.Empty:
+            print("\nWarning: Queue empty before all in-flight queries were drained. A worker may have crashed.")
             break
-        except (FileNotFoundError, EOFError, RuntimeError):
-            queries_in_flight -= 1
 
     for p in workers:
         p.join()
 
-    async_loop.run_until_complete(client.close())
-    async_loop.close()
+    # Pass the strategy's timeout dynamically
+    metrics = compile_validation_metrics(execution_results, planning_times, execution_strategy.default_timeout_s)
+    if display_metrics:
+        display_validation_metrics(metrics)
 
-    metrics = compile_validation_metrics(execution_results, planning_times, client_default_timeout)
-    display_validation_metrics(metrics)
-    return metrics
-
+    # Return BOTH metrics and raw results for Epinet calibration
+    return metrics, execution_results
 
 def compile_validation_metrics(execution_results, planning_times, timeout_val):
     latencies = []
@@ -183,14 +189,12 @@ def compile_validation_metrics(execution_results, planning_times, timeout_val):
 def run_multiple_validations(
         n_runs,
         val_loader,
-        client,
+        execution_strategy,
         agent_builder_fn,
         agent_kwargs,
         beam_width=4,
         num_workers=4,
-        max_concurrent_db_queries=4,
         samples_per_execution_batch=32,
-        client_default_timeout=60.0
 ):
     """Executes the validation pipeline multiple times and computes aggregated metrics."""
     all_metrics = defaultdict(list)
@@ -200,16 +204,14 @@ def run_multiple_validations(
         print(f"STARTING VALIDATION RUN {run + 1}/{n_runs}")
         print("="*50)
 
-        metrics = multiprocess_validate_agent(
+        metrics, _ = multiprocess_validate_agent(
             val_loader=val_loader,
-            client=client,
+            execution_strategy=execution_strategy,
             agent_builder_fn=agent_builder_fn,
             agent_kwargs=agent_kwargs,
             beam_width=beam_width,
             num_workers=num_workers,
-            max_concurrent_db_queries=max_concurrent_db_queries,
             samples_per_execution_batch=samples_per_execution_batch,
-            client_default_timeout=client_default_timeout
         )
 
         for key, value in metrics.items():

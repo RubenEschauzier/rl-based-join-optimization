@@ -1,0 +1,48 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+dataset:
+  endpoint_location: "http://localhost:8888"
+  queries_train: "data/generated_queries/star_yago_gnce/dataset_train"
+  queries_val: "data/generated_queries/star_yago_gnce/dataset_val"
+  rdf2vec_vector_location: "data/rdf2vec_embeddings/yago_gnce/model.json"
+  occurrences_location: "data/term_occurrences/yago_gnce/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/yago_gnce/tp_cardinalities.json"
+
+models:
+  embedder:
+    config: "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_separate_head.yaml"
+  epinet:
+    prior_config: "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
+    experiment_dir: "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost_epinet_training-25-03-2026-22-26-33"
+  trained:
+    experiment_base_dir: "experiments/experiment_outputs/yago_gnce/online_epinet_training"
+
+hyperparameters:
+  num_workers: 4
+  beam_width: 4
+  mlp_dimension_full: 64
+  n_steps_before_train: 0
+  samples_per_train: 12
+  train_step_batch_size: 128
+  n_batches_per_train_step: 2
+  lambda_aux_task: 0.2
+  n_epi_indexes_train: 16
+  n_epi_indexes_val: 100
+  use_per: True
+  epinet_index_dim: 32
+  sigma: 0.60
+  alpha_mlp: 0.08
+  alpha_ensemble: 0.30
+  lr: 0.0001
+  weight_decay: 0.04
+  n_epochs: 25
+
+execution:
+  use_ray: True
+  ray_endpoints:
+      - "http://192.168.129.4:7000"
+      - "http://192.168.129.4:7001"
+      - "http://192.168.129.4:7002"
