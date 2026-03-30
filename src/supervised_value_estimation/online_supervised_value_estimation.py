@@ -974,7 +974,6 @@ def main_train(queries_train,
     #TODO:
     # - Validate GNCE performance
     # - Figure out why epinet is not training (womp womp)
-    # - Add experiment writer
     # - Run experiment on virtual wall
 
     #TODO: Experiments default
