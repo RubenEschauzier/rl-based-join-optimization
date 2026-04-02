@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from src.random_query_generation.generation_validation import analyze_query_dataset_statistics, \
     analyze_all_term_coverage
+from src.utils.generation_utils.generation_utils import filter_isomorphic_queries
 
 # Configuration
 SEED_SUBJECTS = 50000
@@ -137,7 +138,12 @@ def build_query_string(subject: str, predicates: tuple, objects: list, bind_subj
     query = f"SELECT (COUNT(*) AS ?res) WHERE {{ {' '.join(where_clauses)} }}"
     return query, entities, where_clauses
 
-def get_queries(dataset_name: str, n_triples: int = 1, n_queries: int = 1000, endpoint_url: str = None):
+def get_queries(
+        dataset_dir: str,
+                dataset_name: str,
+                n_triples: int = 1,
+                n_queries: int = 1000,
+                endpoint_url: str = None):
     print("Initializing global graph statistics...")
     total_subjects = get_total_subject_count(endpoint_url)
     global_predicates = get_global_predicates(endpoint_url)
@@ -204,19 +210,21 @@ def get_queries(dataset_name: str, n_triples: int = 1, n_queries: int = 1000, en
 
     pbar.close()
 
+    testdata = filter_isomorphic_queries(testdata)
+
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     filename = f"{dataset_name}_stars_{timestamp}_{n_triples}.json"
-    with open(filename, "w") as fp:
+    loc = os.path.join(dataset_dir, filename)
+    with open(loc, "w") as fp:
         json.dump(testdata, fp, indent=2)
 
-    analyze_query_dataset_statistics(filename)
-    analyze_all_term_coverage(filename, endpoint_url, 15)
+    analyze_query_dataset_statistics(loc)
+    # analyze_all_term_coverage(loc, endpoint_url, 15)
     return testdata
 
 
 if __name__ == "__main__":
     n_triples_to_sample = [2, 3, 5, 8]
     for n in n_triples_to_sample:
-        get_queries("star-yago-gnce-empty",
+        get_queries("data/generated_queries/star_yago_empty", "star-yago-gnce-empty",
                     n_triples=n, n_queries=5000, endpoint_url="http://localhost:8888")
-        break

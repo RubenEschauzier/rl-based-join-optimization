@@ -196,3 +196,27 @@ def fetch_global_vocabulary(endpoint_url: str) -> tuple:
                 db_literals[term_value] += count
 
     return db_uris, db_literals
+
+
+def count_queries_with_duplicate_triples(queries):
+    """
+    Counts how many queries contain identical (duplicate) triple patterns.
+
+    Args:
+        queries (list of list of tuples): A dataset of queries, where each
+                                          query is a list of (subject, predicate, object) tuples.
+
+    Returns:
+        int: The total number of queries containing duplicates.
+    """
+    duplicate_count = 0
+
+    for query in queries:
+        # Sets automatically remove duplicate elements
+        unique_triples = set(query)
+
+        # If the set is smaller than the list, duplicates exist
+        if len(query) != len(unique_triples):
+            duplicate_count += 1
+
+    return duplicate_count
