@@ -1138,7 +1138,7 @@ def run_online_estimation(cfg: DictConfig):
 
 
 @hydra.main(version_base=None, config_path="../../experiments/experiment_configs/online_cost_latency_estimation",
-            config_name="online_supervised_latency_cost_estimation_epinet.yaml")
+            config_name="online_supervised_latency_cost_estimation_epinet_distributed_virtual_wall.yaml")
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 

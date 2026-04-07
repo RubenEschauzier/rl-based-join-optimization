@@ -21,7 +21,7 @@ models:
     experiment_base_dir: "experiments/experiment_outputs/yago_gnce/online_epinet_training"
 
 hyperparameters:
-  num_workers: 10
+  num_workers: 12
   beam_width: 6
   mlp_dimension_full: 64
   n_steps_before_train: 1028
