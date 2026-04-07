@@ -130,7 +130,9 @@ class RayExecutionStrategy:
         # pool.map automatically routes tasks to idle actors.
         # It guarantees the output list matches the order of the input 'plans' list,
         # ensuring zip() aligns the metrics perfectly with the original items.
-        raw_results = list(self.pool.map(submit_query, plans))
+        raw_results = []
+        for result in tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans"):
+            raw_results.append(result)
 
         # Parse results locally
         for item, raw_result in zip(plans, raw_results):
