@@ -16,7 +16,7 @@ models:
     config: "experiments/model_configs/policy_networks/t_cv_repr_graph_norm_separate_head.yaml"
   epinet:
     prior_config: "experiments/model_configs/prior_networks/prior_t_cv_smallest.yaml"
-    experiment_dir: "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost-24-03-2026-16-36-28"
+    experiment_dir: "experiments/experiment_outputs/yago_gnce/supervised_epinet_training/simulated_cost_epinet_training-25-03-2026-22-26-33"
   trained:
     experiment_base_dir: "experiments/experiment_outputs/yago_gnce/online_epinet_training"
 
