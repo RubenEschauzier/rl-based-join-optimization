@@ -33,13 +33,13 @@ class QLeverOptimizerClientRay:
             await self.create_session()
         return self._session
 
-    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s") -> dict:
+    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True) -> dict:
         """
         Executes the query via HTTP and retrieves the full execution plan + costs.
         """
-        timeout = self.default_timeout
-        if query_obj["query"] in self.query_timeouts:
-            timeout = self.format_latency(self.query_timeouts[query_obj["query"]])
+        # timeout = self.default_timeout
+        # if query_obj["query"] in self.query_timeouts:
+        #     timeout = self.format_latency(self.query_timeouts[query_obj["query"]])
 
         formatted_query = self._apply_join_order(query_obj, join_order)
         # We use 'application/qlever-results+json' to get the runtimeInformation field
@@ -54,6 +54,7 @@ class QLeverOptimizerClientRay:
             "timeout": timeout
         }
         session = await self._get_session()
+        result = None
         try:
             # Note: Sending query as data with the sparql-query content type
             # is the most robust way to handle large queries.
@@ -68,7 +69,7 @@ class QLeverOptimizerClientRay:
                         time_in_seconds = self.decode_to_seconds(time_total)
                         self.query_timeouts[query_obj["query"]] = max(min((time_in_seconds * 2), self.default_timeout_s),
                                                                    1)
-                    return {
+                    result = {
                         "success": True,
                         "runtime_info": result.get("runtimeInformation", {}),
                         "query_plan": result.get("queryExecutionPlan", ""),
@@ -76,13 +77,17 @@ class QLeverOptimizerClientRay:
                     }
                 else:
                     error_text = await response.text()
-                    return {"success": False, "error": error_text}
+                    result = {"success": False, "error": error_text}
 
         except asyncio.TimeoutError:
-            return {"success": False, "error": "Query timed out"}
+            result = {"success": False, "error": "Query timed out"}
         except Exception as e:
-            return {"success": False, "error": str(e), "payload": response}
+            result = {"success": False, "error": str(e)}
 
+        if parse_local:
+            return self.extract_signal(result)
+        else:
+            return result
     def _walk_tree(self, node: dict, join_sequence: list):
         """Recursively extracts Join operations via post-order traversal."""
         if not node:

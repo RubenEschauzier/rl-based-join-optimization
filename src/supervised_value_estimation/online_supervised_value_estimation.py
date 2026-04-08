@@ -99,14 +99,14 @@ class RayExecutionStrategy:
 
         from src.query_environments.qlever.qlever_execute_query_ray import QLeverOptimizerClientRay as RayClient
 
-        # 1. Instantiate the actors
         self.actors = [RayClient.remote(url) for url in ray_endpoints]
-
-        # 2. Wrap them in a Ray ActorPool for dynamic load balancing
         self.pool = ActorPool(self.actors)
 
-        # 3. Local dummy parser to avoid remote execution overhead for simple dictionary extraction
         self.local_parser = QLeverOptimizerClient("dummy_endpoint")
+
+        self.query_timeouts = {}
+        self.default_timeout = self.local_parser.default_timeout
+
 
     def setup(self):
         pass
@@ -125,18 +125,31 @@ class RayExecutionStrategy:
 
             best_plan = item["plan"]["plan"]
 
-            return actor.execute_plan.remote(query_payload, join_order=best_plan)
+            timeout = self.default_timeout
+            if query_data.query in self.query_timeouts:
+                timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
+
+            execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
+                                                         timeout=timeout)
+
+            return execution_result
 
         # pool.map automatically routes tasks to idle actors.
         # It guarantees the output list matches the order of the input 'plans' list,
         # ensuring zip() aligns the metrics perfectly with the original items.
         raw_results = []
         for result in tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans"):
+            # Tighten bounds on successful execution
+            time_query = result["time_total"]
+            if time_query != "0ms":
+                time_in_seconds = self.decode_to_seconds(time_query)
+                self.query_timeouts[query_obj["query"]] = max(min((time_in_seconds * 2), self.default_timeout_s),
+                                                              1)
+
             raw_results.append(result)
 
-        # Parse results locally
         for item, raw_result in zip(plans, raw_results):
-            item["rl_metrics"] = self.local_parser.extract_signal(raw_result)
+            item["rl_metrics"] = raw_result
 
         return plans
 
