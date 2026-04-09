@@ -138,13 +138,16 @@ class RayExecutionStrategy:
         # It guarantees the output list matches the order of the input 'plans' list,
         # ensuring zip() aligns the metrics perfectly with the original items.
         raw_results = []
-        for result in tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans"):
+        for i, result in enumerate(tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans")):
+            # Reconstruct query_data from the original plans list using the index
+            query_data = plans[i]["query"].to_data_list()[0]
+            query_string = query_data.query
+
             # Tighten bounds on successful execution
             time_query = result["time_total"]
             if time_query != "0ms":
-                time_in_seconds = self.decode_to_seconds(time_query)
-                self.query_timeouts[query_obj["query"]] = max(min((time_in_seconds * 2), self.default_timeout_s),
-                                                              1)
+                time_in_seconds = self.local_parser.decode_to_seconds(time_query)
+                self.query_timeouts[query_string] = max(min((time_in_seconds * 2), self.default_timeout_s),1)
 
             raw_results.append(result)
 
