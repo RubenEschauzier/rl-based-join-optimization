@@ -171,7 +171,8 @@ class QLeverOptimizerClientRay:
             "total_cost": total_rows,
             "latency": latency,
             "is_error": False,
-            "is_valid_join_row": is_valid_join_row
+            "is_valid_join_row": is_valid_join_row,
+            "time_total": time_string
         }
 
     def extract_signal(self, qlever_result: dict) -> dict:
@@ -200,7 +201,8 @@ class QLeverOptimizerClientRay:
                 "total_cost": total_rows,
                 "latency": latency,
                 "is_error": True,
-                "is_valid_join_row": is_valid_join_row
+                "is_valid_join_row": is_valid_join_row,
+                "time_total": qlever_result['time_total']
             }
 
     @staticmethod
