@@ -1,3 +1,5 @@
+from abc import ABC
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -20,7 +22,9 @@ class BatchedKroneckerAdapters(Module):
         self.d_phm = d_phm
 
         # Ensure dimensions are divisible by d_phm
-        assert in_channels % d_phm == 0 and out_channels % d_phm == 0
+        if not in_channels % d_phm == 0 or not out_channels % d_phm == 0:
+            raise ValueError(f"in_channels: {in_channels} % d_phm: {d_phm} != 0 "
+                             f"or out_channels: {out_channels} % d_phm: {d_phm} != 0")
         self.in_local = in_channels // d_phm
         self.out_local = out_channels // d_phm
 
@@ -58,19 +62,19 @@ class BatchedKroneckerAdapters(Module):
         num_experts = self.num_experts
         d_in = self.d_phm * self.in_local
         d_out = self.d_phm * self.out_local
+        print(h)
         h = h.reshape(num_experts, d_in, d_out)
 
         return self.dropout(h)
 
 
-class TripleGineConvMoE(MessagePassing):
-    def __init__(self, in_channels: int, out_channels: int, num_experts: int = 4,
-                 d_phm: int = 4, rank: int = 4, top_k: int = 0, eps: float = 0.,
+class TripleGineConvMoE(MessagePassing, ABC):
+    def __init__(self, nn: torch.nn.Module, num_experts: int = 4,
+                 d_phm: int = 4, rank: int = 4, top_k: int = 3, eps: float = 0.,
                  train_eps: bool = False, edge_dim: Optional[int] = None, **kwargs):
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
 
-        self.in_channels = in_channels
         self.top_k = top_k
         self.initial_eps = eps
         self.DIRECTIONAL = True
@@ -80,19 +84,39 @@ class TripleGineConvMoE(MessagePassing):
         else:
             self.register_buffer('eps', torch.Tensor([eps]))
 
+        # Infer input/output channels from the provided neural network
+        if isinstance(nn, torch.nn.Sequential):
+            first_layer = nn[0]
+            last_layer = nn[-1] if hasattr(nn[-1], 'out_features') else nn[-2]
+        else:
+            first_layer = nn
+            last_layer = nn
+
+        if hasattr(first_layer, 'in_features'):
+            in_channels = first_layer.in_features
+        elif hasattr(first_layer, 'in_channels'):
+            in_channels = first_layer.in_channels
+        else:
+            raise ValueError("Could not infer input channels from `nn`.")
+
+        out_channels = last_layer.out_features
+
+        self.in_channels = in_channels
+
         if edge_dim is not None:
             self.lin = Linear(edge_dim + 2 * in_channels, in_channels)
         else:
             self.lin = None
 
         # Frozen backbone component [cite: 61]
-        self.W0 = Linear(in_channels, out_channels)
+        self.W0 = nn
 
         # MoE Components
         self.experts = BatchedKroneckerAdapters(in_channels, out_channels, num_experts, d_phm, rank)
 
         # Router: Projects contextualized node embeddings to expert scores [cite: 98]
         self.router = Linear(in_channels, num_experts)
+        self.current_routing_probs = None
 
         self.reset_parameters()
 
@@ -100,9 +124,14 @@ class TripleGineConvMoE(MessagePassing):
         self.eps.data.fill_(self.initial_eps)
         if self.lin is not None:
             self.lin.reset_parameters()
-        self.W0.reset_parameters()
+        reset(self.W0)
         self.experts.reset_parameters()
         self.router.reset_parameters()
+
+    def freeze_backbone(self):
+        """Freezes the main neural network pathway to prevent catastrophic forgetting."""
+        for param in self.W0.parameters():
+            param.requires_grad = False
 
     def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
                 edge_attr: OptTensor = None, size: Size = None) -> Tensor:
@@ -118,6 +147,7 @@ class TripleGineConvMoE(MessagePassing):
 
         # 2. Routing Mechanism [cite: 98]
         routing_scores = self.router(out)
+        self.current_routing_probs = F.softmax(routing_scores, dim=-1)
 
         if self.top_k > 0:
             # Sparse Routing (Top-K)
@@ -129,16 +159,15 @@ class TripleGineConvMoE(MessagePassing):
             routing_weights.scatter_(1, topk_indices, topk_weights)
         else:
             # Soft Routing (Dense) [cite: 101, 102]
-            routing_weights = F.softmax(routing_scores, dim=-1)
+            routing_weights = self.current_routing_probs
 
-            # 3. Expert Evaluation (Vectorized)
+        # 3. Expert Evaluation (Vectorized)
         h_experts = self.experts.get_expert_matrices()  # Shape: (E, D_in, D_out)
 
         # Frozen pathway output [cite: 61]
         frozen_out = self.W0(out)
 
-        # Calculate MoE output in one step: sum_e (weight_e * (X @ H_e + b_e))
-        # einsum computes the matrix multiplication and weighting simultaneously
+        # Calculate MoE output in one step
         moe_out = torch.einsum('ne, nd, edf -> nf', routing_weights, out, h_experts)
         moe_bias = torch.einsum('ne, ef -> nf', routing_weights, self.experts.bias)
 
@@ -153,3 +182,9 @@ class TripleGineConvMoE(MessagePassing):
 
         edge_attr = edge_attr[:, :-1]
         return self.lin(torch.cat((x_i, edge_attr, x_j), 1)).relu()
+
+    def get_current_routing_probs(self) -> Tensor:
+        return self.current_routing_probs
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(W0={self.W0})'

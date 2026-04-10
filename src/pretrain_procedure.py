@@ -18,10 +18,6 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
     val_predictions = []
     for val_batch in val_dataset_loader:
         with torch.no_grad():
-            # pred = model.forward(x=val_batch.x.double(),
-            #                      edge_index=val_batch.edge_index,
-            #                      edge_attr=val_batch.edge_attr.double(),
-            #                      batch=val_batch.batch)
             pred = model.forward(x=val_batch.x.to(device),
                                  edge_index=val_batch.edge_index.to(device),
                                  edge_attr=val_batch.edge_attr.to(device),
@@ -47,8 +43,9 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device):
         })
     return np.mean(losses), np.mean(maes), np.mean(q_errors), val_predictions
 
-def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
-                            seed, test_queries=None, test_cardinalities=None):
+def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location,
+                            device, n_epoch, batch_size, lr,):
+    lambda_aux = 0.01
     print("Training on {} queries, device: {}".format(len(train_dataset), device))
 
     model_factory_gine_conv= ModelFactory(model_config_location)
@@ -89,6 +86,9 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
             y = torch.log(batch.y.to(device) + 1)
 
             loss = loss_fn(pred.squeeze(), y)
+            aux_load_balance_loss = gine_conv_model.get_load_balancing_loss()
+            if aux_load_balance_loss:
+                loss += lambda_aux * aux_load_balance_loss
             loss.backward()
 
             optimizer.step()
@@ -136,7 +136,6 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
                                                            multiplicity_location=multiplicity_location)
-    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
-                            seed, test_queries=test_queries, test_cardinalities=test_cardinalities)
+    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr)
     return train_dataset, val_dataset
 

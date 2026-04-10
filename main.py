@@ -26,7 +26,7 @@ def get_config_name():
     parser.add_argument(
         "--config",
         type=str,
-        default="pretrain_ppo_qr_dqn_naive_tree_lstm_yago_stars",
+        default="pretrain_experiment_triple_conv_moe_graph_norm.yaml",
         help="Optional Hydra config name"
     )
     args, remaining = parser.parse_known_args()

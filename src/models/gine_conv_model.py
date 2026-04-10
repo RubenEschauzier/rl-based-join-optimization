@@ -2,26 +2,27 @@ import inspect
 import os
 import warnings
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 import torch_geometric
-from torch.nn import ReLU, Linear
-from torch_geometric.nn import GINEConv
+from torch_geometric.nn import GINEConv, Sequential
 
 from src.models.model_layers.directional_gine_conv import DirectionalGINEConv
 from src.models.model_layers.triple_gine_conv import TripleGineConv
+from src.models.model_layers.triple_gine_conv_moe import TripleGineConvMoE
 from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
 
 
 class GINEConvModel(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.embedding_model = None
+        self.embedding_model: Optional[Sequential] = None
         self.heads = torch.nn.ModuleList()
         self.head_types = []
         self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus', 'LayerNorm']
         self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
-        self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'DirectionalGINEConv']
+        self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'TripleGINEConvMoE', 'DirectionalGINEConv']
         self.supported_normalization = ['PairNorm', 'GraphNorm']
         self.verbose = 0
 
@@ -97,6 +98,7 @@ class GINEConvModel(torch.nn.Module):
             layer_class_map = {
                 'GINEConv': GINEConv,
                 'TripleGINEConv': TripleGineConv,
+                'TripleGINEConvMoE': TripleGineConvMoE,
                 'DirectionalGINEConv': DirectionalGINEConv
             }
             conv_class = layer_class_map.get(layer_type)
@@ -138,6 +140,33 @@ class GINEConvModel(torch.nn.Module):
             output = head_model(**filtered_input)
             outputs.append({'output_type': head_type, 'output': output})
         return outputs
+
+    def get_load_balancing_loss(self) -> torch.Tensor | None:
+        """Computes the auxiliary loss across all MoE layers."""
+        aux_loss = torch.Tensor(0)
+        moe_layers = 0
+
+        has_moe_layer = False
+        for module in self.modules():
+            if isinstance(module, TripleGineConvMoE):
+                has_moe_layer = True
+                routing_prob = module.get_current_routing_probs()
+                num_nodes, num_experts = routing_prob.shape
+
+                # Sum probabilities over all nodes for each expert
+                # sum_P shape: (num_experts,)
+                sum_probability_nodes = routing_prob.sum(dim=0)
+
+                # Compute equation 11
+                layer_loss = (num_experts / (num_nodes ** 2)) * torch.sum(sum_probability_nodes ** 2)
+                aux_loss += layer_loss
+                moe_layers += 1
+
+        if not has_moe_layer:
+            return None
+
+        # Average the loss across all MoE layers in the network
+        return aux_loss / max(1, moe_layers)
 
     def serialize_model(self, model_dir):
         embedding_state_dict = self.embedding_model.state_dict()
