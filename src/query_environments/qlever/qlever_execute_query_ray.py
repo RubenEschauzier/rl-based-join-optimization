@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import math
+
 import aiohttp
 import json
 import ray
@@ -18,6 +20,12 @@ class QLeverOptimizerClientRay:
         self.default_timeout_s = 60
         self._session: aiohttp.ClientSession | None = None
 
+        self.logger = logging.getLogger(f"QLeverActor.{http_endpoint}")
+        self.logger.setLevel(logging.DEBUG)
+        handler = logging.FileHandler(f"actor_{http_endpoint.replace('/', '_')}.log")
+        handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+        self.logger.addHandler(handler)
+
     async def create_session(self):
         # Limit connections to prevent overwhelming a single-core target
         connector = aiohttp.TCPConnector(limit=10)
@@ -33,8 +41,10 @@ class QLeverOptimizerClientRay:
             await self.create_session()
         return self._session
 
-    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True,
-                           log_debug = None) -> dict:
+    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True,) -> dict:
+        return await self._execute(query_obj, join_order, timeout, parse_local)
+
+    async def _execute(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True,) -> dict:
         """
         Executes the query via HTTP and retrieves the full execution plan + costs.
         """
@@ -65,9 +75,9 @@ class QLeverOptimizerClientRay:
                                     data=formatted_query, timeout=client_timeout) as response:
                 if response.status == 200:
                     result = await response.json()
-                    if log_debug:
-                        response_size_mb = len(json.dumps(result).encode('utf-8')) / 1024 ** 2
-                        log_debug.debug(f"[MEM] response_payload={response_size_mb:.1f}MB")
+
+                    response_size_mb = len(json.dumps(result).encode('utf-8')) / 1024 ** 2
+                    self.logger.debug(f"[MEM] response_payload={response_size_mb:.1f}MB")
                     # time_total = result.get("time", {}).get("total", "0ms")
 
                     # # Tighten bounds on successful execution

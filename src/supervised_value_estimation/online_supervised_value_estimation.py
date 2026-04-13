@@ -93,16 +93,19 @@ class AsyncExecutionStrategy:
 class RayExecutionStrategy:
     """Handles distributed execution across multiple baremetal servers via Ray."""
 
-    def __init__(self, ray_endpoints: list[str],
+    def __init__(self,
+                 ray_endpoints: list[str],
+                 num_workers: int = 4,
                  logging_location='ray_execution_error.log',
                  debug_location='ray_execution_debug.log'):
         if not ray.is_initialized():
             context = ray.init()
             print(context.dashboard_url)
 
-        from src.query_environments.qlever.qlever_execute_query_ray import QLeverOptimizerClientRay as RayClient
-
-        self.actors = [RayClient.remote(url) for url in ray_endpoints]
+        from src.query_environments.qlever.qlever_multi_execute_ray import MultiEndpointWorker as RayClient
+        chunks = [ray_endpoints[i::num_workers] for i in range(num_workers)]
+        self.actors = [RayClient.remote(chunk) for chunk in chunks]
+        # self.actors = [RayClient.remote(url) for url in ray_endpoints]
         self.pool = ActorPool(self.actors)
 
         self.local_parser = QLeverOptimizerClient("dummy_endpoint")
