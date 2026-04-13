@@ -51,7 +51,9 @@ class QLeverOptimizerClientRay:
         # Add an internal fallback timeout slightly larger than the QLever timeout
         client_timeout = aiohttp.ClientTimeout(total=self.default_timeout_s + 30)
         params = {
-            "timeout": timeout
+            "timeout": timeout,
+            # Ensure empty response to save memory
+            "send": 0
         }
         session = await self._get_session()
         result = None
@@ -64,11 +66,11 @@ class QLeverOptimizerClientRay:
                     result = await response.json()
                     time_total = result.get("time", {}).get("total", "0ms")
 
-                    # Tighten bounds on successful execution
-                    if time_total != "0ms":
-                        time_in_seconds = self.decode_to_seconds(time_total)
-                        self.query_timeouts[query_obj["query"]] = max(min((time_in_seconds * 2), self.default_timeout_s),
-                                                                   1)
+                    # # Tighten bounds on successful execution
+                    # if time_total != "0ms":
+                    #     time_in_seconds = self.decode_to_seconds(time_total)
+                    #     self.query_timeouts[query_obj["query"]] = max(min((time_in_seconds * 2), self.default_timeout_s),
+                    #                                                1)
                     result = {
                         "success": True,
                         "runtime_info": result.get("runtimeInformation", {}),

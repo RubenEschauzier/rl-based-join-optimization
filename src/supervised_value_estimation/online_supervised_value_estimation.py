@@ -212,6 +212,12 @@ class RayExecutionStrategy:
                     exc_info=True
                 )
 
+            except StopIteration:
+                self.crash_logger.error(
+                    f"[{i}] Pool exhausted early — likely a prior actor crash killed the iterator"
+                )
+                break
+
             except Exception as e:
                 self.crash_logger.error(
                     f"[{i}] Unexpected error | query={query_string[:120]} | "
