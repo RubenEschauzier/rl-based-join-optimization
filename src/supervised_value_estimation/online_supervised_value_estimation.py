@@ -157,7 +157,7 @@ class RayExecutionStrategy:
             )
 
             execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
-                                                         timeout=timeout, log_debug = self.debug_logger)
+                                                         timeout=timeout)
 
             return execution_result
 
