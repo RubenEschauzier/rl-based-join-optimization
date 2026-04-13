@@ -33,7 +33,8 @@ class QLeverOptimizerClientRay:
             await self.create_session()
         return self._session
 
-    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True) -> dict:
+    async def execute_plan(self, query_obj, join_order: list[int] = None, timeout: str = "10s", parse_local=True,
+                           log_debug = None) -> dict:
         """
         Executes the query via HTTP and retrieves the full execution plan + costs.
         """
@@ -64,7 +65,10 @@ class QLeverOptimizerClientRay:
                                     data=formatted_query, timeout=client_timeout) as response:
                 if response.status == 200:
                     result = await response.json()
-                    time_total = result.get("time", {}).get("total", "0ms")
+                    if log_debug:
+                        response_size_mb = len(json.dumps(result).encode('utf-8')) / 1024 ** 2
+                        log_debug.debug(f"[MEM] response_payload={response_size_mb:.1f}MB")
+                    # time_total = result.get("time", {}).get("total", "0ms")
 
                     # # Tighten bounds on successful execution
                     # if time_total != "0ms":

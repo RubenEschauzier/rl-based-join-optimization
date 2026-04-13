@@ -150,11 +150,11 @@ class RayExecutionStrategy:
             mem = ray.available_resources().get("memory", None)
             self.debug_logger.debug(
                 f"Submitting query | available_ray_memory={mem} | "
-                f"timeout={timeout} | query={query_data.query[:120]}"
+                f"timeout={timeout} | query={query_data.query}"
             )
 
             execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
-                                                         timeout=timeout)
+                                                         timeout=timeout, log_debug = self.debug_logger)
 
             return execution_result
 
