@@ -49,7 +49,7 @@ class QLeverOptimizerClientRay:
         }
 
         # Add an internal fallback timeout slightly larger than the QLever timeout
-        client_timeout = aiohttp.ClientTimeout(total=self.default_timeout_s + 5)
+        client_timeout = aiohttp.ClientTimeout(total=self.default_timeout_s + 30)
         params = {
             "timeout": timeout
         }
@@ -88,6 +88,7 @@ class QLeverOptimizerClientRay:
             return self.extract_signal(result)
         else:
             return result
+
     def _walk_tree(self, node: dict, join_sequence: list):
         """Recursively extracts Join operations via post-order traversal."""
         if not node:

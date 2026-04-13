@@ -1,3 +1,4 @@
+import logging
 import os
 import queue
 from collections import defaultdict
@@ -92,7 +93,7 @@ class AsyncExecutionStrategy:
 class RayExecutionStrategy:
     """Handles distributed execution across multiple baremetal servers via Ray."""
 
-    def __init__(self, ray_endpoints: list[str]):
+    def __init__(self, ray_endpoints: list[str], logging_location='ray_execution.log', debug_location='ray_debug.log'):
         if not ray.is_initialized():
             context = ray.init()
             print(context.dashboard_url)
@@ -107,6 +108,21 @@ class RayExecutionStrategy:
         self.query_timeouts = {}
         self.default_timeout = self.local_parser.default_timeout
 
+        # Crash Logger (Errors/OOMs)
+        self.crash_logger = logging.getLogger('RayExecutionErrorLogger')
+        self.crash_logger.setLevel(logging.ERROR)
+        error_handler = logging.FileHandler(logging_location)
+        error_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+        self.crash_logger.addHandler(error_handler)
+        self.crash_logger.propagate = False
+
+        # Debug Logger (All outputs)
+        self.debug_logger = logging.getLogger('RayExecutionDebugLogger')
+        self.debug_logger.setLevel(logging.DEBUG)
+        debug_handler = logging.FileHandler(debug_location)
+        debug_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+        self.debug_logger.addHandler(debug_handler)
+        self.debug_logger.propagate = False
 
     def setup(self):
         pass
@@ -114,42 +130,57 @@ class RayExecutionStrategy:
     def execute(self, plans: list):
         """Executes plans using load-aware scheduling."""
 
-        # Define the execution instruction for the pool
         def submit_query(actor, item):
             query_data = item["query"].to_data_list()[0]
-
             query_payload = {
                 "query": query_data.query,
                 "triple_patterns": query_data.triple_patterns
             }
-
             best_plan = item["plan"]["plan"]
 
             timeout = self.default_timeout
             if query_data.query in self.query_timeouts:
                 timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
 
-            execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
-                                                         timeout=timeout)
+            return actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True, timeout=timeout)
 
-            return execution_result
-
-        # pool.map automatically routes tasks to idle actors.
-        # It guarantees the output list matches the order of the input 'plans' list,
-        # ensuring zip() aligns the metrics perfectly with the original items.
         raw_results = []
-        for i, result in enumerate(tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans")):
-            # Reconstruct query_data from the original plans list using the index
+
+        # Queue all tasks; pool.map returns a generator of ObjectRefs
+        refs_generator = self.pool.map(submit_query, plans)
+
+        for i in tqdm(range(len(plans)), desc="Executing Plans"):
             query_data = plans[i]["query"].to_data_list()[0]
             query_string = query_data.query
 
-            # Tighten bounds on successful execution
-            time_query = result["time_total"]
-            if time_query != "0ms":
-                time_in_seconds = self.local_parser.decode_to_seconds(time_query)
-                self.query_timeouts[query_string] = max(min((time_in_seconds * 2), self.default_timeout_s),1)
+            try:
+                object_ref = next(refs_generator)
+                result = ray.get(object_ref)
 
-            raw_results.append(result)
+                # Log every successful or handled-error result
+                self.debug_logger.debug(f"Query {i} Output:\n{result}\n")
+
+                time_query = result.get("time_total", "0ms")
+                if time_query != "0ms":
+                    time_in_seconds = self.local_parser.decode_to_seconds(time_query)
+                    self.query_timeouts[query_string] = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
+
+                raw_results.append(result)
+
+            except ray.exceptions.RayActorError as e:
+                # Catch hardware/memory crashes
+                self.crash_logger.error(f"ACTOR CRASH | Query {i}\nTrace: {str(e)}\nQuery: {query_string}")
+
+                # Mock a failed result to maintain list alignment
+                raw_results.append({
+                    "is_error": True,
+                    "error": "ACTOR_CRASH",
+                    "latency": self.default_timeout_s,
+                    "total_cost": 0,
+                    "per_join_rows": [],
+                    "is_valid_join_row": [],
+                    "time_total": "0ms"
+                })
 
         for item, raw_result in zip(plans, raw_results):
             item["rl_metrics"] = raw_result
@@ -162,7 +193,6 @@ class RayExecutionStrategy:
     @property
     def default_timeout_s(self) -> float:
         return self.local_parser.default_timeout_s
-
 
 def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor,
                     valid_mask: torch.Tensor) -> torch.Tensor:
