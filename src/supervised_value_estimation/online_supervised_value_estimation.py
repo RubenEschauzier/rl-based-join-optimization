@@ -96,13 +96,16 @@ class RayExecutionStrategy:
     def __init__(self,
                  ray_endpoints: list[str],
                  num_workers: int = 4,
-                 logging_location='ray_execution_error.log',
-                 debug_location='ray_execution_debug.log'):
+                 logging_location=os.path.join("logs","ray_execution_error.log"),
+                 debug_location=os.path.join("logs", "ray_execution_debug.log")
+                 ):
         if not ray.is_initialized():
             context = ray.init()
             print(context.dashboard_url)
 
         from src.query_environments.qlever.qlever_multi_execute_ray import MultiEndpointWorker as RayClient
+        num_workers = min(num_workers, len(ray_endpoints))
+
         chunks = [ray_endpoints[i::num_workers] for i in range(num_workers)]
         self.actors = [RayClient.remote(chunk) for chunk in chunks]
         # self.actors = [RayClient.remote(url) for url in ray_endpoints]
@@ -113,21 +116,29 @@ class RayExecutionStrategy:
         self.query_timeouts = {}
         self.default_timeout = self.local_parser.default_timeout
 
+        self.logger = logging.getLogger('RayExecutionLogger')
+        # Set the master logger to the lowest level you intend to capture
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
 
-        # Debug Logger (All outputs)
-        self.debug_logger = logging.getLogger('RayExecutionDebugLogger')
-        self.debug_logger.setLevel(logging.DEBUG)
+        # Create a single formatter to reuse
+        formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+
+        # Configure the Debug Handler (captures DEBUG, INFO, WARNING, ERROR, CRITICAL)
         debug_handler = logging.FileHandler(debug_location)
-        debug_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-        self.debug_logger.addHandler(debug_handler)
-        self.debug_logger.propagate = False
+        debug_handler.setLevel(logging.DEBUG)
+        debug_handler.setFormatter(formatter)
+        self.logger.addHandler(debug_handler)
 
-        self.crash_logger = logging.getLogger('RayExecutionLogger')
-        self.crash_logger.setLevel(logging.ERROR)
-        handler = logging.FileHandler(logging_location)
-        handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-        self.crash_logger.addHandler(handler)
-        self.crash_logger.propagate = False
+        # Configure the Crash Handler (captures ONLY ERROR and CRITICAL)
+        crash_handler = logging.FileHandler(logging_location)
+        crash_handler.setLevel(logging.ERROR)
+        crash_handler.setFormatter(formatter)
+        self.logger.addHandler(crash_handler)
+        if num_workers > len(ray_endpoints):
+            self.logger.debug(f"Num_workers: {num_workers} "
+                              f"> number of endpoints: {len(ray_endpoints)}"
+                              f"clamping number of workers to number of endpoints")
 
     def setup(self):
         pass
@@ -151,14 +162,13 @@ class RayExecutionStrategy:
                 timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
 
             mem = ray.available_resources().get("memory", None)
-            self.debug_logger.debug(
+            self.logger.debug(
                 f"Submitting query | available_ray_memory={mem} | "
                 f"timeout={timeout} | query={query_data.query}"
             )
 
             execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
                                                          timeout=timeout)
-
             return execution_result
 
         raw_results = [None] * len(plans)
@@ -172,7 +182,7 @@ class RayExecutionStrategy:
             try:
                 result = next(plan_iterator)
 
-                self.debug_logger.debug(
+                self.logger.debug(
                     f"[{i}] Raw result received | query={query_string[:120]} | result={result}"
                 )
 
@@ -180,7 +190,7 @@ class RayExecutionStrategy:
                 if time_query != "0ms":
                     time_in_seconds = self.local_parser.decode_to_seconds(time_query)
                     new_timeout = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
-                    self.debug_logger.debug(
+                    self.logger.debug(
                         f"[{i}] Tightening timeout | query={query_string[:120]} | "
                         f"time={time_query} | new_timeout={new_timeout:.2f}s"
                     )
@@ -189,40 +199,40 @@ class RayExecutionStrategy:
                 raw_results[i] = result
 
             except ray.exceptions.OutOfMemoryError as e:
-                self.crash_logger.error(
+                self.logger.error(
                     f"[{i}] OOM on actor | query={query_string[:120]} | error={e}",
                     exc_info=True
                 )
-                self.debug_logger.debug(
+                self.logger.debug(
                     f"[{i}] OOM — actor may have been killed | query={query_string[:120]}"
                 )
 
             except ray.exceptions.RayActorError as e:
                 # Actor died (OOM kill, segfault, etc.) — Ray will have already restarted it
-                self.crash_logger.error(
+                self.logger.error(
                     f"[{i}] Actor crashed | query={query_string[:120]} | error={e}",
                     exc_info=True
                 )
-                self.debug_logger.debug(
+                self.logger.debug(
                     f"[{i}] RayActorError — worker process died, likely OOM | "
                     f"query={query_string[:120]} | cause={e.__cause__}"
                 )
 
             except ray.exceptions.WorkerCrashedError as e:
                 # Worker was forcibly killed (e.g. by the OS OOM killer)
-                self.crash_logger.error(
+                self.logger.error(
                     f"[{i}] Worker killed by OS | query={query_string[:120]} | error={e}",
                     exc_info=True
                 )
 
             except StopIteration:
-                self.crash_logger.error(
+                self.logger.error(
                     f"[{i}] Pool exhausted early — likely a prior actor crash killed the iterator"
                 )
                 break
 
             except Exception as e:
-                self.crash_logger.error(
+                self.logger.error(
                     f"[{i}] Unexpected error | query={query_string[:120]} | "
                     f"error={type(e).__name__}: {e}",
                     exc_info=True
@@ -432,7 +442,6 @@ def process_execution_results(
 
     for execution in execution_results:
         query = execution["query"].to_data_list()[0].query
-
         metrics = execution["rl_metrics"]
         is_error = metrics["is_error"]
 
@@ -670,6 +679,9 @@ def train_step(model, optimizer, normalizers,
 
 def build_validation_agent(model_kwargs, agent_kwargs, state_dict, precomputed_indexes, precomputed_masks, device):
     """Wraps the existing validation agent and syncs the latest training weights."""
+    # Remove model weights as this is given by the passed state_dict
+    model_kwargs.pop("model_weights")
+
     epinet = prepare_epinet_model(**model_kwargs, device=device)
     epinet.load_state_dict(state_dict)
     epinet.eval()
@@ -696,7 +708,6 @@ def main_validate(val_loader, val_cache,
                   epoch_join_rows_losses, epoch_latencies, blending_weights,
                   train_summary, writer):
     val_cache.clear()
-    # client_default_timeout = execution_strategy.default_timeout_s
     current_state_dict = tensors_to_numpy(epinet_latency_estimation.state_dict())
     current_state_dict = {k: torch.from_numpy(v) for k, v in current_state_dict.items()}
 
@@ -1171,6 +1182,8 @@ def main_online_estimation_experiment(endpoint_location, queries_location_train,
         "model_weights": trained_epinet_location,
         "strict": False,
         "cost_only": False,
+        # Filter any diffs for join_rows and latency as these are new heads
+        "diff_filter": r"join_rows|latency"
     }
 
     main_train(queries_train,
@@ -1248,7 +1261,8 @@ def run_online_estimation(cfg: DictConfig):
     )
 
 
-@hydra.main(version_base=None, config_path="../../experiments/experiment_configs/online_cost_latency_estimation",
+@hydra.main(version_base=None,
+            config_path="../../experiments/experiment_configs/online_cost_latency_estimation",
             config_name="online_supervised_latency_cost_estimation_epinet_distributed_virtual_wall.yaml")
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)

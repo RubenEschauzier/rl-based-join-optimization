@@ -204,3 +204,6 @@ data/*
 
 !/data_supervised_only/.keep
 /data_supervised_only
+
+!/logs/.keep
+/logs

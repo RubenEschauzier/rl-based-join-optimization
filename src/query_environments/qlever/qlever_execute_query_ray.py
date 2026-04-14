@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import os
 
 import aiohttp
 import json
@@ -22,7 +23,7 @@ class QLeverOptimizerClientRay:
 
         self.logger = logging.getLogger(f"QLeverActor.{http_endpoint}")
         self.logger.setLevel(logging.DEBUG)
-        handler = logging.FileHandler(f"actor_{http_endpoint.replace('/', '_')}.log")
+        handler = logging.FileHandler(os.path.join("logs", f"actor_{http_endpoint.replace('/', '_')}.log"))
         handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
         self.logger.addHandler(handler)
 

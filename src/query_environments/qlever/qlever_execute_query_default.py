@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import math
+import os
+
 import aiohttp
 import json
 
@@ -21,7 +23,7 @@ class QLeverOptimizerClient:
         # Sanitize endpoint for filename
         sanitized_endpoint = http_endpoint.replace("http://", "").replace("https://", "").replace(":", "_").replace("/",
                                                                                                                     "_")
-        handler = logging.FileHandler(f"client_{sanitized_endpoint}.log")
+        handler = logging.FileHandler(os.path.join("logs", f"client_{sanitized_endpoint}.log"))
         handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
         self.logger.addHandler(handler)
 
@@ -72,7 +74,6 @@ class QLeverOptimizerClient:
 
                     response_size_mb = len(json.dumps(result).encode('utf-8')) / (1024 * 1024)
                     self.logger.debug(f"[MEM] response_payload={response_size_mb:.2f}MB")
-
                     result = {
                         "success": True,
                         "runtime_info": result.get("runtimeInformation", {}),
@@ -89,7 +90,8 @@ class QLeverOptimizerClient:
             result = {"success": False, "error": str(e)}
 
         if parse_local:
-            return self.extract_signal(result)
+            signal = self.extract_signal(result)
+            return signal
         else:
             return result
 

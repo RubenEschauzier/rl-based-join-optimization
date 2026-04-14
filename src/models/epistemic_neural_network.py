@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 from torch_geometric.loader import DataLoader
@@ -331,7 +332,7 @@ class MultiHeadEpistemicNetwork(nn.Module):
             }
             torch.save(checkpoint, os.path.join(model_dir, "epinet_model.pt"))
 
-    def load_epinet(self, path, load_only_cost_model=False, strict=True):
+    def load_epinet(self, path, load_only_cost_model=False, strict=True, diff_filter=None):
         """
         Loads the model weights. Can selectively load just the cost model
         even from a full Epinet checkpoint.
@@ -362,15 +363,22 @@ class MultiHeadEpistemicNetwork(nn.Module):
             else:
                 raise ValueError("Checkpoint does not contain 'state_dict'. It might be a raw cost model file.")
         if not strict:
-            print(f"Unexpected keys: ${unexpected}")
-            print(f"Missing keys: ${missing}")
+            if diff_filter:
+                pattern = re.compile(diff_filter)
+                # Filter out keys that match the regex pattern
+                missing = [k for k in missing if not pattern.search(k)]
+                unexpected = [k for k in unexpected if not pattern.search(k)]
+            if len(unexpected) > 0:
+                print(f"Unexpected keys: ${unexpected}")
+            if len(missing) > 0:
+                print(f"Missing keys: ${missing}")
 
 
 def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_dim, mlp_dimension,
                          heads_config, heads_config_prior,
                          device,
                          model_weights=None, cost_only=False, strict=True,
-                         freeze_embedding=True):
+                         freeze_embedding=True, diff_filter=None):
     model_factory_gine_conv = ModelFactory(full_gnn_config)
     embedding_model_full = model_factory_gine_conv.load_gine_conv()
 
@@ -386,7 +394,10 @@ def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_di
                                                        ensemble_prior_heads_config=heads_config_prior, device=device)
     epinet_cost_estimation.to(device)
     if model_weights:
-        epinet_cost_estimation.load_epinet(model_weights, load_only_cost_model=cost_only, strict=strict)
+        epinet_cost_estimation.load_epinet(model_weights,
+                                           load_only_cost_model=cost_only,
+                                           strict=strict,
+                                           diff_filter=diff_filter)
         if cost_only:
             print(f"Initialized cost model weights from {model_weights}")
         else:
