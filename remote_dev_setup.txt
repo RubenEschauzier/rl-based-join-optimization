@@ -1,0 +1,7 @@
+ssh-add /home/ruben-eschauzier/pemfiles/login_ilabt_imec_be_reschauz@ugent.be.pem
+
+# Start tunnel
+ssh -N -L 2222:n086-01.wall2.ilabt.iminds.be:22 fffreschauz@bastion.ilabt.imec.be &
+
+# Connect through tunnel
+ssh reschauz@127.0.0.1 -p 2222

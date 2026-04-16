@@ -42,7 +42,7 @@ from src.supervised_value_estimation.search_algorithms.beam_search_left_deep imp
 from src.supervised_value_estimation.storage.ExecutionReplayBuffer import ExecutionReplayBuffer, ExecutionBufferSamples, \
     ExecutionBufferSamplesWithTargets
 from src.supervised_value_estimation.supervised_value_estimation_cached_prior import validate_cached
-from src.supervised_value_estimation.utils.utils import tensors_to_numpy
+from src.supervised_value_estimation.utils.utils import tensors_to_numpy, numpy_to_tensors
 from src.supervised_value_estimation.validation.validation_runner import multiprocess_validate_agent
 
 from src.utils.training_utils.query_loading_utils import prepare_data
@@ -104,7 +104,7 @@ class RayExecutionStrategy:
                  debug_location=os.path.join("logs", "ray_execution_debug.log")
                  ):
         if not ray.is_initialized():
-            context = ray.init()
+            context = ray.init(num_cpus=num_workers)
             print(context.dashboard_url)
 
         from src.query_environments.qlever.qlever_multi_execute_ray import MultiEndpointWorker as RayClient
@@ -391,10 +391,11 @@ def cpu_search_worker_epinet(model_builder_fn, model_kwargs, state_dict,
         query = Batch.from_data_list([query_data])
 
         top_k_plans = beam_search(query, agent, beam_width)
+        top_k_plans_safe = tensors_to_numpy(top_k_plans)
 
         plan_queue.put({
             "query": safe_query,
-            "top_k_plans": top_k_plans
+            "top_k_plans": top_k_plans_safe
         })
 
 
@@ -979,7 +980,7 @@ def main_train(queries_train,
                 query_data = Data.from_dict(query_tensors)
                 reconstructed_query = Batch.from_data_list([query_data])
 
-                for plan in result['top_k_plans']:
+                for plan in numpy_to_tensors(result['top_k_plans']):
                     train_buffer.append({"query": reconstructed_query, "plan": plan})
 
                 completed_queries += 1

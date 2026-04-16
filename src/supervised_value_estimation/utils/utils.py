@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 
@@ -14,5 +15,17 @@ def tensors_to_numpy(obj):
         return [tensors_to_numpy(v) for v in obj]
     elif isinstance(obj, tuple):
         return tuple(tensors_to_numpy(v) for v in obj)
+    else:
+        return obj
+
+def numpy_to_tensors(obj):
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)
+    elif isinstance(obj, dict):
+        return {k: numpy_to_tensors(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_tensors(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(numpy_to_tensors(v) for v in obj)
     else:
         return obj

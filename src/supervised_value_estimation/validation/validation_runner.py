@@ -144,6 +144,11 @@ def multiprocess_validate_agent(
     for p in workers:
         p.join()
 
+    query_queue.close()
+    query_queue.join_thread()
+    plan_queue.close()
+    plan_queue.join_thread()
+
     # Pass the strategy's timeout dynamically
     metrics = compile_validation_metrics(execution_results, planning_times, execution_strategy.default_timeout_s)
     if display_metrics:
