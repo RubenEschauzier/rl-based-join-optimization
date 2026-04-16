@@ -49,7 +49,7 @@ from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, prec
 class AsyncExecutionStrategy:
     """Handles standard single-endpoint execution via asyncio."""
 
-    def __init__(self, endpoint_location: str, max_concurrent: int = 4):
+    def __init__(self, endpoint_location: str, max_concurrent: int = 2):
         self.client = QLeverOptimizerClient(endpoint_location)
         self.max_concurrent = max_concurrent
         self.async_loop = None
