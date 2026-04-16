@@ -1045,67 +1045,66 @@ def main_train(queries_train,
 
                     queries_since_last_train = 0
                     train_buffer.clear()
-                    break
 
         def dynamic_masked_mse(predictions: torch.Tensor, targets: torch.Tensor):
             valid_mask: torch.Tensor = targets.where(targets != -1, torch.ones_like(targets))
             return masked_mse_loss(predictions, targets, valid_mask)
 
-        gc.collect()  # Force garbage collection of unreferenced objects
-        process = psutil.Process(os.getpid())
-        main_mem_gb = process.memory_info().rss / (1024 ** 3)
-        print(f"--- Memory Usage Before Validation ---")
-        print(f"Main Process RAM: {main_mem_gb:.2f} GB")
+        # gc.collect()  # Force garbage collection of unreferenced objects
+        # process = psutil.Process(os.getpid())
+        # main_mem_gb = process.memory_info().rss / (1024 ** 3)
+        # print(f"--- Memory Usage Before Validation ---")
+        # print(f"Main Process RAM: {main_mem_gb:.2f} GB")
+        #
+        # # Optional: Track the size of the replay buffer if it exposes a length property
+        # print(
+        #     f"Replay Buffer Size: {len(executions_buffer)} items")
+        # print(f"Executions Buffer: {asizeof.asizeof(executions_buffer) / (1024 ** 2):.2f} MB")
+        # print(f"Execution Result Cache: {asizeof.asizeof(execution_result_cache) / (1024 ** 2):.2f} MB")
+        #
+        # snapshot = tracemalloc.take_snapshot()
+        # top_stats = snapshot.statistics('lineno')
+        #
+        # print("[ Tracemalloc Top 10 Memory Allocations ]")
+        # for stat in top_stats[:10]:
+        #     print(stat)
 
-        # Optional: Track the size of the replay buffer if it exposes a length property
-        print(
-            f"Replay Buffer Size: {len(executions_buffer)} items")
-        print(f"Executions Buffer: {asizeof.asizeof(executions_buffer) / (1024 ** 2):.2f} MB")
-        print(f"Execution Result Cache: {asizeof.asizeof(execution_result_cache) / (1024 ** 2):.2f} MB")
-        
-        snapshot = tracemalloc.take_snapshot()
-        top_stats = snapshot.statistics('lineno')
+        # # Start validation of query heads
+        # epoch_summary = main_validate(
+        #     val_loader=val_loader,
+        #     val_cache=val_cache,
+        #     epinet_latency_estimation=epinet_latency_estimation,
+        #     model_kwargs=model_kwargs,
+        #     agent_kwargs={
+        #         "n_epinet_samples": n_epi_indexes_val ,
+        #         "alpha_mlp": alpha_mlp,
+        #         "alpha_ensemble": alpha_ensemble,
+        #     },
+        #     normalizers=normalizers,
+        #     loss_fns={
+        #       "latency": right_censored_hinge_loss,
+        #       "plan_cost": dynamic_masked_mse,
+        #       "per_join_rows": dynamic_masked_mse
+        #     },
+        #     execution_strategy=execution_strategy,
+        #     sigma=sigma,
+        #     beam_width=beam_width,
+        #     num_workers=4,
+        #     precomputed_indexes=precomputed_indexes,
+        #     precomputed_masks=precomputed_masks,
+        #     epoch_total_losses=epoch_total_train_losses,
+        #     epoch_latency_losses=epoch_latency_train_losses,
+        #     epoch_plan_cost_losses=epoch_plan_cost_train_losses,
+        #     epoch_join_rows_losses=epoch_join_rows_train_losses,
+        #     epoch_latencies=epoch_latencies,
+        #     blending_weights=epoch_blending_weights,
+        #     train_summary=train_summary,
+        #     writer=writer,
+        # )
 
-        print("[ Tracemalloc Top 10 Memory Allocations ]")
-        for stat in top_stats[:10]:
-            print(stat)
-
-        # Start validation of query heads
-        epoch_summary = main_validate(
-            val_loader=val_loader,
-            val_cache=val_cache,
-            epinet_latency_estimation=epinet_latency_estimation,
-            model_kwargs=model_kwargs,
-            agent_kwargs={
-                "n_epinet_samples": n_epi_indexes_val ,
-                "alpha_mlp": alpha_mlp,
-                "alpha_ensemble": alpha_ensemble,
-            },
-            normalizers=normalizers,
-            loss_fns={
-              "latency": right_censored_hinge_loss,
-              "plan_cost": dynamic_masked_mse,
-              "per_join_rows": dynamic_masked_mse
-            },
-            execution_strategy=execution_strategy,
-            sigma=sigma,
-            beam_width=beam_width,
-            num_workers=4,
-            precomputed_indexes=precomputed_indexes,
-            precomputed_masks=precomputed_masks,
-            epoch_total_losses=epoch_total_train_losses,
-            epoch_latency_losses=epoch_latency_train_losses,
-            epoch_plan_cost_losses=epoch_plan_cost_train_losses,
-            epoch_join_rows_losses=epoch_join_rows_train_losses,
-            epoch_latencies=epoch_latencies,
-            blending_weights=epoch_blending_weights,
-            train_summary=train_summary,
-            writer=writer,
-        )
-
-        train_summary.update(epoch_summary, epoch)
-        best, per_epoch = train_summary.summary()
-        writer.write_epoch_to_file([], best, per_epoch, epinet_latency_estimation, epoch)
+        # train_summary.update(epoch_summary, epoch)
+        # best, per_epoch = train_summary.summary()
+        # writer.write_epoch_to_file([], best, per_epoch, epinet_latency_estimation, epoch)
 
     for _ in range(num_workers):
         query_queue.put(None)
