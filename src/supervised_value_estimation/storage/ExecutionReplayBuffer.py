@@ -5,6 +5,8 @@ import numpy as np
 from typing import Tuple, Union, NamedTuple, Any
 
 from numpy.dtypes import StringDType
+from torchgen.executorch.api.et_cpp import return_names
+
 
 @dataclass(frozen=True)
 class ExecutionBufferSamples:
@@ -160,3 +162,6 @@ class ExecutionReplayBuffer:
 
     def _to_torch(self, array: np.ndarray) -> torch.Tensor:
         return torch.tensor(array, device=self.device)
+
+    def __len__(self) -> int:
+        return self.buffer_size if self.full else self.pos

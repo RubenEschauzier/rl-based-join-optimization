@@ -1,6 +1,8 @@
+import gc
 import logging
 import os
 import queue
+import tracemalloc
 from collections import defaultdict
 from dataclasses import asdict
 import asyncio
@@ -8,9 +10,11 @@ import asyncio
 import diskcache
 import hydra
 import numpy as np
+import psutil
 
 import ray
 from omegaconf import OmegaConf, DictConfig
+from pympler import asizeof
 from ray.util import ActorPool
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.data import Batch, Data
@@ -707,6 +711,7 @@ def main_validate(val_loader, val_cache,
                   epoch_total_losses, epoch_latency_losses, epoch_plan_cost_losses,
                   epoch_join_rows_losses, epoch_latencies, blending_weights,
                   train_summary, writer):
+
     val_cache.clear()
     current_state_dict = tensors_to_numpy(epinet_latency_estimation.state_dict())
     current_state_dict = {k: torch.from_numpy(v) for k, v in current_state_dict.items()}
@@ -804,6 +809,7 @@ def main_train(queries_train,
                writer,
                val_cache,
                gpu_device):
+    tracemalloc.start()
 
     train_summary = TrainSummary([
                                    # ("val_epi_mse_latency", "min"), ("val_epi_mse_latency_scaled", "min"),
@@ -1044,6 +1050,25 @@ def main_train(queries_train,
         def dynamic_masked_mse(predictions: torch.Tensor, targets: torch.Tensor):
             valid_mask: torch.Tensor = targets.where(targets != -1, torch.ones_like(targets))
             return masked_mse_loss(predictions, targets, valid_mask)
+
+        gc.collect()  # Force garbage collection of unreferenced objects
+        process = psutil.Process(os.getpid())
+        main_mem_gb = process.memory_info().rss / (1024 ** 3)
+        print(f"--- Memory Usage Before Validation ---")
+        print(f"Main Process RAM: {main_mem_gb:.2f} GB")
+
+        # Optional: Track the size of the replay buffer if it exposes a length property
+        print(
+            f"Replay Buffer Size: {len(executions_buffer)} items")
+        print(f"Executions Buffer: {asizeof.asizeof(executions_buffer) / (1024 ** 2):.2f} MB")
+        print(f"Execution Result Cache: {asizeof.asizeof(execution_result_cache) / (1024 ** 2):.2f} MB")
+        
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics('lineno')
+
+        print("[ Tracemalloc Top 10 Memory Allocations ]")
+        for stat in top_stats[:10]:
+            print(stat)
 
         # Start validation of query heads
         epoch_summary = main_validate(
