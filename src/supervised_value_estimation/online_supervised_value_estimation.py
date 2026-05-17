@@ -571,6 +571,8 @@ def process_execution_results(
             c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1).numpy()
 
             # Record state in execution buffer
+            print(type(plan_features["prepared_trees"]))
+            print(plan_features["prepared_trees"])
             executions_buffer.add(
                 query_string=query,
                 join_plan=join_plan,
@@ -739,7 +741,7 @@ def train_step(model, optimizer, normalizers,
                                                             normalizers,
                                                             epinet_indexes,
                                                             sigma, device)
-
+    print(samples_with_targets)
     estimated_costs = estimate_cost(model, samples_with_targets, epinet_indexes,
                                     alpha_mlp, alpha_ensemble, device=device)
     estimated_variances = get_variance_estimates(estimated_costs)
@@ -1164,61 +1166,45 @@ def main_train(queries_train,
             valid_mask: torch.Tensor = targets.where(targets != -1, torch.ones_like(targets))
             return masked_mse_loss(predictions, targets, valid_mask)
 
-        # gc.collect()  # Force garbage collection of unreferenced objects
-        # process = psutil.Process(os.getpid())
-        # main_mem_gb = process.memory_info().rss / (1024 ** 3)
-        # print(f"--- Memory Usage Before Validation ---")
-        # print(f"Main Process RAM: {main_mem_gb:.2f} GB")
-        #
-        # # Optional: Track the size of the replay buffer if it exposes a length property
-        # print(
-        #     f"Replay Buffer Size: {len(executions_buffer)} items")
-        # print(f"Executions Buffer: {asizeof.asizeof(executions_buffer) / (1024 ** 2):.2f} MB")
-        # print(f"Execution Result Cache: {asizeof.asizeof(execution_result_cache) / (1024 ** 2):.2f} MB")
-        #
-        # snapshot = tracemalloc.take_snapshot()
-        # top_stats = snapshot.statistics('lineno')
-        #
-        # print("[ Tracemalloc Top 10 Memory Allocations ]")
-        # for stat in top_stats[:10]:
-        #     print(stat)
+        epoch_summary = main_validate(
+                val_loader = val_loader,
+                val_cache = val_cache,
+                epinet_latency_estimation = epinet_latency_estimation,
+                model_kwargs = model_kwargs,
+                agent_kwargs = {
+                            "n_epinet_samples": n_epi_indexes_val,
+                            "alpha_mlp": alpha_mlp,
+                            "alpha_ensemble": alpha_ensemble,
+                    },
+                normalizers = normalizers,
+                loss_fns = {
+                  "latency": right_censored_hinge_loss,
+                  "plan_cost": dynamic_masked_mse,
+                  "per_join_rows": dynamic_masked_mse
+                },
+                execution_strategy = execution_strategy,
+                sigma = sigma,
+                beam_width = beam_width,
+                num_workers = 4,
+                precomputed_indexes = precomputed_indexes,
+                precomputed_masks = precomputed_masks,
+                epoch_total_losses = epoch_total_train_losses,
+                epoch_latency_losses = epoch_latency_train_losses,
+                epoch_plan_cost_losses = epoch_plan_cost_train_losses,
+                epoch_join_rows_losses = epoch_join_rows_train_losses,
+                epoch_latencies = epoch_latencies,
+                blending_weights = epoch_blending_weights,
+                train_summary = train_summary,
+                writer = writer,
+                )
 
-        # # Start validation of query heads
-        # epoch_summary = main_validate(
-        #     val_loader=val_loader,
-        #     val_cache=val_cache,
-        #     epinet_latency_estimation=epinet_latency_estimation,
-        #     model_kwargs=model_kwargs,
-        #     agent_kwargs={
-        #         "n_epinet_samples": n_epi_indexes_val ,
-        #         "alpha_mlp": alpha_mlp,
-        #         "alpha_ensemble": alpha_ensemble,
-        #     },
-        #     normalizers=normalizers,
-        #     loss_fns={
-        #       "latency": right_censored_hinge_loss,
-        #       "plan_cost": dynamic_masked_mse,
-        #       "per_join_rows": dynamic_masked_mse
-        #     },
-        #     execution_strategy=execution_strategy,
-        #     sigma=sigma,
-        #     beam_width=beam_width,
-        #     num_workers=4,
-        #     precomputed_indexes=precomputed_indexes,
-        #     precomputed_masks=precomputed_masks,
-        #     epoch_total_losses=epoch_total_train_losses,
-        #     epoch_latency_losses=epoch_latency_train_losses,
-        #     epoch_plan_cost_losses=epoch_plan_cost_train_losses,
-        #     epoch_join_rows_losses=epoch_join_rows_train_losses,
-        #     epoch_latencies=epoch_latencies,
-        #     blending_weights=epoch_blending_weights,
-        #     train_summary=train_summary,
-        #     writer=writer,
-        # )
+        train_summary.update(epoch_summary, epoch)
+        best, per_epoch = train_summary.summary()
+        writer.write_epoch_to_file([], best, per_epoch, epinet_latency_estimation, epoch)
 
-        # train_summary.update(epoch_summary, epoch)
-        # best, per_epoch = train_summary.summary()
-        # writer.write_epoch_to_file([], best, per_epoch, epinet_latency_estimation, epoch)
+        train_summary.update(epoch_summary, epoch)
+        best, per_epoch = train_summary.summary()
+        writer.write_epoch_to_file([], best, per_epoch, epinet_latency_estimation, epoch)
 
     for _ in range(num_workers):
         query_queue.put(None)
