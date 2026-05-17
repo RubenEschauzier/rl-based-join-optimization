@@ -203,15 +203,14 @@ class RayExecutionStrategy:
         #                                                  timeout=timeout)
         #     return execution_result
 
-        bar_execute_query = tqdm(total=len(plans), desc="Executing queries..", position=1, leave=False)
+        bar_execute_query = tqdm(total=len(plans), desc="Executing queries..", leave=False, dynamic_ncols=True,
+                                 file=sys.stdout)
 
         for actor in self.actors:
             for _ in range(max_concurrent_per_actor):
                 submit_next_task(actor)
 
         raw_results = [None] * len(plans)
-        for i in tqdm(range(len(plans))):
-            pass
 
         while inflight_futures:
             # Wait for exactly ONE future to finish (fastest first)
@@ -355,6 +354,7 @@ class RayExecutionStrategy:
         for item, raw_result in zip(plans, raw_results):
             item["rl_metrics"] = raw_result
 
+        bar_execute_query.clear()
         bar_execute_query.close()
 
         return plans
@@ -696,7 +696,7 @@ def estimate_cost(epinet_latency_estimation, sample_with_targets: ExecutionBuffe
 
             if key in epistemic_nn_heads:
                 ensemble_prior = torch.matmul(epinet_indexes,
-                                              torch.tensor(ensemble_prior, device=device).unsqueeze(dim=-1))
+                                              ensemble_prior.to(device).unsqueeze(dim=-1))
                 ensemble_prior_flat = ensemble_prior.view(-1, 1)
                 mlp_prior = epinet_latency_estimation.compute_mlp_prior_batched(last_feature, epinet_indexes)
                 learnable_mlp_prior = epinet_latency_estimation.compute_learnable_mlp_batched(last_feature,
@@ -1050,7 +1050,8 @@ def main_train(queries_train,
         epoch_latencies = []
         epoch_blending_weights = []
 
-        with tqdm(total=len(loader), desc="Training loop..", position=0, leave=True) as pbar:
+        with tqdm(total=len(loader), desc="Training loop..", leave=True, dynamic_ncols=True, file=sys.stdout
+                  ) as pbar:
             while completed_queries < len(loader):
 
                 # Maintain backpressure
