@@ -688,9 +688,9 @@ def estimate_cost(epinet_latency_estimation, sample_with_targets: ExecutionBuffe
     head_outputs = {}
     for batch_idx in range(sample_with_targets.prepared_trees.shape[0]):
         # Unsqueeze to add back batch dimension
-        prepared_tree = torch.from_numpy(sample_with_targets.prepared_trees[batch_idx]).unsqueeze(dim=0).to(device)
-        prepared_idx = torch.from_numpy(sample_with_targets.prepared_idx[batch_idx]).unsqueeze(dim=0).to(device)
-        prepared_mask = torch.from_numpy(sample_with_targets.prepared_masks[batch_idx]).unsqueeze(dim=0).to(device)
+        prepared_tree = sample_with_targets.prepared_trees[batch_idx].unsqueeze(dim=0).to(device)
+        prepared_idx = sample_with_targets.prepared_idx[batch_idx].unsqueeze(dim=0).to(device)
+        prepared_mask = sample_with_targets.prepared_masks[batch_idx].unsqueeze(dim=0).to(device)
 
         heads_output, last_feature = epinet_latency_estimation.estimate_cost_from_prepared(
             prepared_tree, prepared_idx, prepared_mask)
