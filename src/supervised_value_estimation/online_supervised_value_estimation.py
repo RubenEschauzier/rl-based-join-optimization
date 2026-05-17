@@ -571,8 +571,11 @@ def process_execution_results(
             c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1).numpy()
 
             # Record state in execution buffer
-            print(type(plan_features["prepared_trees"]))
+            #TODO Here is tensors which should be numpy arrays. In fact I believe this may
+            # be more wrong
             print(plan_features["prepared_trees"])
+            print(type(plan_features["prepared_trees"]))
+            print("Printed")
             executions_buffer.add(
                 query_string=query,
                 join_plan=join_plan,
@@ -741,7 +744,6 @@ def train_step(model, optimizer, normalizers,
                                                             normalizers,
                                                             epinet_indexes,
                                                             sigma, device)
-    print(samples_with_targets)
     estimated_costs = estimate_cost(model, samples_with_targets, epinet_indexes,
                                     alpha_mlp, alpha_ensemble, device=device)
     estimated_variances = get_variance_estimates(estimated_costs)
