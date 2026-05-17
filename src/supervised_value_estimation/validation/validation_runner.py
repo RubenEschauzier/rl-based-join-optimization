@@ -78,6 +78,7 @@ def multiprocess_validate_agent(
             target=cpu_search_worker,
             args=(query_queue, plan_queue, agent_builder_fn, agent_kwargs, beam_width)
         )
+        p.daemon = True
         p.start()
         workers.append(p)
 

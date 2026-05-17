@@ -151,124 +151,189 @@ class RayExecutionStrategy:
 
     def execute(self, plans: list):
         """Executes plans using load-aware scheduling."""
+        max_concurrent_per_actor = 25
+        total_inflight_limit = len(self.actors) * max_concurrent_per_actor
+        inflight_futures = {}
+        plan_idx = 0
 
-        # Define the execution instruction for the pool
-        def submit_query(actor, item):
-            query_data = item["query"].to_data_list()[0]
+        # Helper to submit a single task to a specific actor
+        def submit_next_task(actor):
+            nonlocal plan_idx
+            if plan_idx < len(plans):
+                item = plans[plan_idx]
+                query_data = item["query"].to_data_list()[0]
 
-            query_payload = {
-                "query": query_data.query,
-                "triple_patterns": query_data.triple_patterns
-            }
+                query_payload = {
+                    "query": query_data.query,
+                    "triple_patterns": query_data.triple_patterns
+                }
 
-            best_plan = item["plan"]["plan"]
+                timeout = self.default_timeout
+                if query_data.query in self.query_timeouts:
+                    timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
 
-            timeout = self.default_timeout
-            if query_data.query in self.query_timeouts:
-                timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
+                future = actor.execute_plan.remote(
+                    query_payload,
+                    join_order=item["plan"]["plan"],
+                    parse_local=True,
+                    timeout=timeout
+                )
+                inflight_futures[future] = (actor, plan_idx, query_data.query)
+                plan_idx += 1
 
-            mem_usage = psutil.virtual_memory().percent
-            self.logger.debug(f"Submitting query | host_ram_usage={mem_usage}% | ...")
+        # # Define the execution instruction for the pool
+        # def submit_query(actor, item):
+        #     query_data = item["query"].to_data_list()[0]
+        #
+        #     query_payload = {
+        #         "query": query_data.query,
+        #         "triple_patterns": query_data.triple_patterns
+        #     }
+        #
+        #     best_plan = item["plan"]["plan"]
+        #
+        #     timeout = self.default_timeout
+        #     if query_data.query in self.query_timeouts:
+        #         timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
+        #
+        #     mem_usage = psutil.virtual_memory().percent
+        #     self.logger.debug(f"Submitting query | host_ram_usage={mem_usage}% | ...")
+        #
+        #     execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
+        #                                                  timeout=timeout)
+        #     return execution_result
 
-            execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
-                                                         timeout=timeout)
-            return execution_result
+        bar_execute_query = tqdm(total=len(plans), desc="Executing queries..", position=1, leave=False)
+
+        for actor in self.actors:
+            for _ in range(max_concurrent_per_actor):
+                submit_next_task(actor)
 
         raw_results = [None] * len(plans)
+        for i in tqdm(range(len(plans))):
+            pass
 
-        plan_iterator = self.pool.map(submit_query, plans)
+        while inflight_futures:
+            # Wait for exactly ONE future to finish (fastest first)
+            done_refs, _ = ray.wait(list(inflight_futures.keys()), num_returns=1, timeout=0.5)
 
-        for i in range(len(plans)):
-            query_data = plans[i]["query"].to_data_list()[0]
-            query_string = query_data.query
+            for ready_future in done_refs:
+                finished_actor, idx, query_string = inflight_futures.pop(ready_future)
+                bar_execute_query.update(1)
 
-            try:
-                result = next(plan_iterator)
+                try:
+                    result = ray.get(ready_future)
+                    raw_results[idx] = result
 
-                self.logger.debug(
-                    f"[{i}] Raw result received | query={query_string[:120]} | result={result}"
-                )
+                    # Update timeouts on success
+                    time_query = result.get("time_total")
+                    if time_query != "0ms" and not result.get("is_error"):
+                        time_in_seconds = self.local_parser.decode_to_seconds(time_query)
+                        self.query_timeouts[query_string] = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
 
-                time_query = result["time_total"]
-                if time_query != "0ms":
-                    time_in_seconds = self.local_parser.decode_to_seconds(time_query)
-                    new_timeout = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
-                    self.logger.debug(
-                        f"[{i}] Tightening timeout | query={query_string[:120]} | "
-                        f"time={time_query} | new_timeout={new_timeout:.2f}s"
-                    )
-                    self.query_timeouts[query_string] = new_timeout
+                except ray.exceptions.RayActorError as e:
+                    self.logger.critical(f"FATAL: Actor crashed on query {idx}. {e}")
+                    sys.exit(1)
+                except ray.exceptions.RayTaskError as e:
+                    self.logger.critical(f"FATAL: Unhandled exception in actor on query {idx}. {e}")
+                    sys.exit(1)
 
-                raw_results[i] = result
+                # Submit new task to the actor that produced the result
+                submit_next_task(finished_actor)
 
-            except ray.exceptions.OutOfMemoryError as e:
-                self.logger.error(
-                    f"[{i}] OOM on actor | query={query_string[:120]} | error={e}",
-                    exc_info=True
-                )
-                self.logger.debug(
-                    f"[{i}] OOM — actor may have been killed | query={query_string[:120]}"
-                )
-
-            except ray.exceptions.RayActorError as e:
-                # Handle direct worker/actor processes dying (e.g., OS OOM Killer)
-                error_msg = (
-                    f"\n{'=' * 60}\n"
-                    f"FATAL: RAY ACTOR CRASHED DURING POOL MAP\n"
-                    f"{'=' * 60}\n"
-                    f"Query Index : {i}\n"
-                    f"Query String: {query_string[:250]}...\n"
-                    f"Actor Info  : {e}\n"
-                    f"{'=' * 60}\n"
-                    f"Terminating main training script immediately."
-                )
-                self.logger.critical(error_msg, exc_info=True)
-                print(error_msg, file=sys.stderr)
-                sys.exit(1)
-
-            except ray.exceptions.RayTaskError as e:
-                # Handle unhandled Python exceptions raised inside the actor code itself
-                error_msg = (
-                    f"\n{'=' * 60}\n"
-                    f"FATAL: UNHANDLED EXCEPTION IN ACTOR CODE DURING POOL MAP\n"
-                    f"{'=' * 60}\n"
-                    f"Query Index : {i}\n"
-                    f"Query String: {query_string[:250]}...\n"
-                    f"Traceback   :\n{e}\n"
-                    f"{'=' * 60}\n"
-                    f"Terminating main training script immediately."
-                )
-                self.logger.critical(error_msg, exc_info=True)
-                print(error_msg, file=sys.stderr)
-                sys.exit(1)
-                
-            except ray.exceptions.WorkerCrashedError as e:
-                # Worker was forcibly killed (e.g. by the OS OOM killer)
-                self.logger.error(
-                    f"[{i}] Worker killed by OS | query={query_string[:120]} | error={e}",
-                    exc_info=True
-                )
-
-            except StopIteration:
-                error_msg = (f"FATAL: Pool iterator exhausted early at index {i}. "
-                             f"Prior actor failures likely corrupted the stream.")
-                self.logger.critical(error_msg)
-                print(error_msg, file=sys.stderr)
-                sys.exit(1)
-
-            except Exception as e:
-                error_msg = (
-                    f"\n{'=' * 60}\n"
-                    f"FATAL: UNEXPECTED ERROR AT INDEX {i}\n"
-                    f"{'=' * 60}\n"
-                    f"Error Type  : {type(e).__name__}\n"
-                    f"Message     : {e}\n"
-                    f"{'=' * 60}\n"
-                    f"Terminating main training script immediately."
-                )
-                self.logger.critical(error_msg, exc_info=True)
-                print(error_msg, file=sys.stderr)
-                sys.exit(1)
+        # plan_iterator = self.pool.map(submit_query, plans)
+        #
+        # for i in range(len(plans)):
+        #     query_data = plans[i]["query"].to_data_list()[0]
+        #     query_string = query_data.query
+        #
+        #     try:
+        #         result = next(plan_iterator)
+        #
+        #         self.logger.debug(
+        #             f"[{i}] Raw result received | query={query_string[:120]} | result={result}"
+        #         )
+        #
+        #         time_query = result["time_total"]
+        #         if time_query != "0ms":
+        #             time_in_seconds = self.local_parser.decode_to_seconds(time_query)
+        #             new_timeout = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
+        #             self.logger.debug(
+        #                 f"[{i}] Tightening timeout | query={query_string[:120]} | "
+        #                 f"time={time_query} | new_timeout={new_timeout:.2f}s"
+        #             )
+        #             self.query_timeouts[query_string] = new_timeout
+        #
+        #         raw_results[i] = result
+        #
+        #     except ray.exceptions.OutOfMemoryError as e:
+        #         self.logger.error(
+        #             f"[{i}] OOM on actor | query={query_string[:120]} | error={e}",
+        #             exc_info=True
+        #         )
+        #         self.logger.debug(
+        #             f"[{i}] OOM — actor may have been killed | query={query_string[:120]}"
+        #         )
+        #
+        #     except ray.exceptions.RayActorError as e:
+        #         # Handle direct worker/actor processes dying (e.g., OS OOM Killer)
+        #         error_msg = (
+        #             f"\n{'=' * 60}\n"
+        #             f"FATAL: RAY ACTOR CRASHED DURING POOL MAP\n"
+        #             f"{'=' * 60}\n"
+        #             f"Query Index : {i}\n"
+        #             f"Query String: {query_string[:250]}...\n"
+        #             f"Actor Info  : {e}\n"
+        #             f"{'=' * 60}\n"
+        #             f"Terminating main training script immediately."
+        #         )
+        #         self.logger.critical(error_msg, exc_info=True)
+        #         print(error_msg, file=sys.stderr)
+        #         sys.exit(1)
+        #
+        #     except ray.exceptions.RayTaskError as e:
+        #         # Handle unhandled Python exceptions raised inside the actor code itself
+        #         error_msg = (
+        #             f"\n{'=' * 60}\n"
+        #             f"FATAL: UNHANDLED EXCEPTION IN ACTOR CODE DURING POOL MAP\n"
+        #             f"{'=' * 60}\n"
+        #             f"Query Index : {i}\n"
+        #             f"Query String: {query_string[:250]}...\n"
+        #             f"Traceback   :\n{e}\n"
+        #             f"{'=' * 60}\n"
+        #             f"Terminating main training script immediately."
+        #         )
+        #         self.logger.critical(error_msg, exc_info=True)
+        #         print(error_msg, file=sys.stderr)
+        #         sys.exit(1)
+        #
+        #     except ray.exceptions.WorkerCrashedError as e:
+        #         # Worker was forcibly killed (e.g. by the OS OOM killer)
+        #         self.logger.error(
+        #             f"[{i}] Worker killed by OS | query={query_string[:120]} | error={e}",
+        #             exc_info=True
+        #         )
+        #
+        #     except StopIteration:
+        #         error_msg = (f"FATAL: Pool iterator exhausted early at index {i}. "
+        #                      f"Prior actor failures likely corrupted the stream.")
+        #         self.logger.critical(error_msg)
+        #         print(error_msg, file=sys.stderr)
+        #         sys.exit(1)
+        #
+        #     except Exception as e:
+        #         error_msg = (
+        #             f"\n{'=' * 60}\n"
+        #             f"FATAL: UNEXPECTED ERROR AT INDEX {i}\n"
+        #             f"{'=' * 60}\n"
+        #             f"Error Type  : {type(e).__name__}\n"
+        #             f"Message     : {e}\n"
+        #             f"{'=' * 60}\n"
+        #             f"Terminating main training script immediately."
+        #         )
+        #         self.logger.critical(error_msg, exc_info=True)
+        #         print(error_msg, file=sys.stderr)
+        #         sys.exit(1)
 
         # # pool.map automatically routes tasks to idle actors.
         # # It guarantees the output list matches the order of the input 'plans' list,
@@ -289,6 +354,8 @@ class RayExecutionStrategy:
 
         for item, raw_result in zip(plans, raw_results):
             item["rl_metrics"] = raw_result
+
+        bar_execute_query.close()
 
         return plans
 
@@ -942,6 +1009,7 @@ def main_train(queries_train,
         target=generic_gpu_server,
         args=(inference_queue, result_queues, weights_queue, EpinetServerHandler, handler_kwargs)
     )
+    gpu_process.daemon = True
     gpu_process.start()
 
     workers = []
@@ -953,6 +1021,7 @@ def main_train(queries_train,
                   precomputed_indexes, precomputed_masks,
                   alpha_mlp, alpha_ensemble, beam_width)
         )
+        p.daemon = True
         p.start()
         workers.append(p)
 
@@ -982,7 +1051,7 @@ def main_train(queries_train,
         epoch_latencies = []
         epoch_blending_weights = []
 
-        with tqdm(total=len(loader)) as pbar:
+        with tqdm(total=len(loader), desc="Training loop..", position=0, leave=True) as pbar:
             while completed_queries < len(loader):
 
                 # Maintain backpressure
