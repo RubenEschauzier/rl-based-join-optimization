@@ -966,9 +966,23 @@ def main_train(queries_train,
                     except StopIteration:
                         break
 
-                result = plan_queue.get()
-                queries_in_flight -= 1
+                try:
+                    max_wait_seconds = 60
+                    result = plan_queue.get(timeout=max_wait_seconds)
+                except queue.Empty:
+                    dead_workers = [p.pid for p in workers if not p.is_alive()]
+                    if dead_workers:
+                        raise RuntimeError(
+                            f"FATAL: Workers {dead_workers} died unexpectedly (Likely OS OOM Killer). "
+                            "Crashing main script to prevent zombie state."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"FATAL: plan_queue.get() timed out after {max_wait_seconds}s. "
+                            "Workers are alive but deadlocked."
+                        )
 
+                queries_in_flight -= 1
                 query_tensors = {
                     k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
                     for k, v in result["query"].items()
@@ -984,7 +998,8 @@ def main_train(queries_train,
                 queries_since_last_train += 1
 
                 pbar.update(1)
-                if queries_since_last_train >= samples_per_train and completed_queries > n_steps_before_train:
+                if (queries_since_last_train >= samples_per_train and completed_queries > n_steps_before_train
+                        or (completed_queries >= len(loader) and len(train_buffer) > 0)):
                     execution_results = execution_strategy.execute(train_buffer)
 
                     avg_latency, avg_total_cost = process_execution_results(
