@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 import queue
+import textwrap
 import tracemalloc
 from collections import defaultdict
 from dataclasses import asdict
@@ -12,6 +13,7 @@ import hydra
 import numpy as np
 import psutil
 
+import sys
 import ray
 from omegaconf import OmegaConf, DictConfig
 from pympler import asizeof
@@ -209,16 +211,37 @@ class RayExecutionStrategy:
                 )
 
             except ray.exceptions.RayActorError as e:
-                # Actor died (OOM kill, segfault, etc.) — Ray will have already restarted it
-                self.logger.error(
-                    f"[{i}] Actor crashed | query={query_string[:120]} | error={e}",
-                    exc_info=True
+                # Handle direct worker/actor processes dying (e.g., OS OOM Killer)
+                error_msg = (
+                    f"\n{'=' * 60}\n"
+                    f"FATAL: RAY ACTOR CRASHED DURING POOL MAP\n"
+                    f"{'=' * 60}\n"
+                    f"Query Index : {i}\n"
+                    f"Query String: {query_string[:250]}...\n"
+                    f"Actor Info  : {e}\n"
+                    f"{'=' * 60}\n"
+                    f"Terminating main training script immediately."
                 )
-                self.logger.debug(
-                    f"[{i}] RayActorError — worker process died, likely OOM | "
-                    f"query={query_string[:120]} | cause={e.__cause__}"
-                )
+                self.logger.critical(error_msg, exc_info=True)
+                print(error_msg, file=sys.stderr)
+                sys.exit(1)
 
+            except ray.exceptions.RayTaskError as e:
+                # Handle unhandled Python exceptions raised inside the actor code itself
+                error_msg = (
+                    f"\n{'=' * 60}\n"
+                    f"FATAL: UNHANDLED EXCEPTION IN ACTOR CODE DURING POOL MAP\n"
+                    f"{'=' * 60}\n"
+                    f"Query Index : {i}\n"
+                    f"Query String: {query_string[:250]}...\n"
+                    f"Traceback   :\n{e}\n"
+                    f"{'=' * 60}\n"
+                    f"Terminating main training script immediately."
+                )
+                self.logger.critical(error_msg, exc_info=True)
+                print(error_msg, file=sys.stderr)
+                sys.exit(1)
+                
             except ray.exceptions.WorkerCrashedError as e:
                 # Worker was forcibly killed (e.g. by the OS OOM killer)
                 self.logger.error(
@@ -227,17 +250,26 @@ class RayExecutionStrategy:
                 )
 
             except StopIteration:
-                self.logger.error(
-                    f"[{i}] Pool exhausted early — likely a prior actor crash killed the iterator"
-                )
-                break
+                error_msg = (f"FATAL: Pool iterator exhausted early at index {i}. "
+                             f"Prior actor failures likely corrupted the stream.")
+                self.logger.critical(error_msg)
+                print(error_msg, file=sys.stderr)
+                sys.exit(1)
 
             except Exception as e:
-                self.logger.error(
-                    f"[{i}] Unexpected error | query={query_string[:120]} | "
-                    f"error={type(e).__name__}: {e}",
-                    exc_info=True
+                error_msg = (
+                    f"\n{'=' * 60}\n"
+                    f"FATAL: UNEXPECTED ERROR AT INDEX {i}\n"
+                    f"{'=' * 60}\n"
+                    f"Error Type  : {type(e).__name__}\n"
+                    f"Message     : {e}\n"
+                    f"{'=' * 60}\n"
+                    f"Terminating main training script immediately."
                 )
+                self.logger.critical(error_msg, exc_info=True)
+                print(error_msg, file=sys.stderr)
+                sys.exit(1)
+
         # # pool.map automatically routes tasks to idle actors.
         # # It guarantees the output list matches the order of the input 'plans' list,
         # # ensuring zip() aligns the metrics perfectly with the original items.
@@ -980,8 +1012,8 @@ def main_train(queries_train,
                         raise RuntimeError(
                             f"FATAL: plan_queue.get() timed out after {max_wait_seconds}s. "
                             "Workers are alive but deadlocked."
-                        )
-
+                        )               
+                    
                 queries_in_flight -= 1
                 query_tensors = {
                     k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
