@@ -165,11 +165,8 @@ class RayExecutionStrategy:
             if query_data.query in self.query_timeouts:
                 timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
 
-            mem = ray.available_resources().get("memory", None)
-            self.logger.debug(
-                f"Submitting query | available_ray_memory={mem} | "
-                f"timeout={timeout} | query={query_data.query}"
-            )
+            mem_usage = psutil.virtual_memory().percent
+            self.logger.debug(f"Submitting query | host_ram_usage={mem_usage}% | ...")
 
             execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
                                                          timeout=timeout)

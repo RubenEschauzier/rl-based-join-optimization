@@ -70,10 +70,11 @@ class QLeverOptimizerClient:
             async with session.post(self.http_endpoint, params=params, headers=headers,
                                     data=formatted_query, timeout=client_timeout) as response:
                 if response.status == 200:
-                    result = await response.json()
-
-                    response_size_mb = len(json.dumps(result).encode('utf-8')) / (1024 * 1024)
+                    raw_bytes = await response.read()
+                    response_size_mb = len(raw_bytes) / (1024 * 1024)
                     self.logger.debug(f"[MEM] response_payload={response_size_mb:.2f}MB")
+
+                    result = json.loads(raw_bytes)
                     result = {
                         "success": True,
                         "runtime_info": result.get("runtimeInformation", {}),
