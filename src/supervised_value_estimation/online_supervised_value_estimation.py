@@ -571,11 +571,6 @@ def process_execution_results(
             c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1).numpy()
 
             # Record state in execution buffer
-            #TODO Here is tensors which should be numpy arrays. In fact I believe this may
-            # be more wrong
-            print(plan_features["prepared_trees"])
-            print(type(plan_features["prepared_trees"]))
-            print("Printed")
             executions_buffer.add(
                 query_string=query,
                 join_plan=join_plan,
