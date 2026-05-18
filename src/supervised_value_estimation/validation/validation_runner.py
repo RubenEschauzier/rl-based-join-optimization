@@ -128,7 +128,7 @@ def multiprocess_validate_agent(
                 batch_results = execution_strategy.execute(execution_plans)
                 execution_results.extend(batch_results)
                 execution_plans.clear()
-                break
+
     for _ in range(num_workers):
         query_queue.put(None)
 
