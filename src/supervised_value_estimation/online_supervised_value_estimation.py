@@ -1159,6 +1159,7 @@ def main_train(queries_train,
 
                     queries_since_last_train = 0
                     train_buffer.clear()
+                    break
 
         def dynamic_masked_mse(predictions: torch.Tensor, targets: torch.Tensor):
             valid_mask: torch.Tensor = targets.where(targets != -1, torch.ones_like(targets))
