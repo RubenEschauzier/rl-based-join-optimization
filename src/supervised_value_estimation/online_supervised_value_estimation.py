@@ -841,7 +841,7 @@ def main_validate(val_loader, val_cache,
         agent_kwargs=agent_kwargs,
         beam_width=beam_width,
         num_workers=num_workers,
-        samples_per_execution_batch=4
+        samples_per_execution_batch=512
     )
     search_metrics = {k: v for k, v in search_metrics.items() if 'planning' not in str(k)}
     search_metrics.pop("timeout_error_rate")

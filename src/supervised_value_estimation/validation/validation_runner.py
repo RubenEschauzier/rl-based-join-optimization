@@ -61,7 +61,7 @@ def multiprocess_validate_agent(
         agent_kwargs,
         beam_width=4,
         num_workers=4,
-        samples_per_execution_batch=8,
+        samples_per_execution_batch=512,
         display_metrics = False,
 ):
     """
