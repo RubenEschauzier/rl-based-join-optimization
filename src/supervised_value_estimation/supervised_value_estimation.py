@@ -14,7 +14,11 @@ from torch_geometric.loader import DataLoader
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork
 from src.models.query_plan_prediction_model import PlanCostEstimatorFull, QueryPlansPredictionModel
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
-from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
+from src.utils.epinet_utils.simulated_plan_cost_dataset import (
+    prepare_simulated_dataset,
+    preprocess_plans,
+    validate_plan_normalization,
+)
 from src.utils.training_utils.training_tracking import TrainSummary, ExperimentWriter
 
 # Get the path of the parent directory (the root of the project)
@@ -35,7 +39,7 @@ from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, prec
 import torch
 
 
-def prepare_cardinality_estimator(model_config, model_directory=None):
+def prepare_cardinality_estimator(model_config, model_directory=None, freeze=False):
     model_factory_gine_conv = ModelFactory(model_config)
     gine_conv_model = model_factory_gine_conv.load_gine_conv()
     if model_directory:
@@ -43,6 +47,11 @@ def prepare_cardinality_estimator(model_config, model_directory=None):
                                       "embedding_model.pt",
                                       ["head_cardinality.pt"],
                                       float_weights=True)
+    if freeze:
+        if hasattr(gine_conv_model, "freeze_model"):
+            gine_conv_model.freeze_model()
+        else:
+            gine_conv_model.eval()
     return gine_conv_model
 
 
@@ -52,9 +61,11 @@ def validate(queries_val, query_plans_val,
              train_loss,
              epinet_cost_estimation,
              device,
+             joint_loss_noise_std=1.0,
+             joint_loss_tau=10,
              ):
     mape = MeanAbsolutePercentageError()
-    joint_loss = GaussianJointLogLoss()
+    joint_loss = GaussianJointLogLoss(noise_std=joint_loss_noise_std, tau=joint_loss_tau)
     mape.to(device)
 
     val_loader = DataLoader(queries_val, batch_size=1, shuffle=False)
@@ -123,13 +134,17 @@ def validation_step(epoch_train_loss, epoch,
                     mean_train, std_train,
                     loss,
                     epinet_cost_estimation,
-                    device):
+                    device,
+                    joint_loss_noise_std=1.0,
+                    joint_loss_tau=10):
     query_to_val_cost = validate(queries_val, query_plans_val,
                                  precomputed_indexes, precomputed_masks,
                                  mean_train, std_train,
                                  loss,
                                  epinet_cost_estimation,
                                  device,
+                                 joint_loss_noise_std=joint_loss_noise_std,
+                                 joint_loss_tau=joint_loss_tau,
                                  )
 
     mean_metrics_val = summarize_metrics(query_to_val_cost, epoch_train_loss.item())
@@ -151,7 +166,9 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                                lr, weight_decay, n_epochs,
                                writer,
                                first_validate=False,
-                               trial: optuna.Trial = None):
+                               trial: optuna.Trial = None,
+                               joint_loss_noise_std=1.0,
+                               joint_loss_tau=10):
     train_summary = TrainSummary([("train_loss", "min"), ("val_loss_cost_scaled", "min"),
                                   ("val_loss_cost_unscaled", "min"), ("val_mape_cost_scaled", "min"),
                                   ("val_mape_cost_unscaled", "min"),
@@ -191,7 +208,9 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                         mean_train, std_train,
                         loss,
                         epinet_cost_estimation,
-                        device)
+                        device,
+                        joint_loss_noise_std=joint_loss_noise_std,
+                        joint_loss_tau=joint_loss_tau)
 
     for epoch in range(1, n_epochs + 1):
         query_loss_epoch = []
@@ -224,7 +243,9 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                                               mean_train, std_train,
                                               loss,
                                               epinet_cost_estimation,
-                                              device)
+                                              device,
+                                              joint_loss_noise_std=joint_loss_noise_std,
+                                              joint_loss_tau=joint_loss_tau)
 
         if scheduler.get_last_lr() != previous_lr:
             print("INFO: Lr Updated from {} to {}".format(previous_lr, scheduler.get_last_lr()))
@@ -254,7 +275,17 @@ def main_simulated_training(cfg: DictConfig,
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train, std_train = preprocess_plans(query_plans_dict)
-    val_plans, _, _ = preprocess_plans(query_plans_dict_val)
+    val_plans, _, _ = preprocess_plans(query_plans_dict_val, mean_train, std_train)
+    validate_plan_normalization(
+        query_plans_dict_val,
+        val_plans,
+        mean_train,
+        std_train,
+        compare_self_normalization=True,
+    )
+
+    joint_loss_noise_std = getattr(cfg.hyperparameters, "joint_loss_noise_std", 1.0)
+    joint_loss_tau = getattr(cfg.hyperparameters, "joint_loss_tau", 10)
 
     # Execute training
     train_simulated_cost_model(
@@ -272,7 +303,9 @@ def main_simulated_training(cfg: DictConfig,
         query_batch_size=cfg.hyperparameters.query_batch_size,
         lr=cfg.hyperparameters.lr,
         weight_decay=cfg.hyperparameters.weight_decay,
-        n_epochs=cfg.hyperparameters.n_epochs
+        n_epochs=cfg.hyperparameters.n_epochs,
+        joint_loss_noise_std=joint_loss_noise_std,
+        joint_loss_tau=joint_loss_tau,
     )
 
 
@@ -301,7 +334,9 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
     # Prepare large (20 million parameters) oracle model to estimate cardinality of join plans
     oracle_model = prepare_cardinality_estimator(
-        model_config=cfg.models.oracle.config, model_directory=cfg.models.oracle.dir
+        model_config=cfg.models.oracle.config,
+        model_directory=cfg.models.oracle.dir,
+        freeze=True,
     ).to(device)
 
     # Prepare plan cost estimation models and epinet

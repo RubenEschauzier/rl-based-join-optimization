@@ -20,7 +20,11 @@ from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork, prepare_epinet_model
 from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
-from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
+from src.utils.epinet_utils.simulated_plan_cost_dataset import (
+    prepare_simulated_dataset,
+    preprocess_plans,
+    validate_plan_normalization,
+)
 from src.utils.training_utils.training_tracking import TrainSummary, ExperimentWriter
 
 # Get the path of the parent directory (the root of the project)
@@ -43,18 +47,25 @@ class MetricsTracker:
         self.metrics = defaultdict(list)
         self.p_values = []
         self.distribution_variances = []
+        self.p_values_linear = []
+        self.distribution_variances_linear = []
 
     def update(self, **kwargs):
         for key, value in kwargs.items():
             self.metrics[key].append(value)
 
-    def update_calibration(self, p_vals, dist_vars):
+    def update_calibration(self, p_vals, dist_vars, p_vals_linear=None, dist_vars_linear=None):
         self.p_values.extend(p_vals)
         self.distribution_variances.extend(dist_vars)
+        if p_vals_linear is not None and dist_vars_linear is not None:
+            self.p_values_linear.extend(p_vals_linear)
+            self.distribution_variances_linear.extend(dist_vars_linear)
 
     def reset_calibration_stats(self):
         self.p_values = []
         self.distribution_variances = []
+        self.p_values_linear = []
+        self.distribution_variances_linear = []
 
     def summarize(self):
         """Returns the mean for all scalar metrics."""
@@ -63,7 +74,7 @@ class MetricsTracker:
 
 
 
-def prepare_cardinality_estimator(model_config, model_directory=None):
+def prepare_cardinality_estimator(model_config, model_directory=None, freeze=False):
     model_factory_gine_conv = ModelFactory(model_config)
     gine_conv_model = model_factory_gine_conv.load_gine_conv()
     if model_directory:
@@ -71,6 +82,11 @@ def prepare_cardinality_estimator(model_config, model_directory=None):
                                       "embedding_model.pt",
                                       ["head_cardinality.pt"],
                                       float_weights=True)
+    if freeze:
+        if hasattr(gine_conv_model, "freeze_model"):
+            gine_conv_model.freeze_model()
+        else:
+            gine_conv_model.eval()
     return gine_conv_model
 
 
@@ -138,36 +154,58 @@ def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_
     pred_matrix = pred_unscaled.reshape(n_epi_indexes, n_plans)
     pred_matrix_scaled = pred_flat.reshape(n_epi_indexes, n_plans)
 
+    pred_matrix_by_plan = pred_matrix.T
+
     y_pred_mean = pred_matrix.mean(axis=0)
     y_pred_mean_scaled = pred_matrix_scaled.mean(axis=0)
     y_pred_std = pred_matrix.std(axis=0)
 
-    p_values, epinet_distribution_variance = compute_calibration_measures(
+    p_values_log, epinet_distribution_variance_log = compute_calibration_measures(
         y_true,
-        pred_matrix.reshape(n_plans, n_epi_indexes),
+        pred_matrix_by_plan,
+    )
+
+    clipped_log = np.clip(pred_matrix_by_plan, -50, 50)
+    y_true_linear = np.exp(np.clip(y_true, -50, 50))
+    pred_matrix_linear = np.exp(clipped_log)
+    y_pred_mean_linear = pred_matrix_linear.mean(axis=1)
+    y_pred_std_linear = pred_matrix_linear.std(axis=1)
+
+    p_values_linear, epinet_distribution_variance_linear = compute_calibration_measures(
+        y_true_linear,
+        pred_matrix_linear,
     )
 
     joint_gaussian_nll = joint_loss(torch.tensor(pred_matrix_scaled), torch.tensor(y_scaled))
 
-    mse = np.mean((y_pred_mean - y_true) ** 2)
+    mse_log = np.mean((y_pred_mean - y_true) ** 2)
     mse_scaled = np.mean((y_pred_mean_scaled - y_scaled) ** 2)
+    mse_linear = np.mean((y_pred_mean_linear - y_true_linear) ** 2)
 
     return {
-        f"val_epi_mse_{head_name}": mse,
+        f"val_epi_mse_{head_name}": mse_log,
+        f"val_epi_mse_{head_name}_log_cost": mse_log,
         f"val_epi_mse_{head_name}_scaled": mse_scaled,
+        f"val_epi_mse_{head_name}_linear_cost": mse_linear,
         f"val_epi_avg_std_{head_name}": np.mean(y_pred_std),
-        f"val_observed_p_values_{head_name}": p_values,
-        f"val_distribution_variance_{head_name}": epinet_distribution_variance,
+        f"val_epi_avg_std_{head_name}_log_cost": np.mean(y_pred_std),
+        f"val_epi_avg_std_{head_name}_linear_cost": np.mean(y_pred_std_linear),
+        f"val_observed_p_values_{head_name}_log_cost": p_values_log,
+        f"val_distribution_variance_{head_name}_log_cost": epinet_distribution_variance_log,
+        f"val_observed_p_values_{head_name}_linear_cost": p_values_linear,
+        f"val_distribution_variance_{head_name}_linear_cost": epinet_distribution_variance_linear,
         f"val_joint_gaussian_nll_{head_name}": joint_gaussian_nll,
+        f"val_joint_gaussian_nll_{head_name}_log_cost": joint_gaussian_nll,
     }
 
 
 def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation, val_cache,
                     mean_vals, std_vals, train_loss, device, n_val_epi_indexes,
                     sigma, alpha_mlp, alpha_ensemble, precomputed_indexes, precomputed_masks,
+                    joint_loss_noise_std=1.0, joint_loss_tau=10,
                     head_names_to_val = ("plan_cost",)):
     mape = MeanAbsolutePercentageError().to(device)
-    joint_loss = GaussianJointLogLoss()
+    joint_loss = GaussianJointLogLoss(noise_std=joint_loss_noise_std, tau=joint_loss_tau)
     tracker = MetricsTracker()
     generator = torch.Generator(device=device)
 
@@ -221,8 +259,10 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
                         )
 
                         tracker.update_calibration(
-                            val_metrics.pop(f"val_observed_p_values_{head_name}"),
-                            val_metrics.pop(f"val_distribution_variance_{head_name}"),
+                            val_metrics.pop(f"val_observed_p_values_{head_name}_log_cost"),
+                            val_metrics.pop(f"val_distribution_variance_{head_name}_log_cost"),
+                            val_metrics.pop(f"val_observed_p_values_{head_name}_linear_cost"),
+                            val_metrics.pop(f"val_distribution_variance_{head_name}_linear_cost"),
                         )
 
                         estimated_head_val = estimated_head_val.squeeze()
@@ -426,15 +466,24 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         )
 
         mean_metrics_val = tracker.summarize()
-        calibration_error, sharpness = calculate_calibration_metrics(
+        calibration_error_log, sharpness_log = calculate_calibration_metrics(
             tracker.p_values, tracker.distribution_variances, 100,
-            os.path.join(writer.get_epoch_dir(epoch), 'calibration_plot.pdf')
+            os.path.join(writer.get_epoch_dir(epoch), 'calibration_plot_log_cost.pdf')
+        )
+
+        calibration_error_linear, sharpness_linear = calculate_calibration_metrics(
+            tracker.p_values_linear, tracker.distribution_variances_linear, 100,
+            os.path.join(writer.get_epoch_dir(epoch), 'calibration_plot_linear_cost.pdf')
         )
 
         mean_metrics_val.update({
             "train_loss": epoch_train_loss.item(),
-            "val_calibration_error": calibration_error.item(),
-            "val_sharpness": sharpness.item()
+            "val_calibration_error": calibration_error_log.item(),
+            "val_sharpness": sharpness_log.item(),
+            "val_calibration_error_log_cost": calibration_error_log.item(),
+            "val_sharpness_log_cost": sharpness_log.item(),
+            "val_calibration_error_linear_cost": calibration_error_linear.item(),
+            "val_sharpness_linear_cost": sharpness_linear.item()
         })
 
         train_summary.update(mean_metrics_val, epoch)

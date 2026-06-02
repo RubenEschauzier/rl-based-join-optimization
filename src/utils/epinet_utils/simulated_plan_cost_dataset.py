@@ -81,6 +81,63 @@ def preprocess_plans(plans, mean_cost=None, std_cost=None):
     return attach_unique_id_to_plan(plans_standardized), mean_cost, std_cost
 
 
+def _extract_plan_costs(plans):
+    costs = []
+    for query_plans in plans.values():
+        for plan in query_plans:
+            if len(plan) < 2:
+                continue
+            costs.append(plan[1])
+    return np.array(costs, dtype=float)
+
+
+def validate_plan_normalization(original_plans,
+                                normalized_plans,
+                                mean_cost,
+                                std_cost,
+                                sample_size=1000,
+                                atol=1e-6,
+                                rtol=1e-5,
+                                compare_self_normalization=False):
+    raw_flattened = flatten_plans(original_plans)
+    raw_costs = _extract_plan_costs(raw_flattened)
+    normalized_costs = _extract_plan_costs(normalized_plans)
+
+    if raw_costs.size != normalized_costs.size:
+        raise ValueError(
+            f"Mismatch in plan counts after normalization: {raw_costs.size} vs {normalized_costs.size}"
+        )
+
+    unscaled_costs = (normalized_costs * std_cost) + mean_cost
+    raw_sorted = np.sort(raw_costs)
+    unscaled_sorted = np.sort(unscaled_costs)
+
+    if raw_sorted.size == 0:
+        return
+
+    sample_indices = None
+    if raw_sorted.size > sample_size:
+        rng = np.random.default_rng(0)
+        sample_indices = rng.choice(raw_sorted.size, size=sample_size, replace=False)
+        raw_sorted = raw_sorted[sample_indices]
+        unscaled_sorted = unscaled_sorted[sample_indices]
+
+    if not np.allclose(raw_sorted, unscaled_sorted, rtol=rtol, atol=atol):
+        raise ValueError("Unscaled normalized costs do not match original costs.")
+
+    if compare_self_normalization:
+        self_norm, mean_self, std_self = preprocess_plans(original_plans)
+        self_costs = _extract_plan_costs(self_norm)
+        self_unscaled = (self_costs * std_self) + mean_self
+        self_sorted = np.sort(self_unscaled)
+        if sample_indices is not None:
+            self_sorted = self_sorted[sample_indices]
+        elif self_sorted.size > sample_size:
+            self_sorted = self_sorted[:sample_size]
+        if not np.allclose(raw_sorted, self_sorted[:raw_sorted.size], rtol=rtol, atol=atol):
+            raise ValueError("Self-normalized unscaled costs do not match original costs.")
+
+
 def attach_unique_id_to_plan(simulated_query_plans):
     data_index = 0
     for query in sorted(simulated_query_plans.keys()):
