@@ -2,47 +2,35 @@ model:
   type: GINEConv
   embedding:
     layers:
-      - type: Linear
-        in_features: 129
-        out_features: 128
-        id: embed_1
-      - type: TripleGINEConvMoE
-        num_experts: 32
-        top_k: 4
+      - type: TripleGINEConv
         nn:
           - type: Linear
-            in_features: 128
-            out_features: 64
+            in_features: 136
+            out_features: 101
             id: gine_nn_1_lin_1
           - type: ReLU
             id: gine_nn_1_relu_1
           - type: Linear
-            in_features: 64
-            out_features: 128
+            in_features: 101
+            out_features: 101
             id: gine_nn_1_lin_2
-        edge_dim: 129
-        id: gine_moe_1
+        edge_dim: 137
+        id: gine_1
 
-      - type: GraphNorm
-        in_channels: 128
-        id: graph_norm_1
-
-      - type: TripleGINEConvMoE
-        num_experts: 32
-        top_k: 4
+      - type: TripleGINEConv
         nn:
           - type: Linear
-            in_features: 128
-            out_features: 64
+            in_features: 101
+            out_features: 100
             id: gine_nn_2_lin_1
           - type: ReLU
             id: gine_nn_2_relu_1
           - type: Linear
-            in_features: 64
+            in_features: 100
             out_features: 200
             id: gine_nn_2_lin_2
-        edge_dim: 129
-        id: gine_moe_2
+        edge_dim: 137
+        id: gine_2
 
       - type: SumAggregation
         id: sum_agg
@@ -64,3 +52,5 @@ model:
 weight_location:
   directory: ""
   chkp: true
+
+

@@ -81,6 +81,7 @@ class MultiHeadEpistemicNetwork(nn.Module):
             for i in range(epi_index_dim)
         ])
         self.ensemble_combined_prior_models.apply(init_weights)
+
         for combined_prior in self.ensemble_combined_prior_models:
             for param in combined_prior.parameters():
                 param.requires_grad = False
@@ -260,20 +261,42 @@ class MultiHeadEpistemicNetwork(nn.Module):
         k = epi_indexes.shape[0]
 
         # Repeat features K times: [N, F] -> [K*N, F]
+        # Stacks last features on top of each other. So
+        #            lf_1_1, ..., lf_1_F
+        # ep_index_1:  ...
+        #            lf_N_1, ..., lf_N_F
+        #            lf_1_1, ..., lf_1_F
+        # epi_index_2: ...
+        #            lf_N_1, ..., lf_N_F
         last_feature_exp = last_feature.repeat(k, 1)
 
         # Interleave indexes N times: [K, D] -> [K*N, D]
+        # Repeat interleave repeats the first row n times then second row n times
+        # so:
+        # epi_index_1_1,
+        # ...
+        # epi_index_1_n,
+        # epi_index_2_1,
+        # ...
+        # epi_index_2_n,
+        # ...
+        # With epi_index_ an epi_index_dim row_vector
         epi_indexes_exp = epi_indexes.repeat_interleave(n, dim=0)
 
-        # Concatenate and pass through shared feature extractor
+        # Concatenate features and indexes along the feature dimension (dim=1).
+        # Each row becomes [last_feature, epi_index].
+        # The layout groups by sampled epistemic index (e), iterating through all plans:
+        # [e_0_plan_0, ..., e_0_plan_{N-1}, e_1_plan_0, ..., e_1_plan_{N-1}, ...]
+        # Total shape: [N * K, F + D]
         concat_input = torch.cat([last_feature_exp, epi_indexes_exp], dim=1)
+        # [N * K, out_dim]
         shared_features = self.prior_epinet_features(concat_input)
 
         epinet_outputs = {}
         for head_name, head_layer in self.prior_epinet_heads.items():
             mlp_output = head_layer(shared_features)
             epinet_outputs[head_name] = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
-
+        # Output is blockwise so All plans for sampled index one, then two etc
         return epinet_outputs
 
     def compute_learnable_mlp_batched(self, last_feature, epi_indexes):

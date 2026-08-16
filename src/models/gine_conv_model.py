@@ -141,9 +141,9 @@ class GINEConvModel(torch.nn.Module):
             outputs.append({'output_type': head_type, 'output': output})
         return outputs
 
-    def get_load_balancing_loss(self) -> torch.Tensor | None:
+    def get_load_balancing_loss(self, device, writer=None, epoch=None) -> torch.Tensor | None:
         """Computes the auxiliary loss across all MoE layers."""
-        aux_loss = torch.Tensor(0)
+        aux_loss = torch.tensor(0, device=device, dtype=torch.float32)
         moe_layers = 0
 
         has_moe_layer = False
@@ -151,22 +151,77 @@ class GINEConvModel(torch.nn.Module):
             if isinstance(module, TripleGineConvMoE):
                 has_moe_layer = True
                 routing_prob = module.get_current_routing_probs()
-                num_nodes, num_experts = routing_prob.shape
 
+                # if writer and epoch and hasattr(writer, 'add_histogram'):
+                #     # Log the full distribution of routing scores before softmax to see raw router confidence
+                #     writer.add_histogram('Routing/Expert_Score_Distribution', routing_prob, epoch)
+
+                if writer and epoch is not None:
+                    # Calculate the mean probability for each expert across the batch
+                    mean_probs = torch.mean(routing_prob, dim=0)
+
+                    # Create a dictionary mapping expert IDs to their mean probability
+                    prob_dict = {f'Expert_{i}': p.item() for i, p in enumerate(mean_probs)}
+
+                    # Use add_scalars (plural) to group them in one chart
+                    if hasattr(writer, 'add_scalars'):
+                        writer.add_scalars('Routing/Expert_Distribution', prob_dict, epoch)
+                    else:
+                        # Fallback: Many loggers group scalars automatically if they share the same folder name
+                        for label, val in prob_dict.items():
+                            writer.log({f'Routing_Distribution/{label}': val, 'step': epoch})
+
+                num_nodes, num_experts = routing_prob.shape
                 # Sum probabilities over all nodes for each expert
                 # sum_P shape: (num_experts,)
                 sum_probability_nodes = routing_prob.sum(dim=0)
 
-                # Compute equation 11
+                # Compute routing loss https://arxiv.org/abs/2511.04008
                 layer_loss = (num_experts / (num_nodes ** 2)) * torch.sum(sum_probability_nodes ** 2)
                 aux_loss += layer_loss
                 moe_layers += 1
 
         if not has_moe_layer:
             return None
-
+        if writer and epoch:
+            writer.add_scalar(f'Routing/Auxiliary loss', (aux_loss / max(1, moe_layers)).detach().item(), epoch)
         # Average the loss across all MoE layers in the network
         return aux_loss / max(1, moe_layers)
+
+    def register_moe_gradient_hooks(self, writer, get_global_step_fn):
+        """
+        Registers backward hooks on MoE layers to log gradient norms to TensorBoard.
+
+        Args:
+            writer: SummaryWriter instance.
+            get_global_step_fn: A callable returning the current global training step.
+        """
+        moe_count = 0
+        for name, module in self.named_modules():
+            if isinstance(module, TripleGineConvMoE):
+                moe_layer_id = f"MoE_Layer_{moe_count}"
+
+                # Closure to capture the correct parameter name and layer ID
+                def make_hook(param_name):
+                    def hook(grad):
+                        if grad is not None and writer is not None:
+                            norm = torch.norm(grad, p=2).item()
+                            step = get_global_step_fn()
+                            writer.add_scalar(f'Gradients/{moe_layer_id}_{param_name}_L2', norm, step)
+
+                    return hook
+
+                # Register hooks on the specific parameters
+                if hasattr(module, 'router') and hasattr(module.router, 'weight'):
+                    module.router.weight.register_hook(make_hook('Router_Weight'))
+
+                if hasattr(module, 'experts') and hasattr(module.experts, 'expert_L'):
+                    module.experts.expert_L.register_hook(make_hook('Expert_L_Factor'))
+
+                moe_count += 1
+
+        if self.verbose > 0:
+            print(f"Registered gradient hooks for {moe_count} MoE layers.")
 
     def serialize_model(self, model_dir):
         embedding_state_dict = self.embedding_model.state_dict()

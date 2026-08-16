@@ -23,12 +23,14 @@ class WalksCorpus:
             for line in f:
                 yield line.strip().split()
 
+
 def validate_completeness_embeddings(model, entities):
     missing_entities = 0
     for entity in entities:
         if entity not in model.wv:
             missing_entities += 1
     return missing_entities
+
 
 def validate_completeness_walks(walk_corpus, entities, min_count):
     missing_entities = 0
@@ -47,14 +49,13 @@ def validate_completeness_walks(walk_corpus, entities, min_count):
                 insufficient_occurrences_entities += 1
     return missing_entities, insufficient_occurrences_entities
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train pyrdf2vec using disk-based walk storage with a SPARQL endpoint.")
     parser.add_argument("--endpoint", required=True, help="SPARQL endpoint URL.")
-    parser.add_argument("--queries_to_embed",
-                        required=True,
-                        nargs="+",
-                        help="File location of queries to embed entities of.")
+    parser.add_argument("--base_dir", required=True, help="Base directory containing query files.")
+    parser.add_argument("--glob_pattern", required=True, help="Glob pattern to match files inside the base directory.")
     parser.add_argument("--output", required=True, help="Output folder for walks and model.")
     parser.add_argument("--model_file_name", type=str, default="model.json",
                         help="File to where the model should be written")
@@ -75,21 +76,30 @@ def main():
 
     # Walk generator
     walker = RandomWalker(max_depth=args.depth, max_walks=args.num_walks, with_reverse=True, md5_bytes=None)
-    # transformer = RDF2VecTransformer(walkers=walker)
+
+    # NEW: Find files using the base directory and glob pattern, filtering for .json files explicitly
+    search_path = os.path.join(args.base_dir, args.glob_pattern)
+    query_paths = [
+        p for p in glob.glob(search_path, recursive=True)
+        if p.endswith('.json') and os.path.isfile(p)
+    ]
+
+    print(f"Found {len(query_paths)} JSON files matching the pattern.")
+
     # Read entities to embed
     entities = set()
-    for query_path in args.queries_to_embed:
+    for query_path in query_paths:
         with open(query_path, 'r') as f:
             raw_data = json.load(f)
-        for i, data in tqdm(enumerate(raw_data), total=len(raw_data)):
+        for i, data in tqdm(enumerate(raw_data), total=len(raw_data),
+                            desc=f"Processing {os.path.basename(query_path)}"):
             _, tp_rdflib = ProcessQuery.deconstruct_to_triple_pattern(data['query'])
             for tp in tp_rdflib:
                 for entity in tp:
                     if isinstance(entity, URIRef):
                         entities.add(str(entity))
-
     entities = list(entities)
-    
+
     print("Generating walks from SPARQL endpoint...")
     with open(walks_file, "w") as f:
         for entity in tqdm(entities):
@@ -97,8 +107,8 @@ def main():
                 walks = walker.extract(kg, [entity])[0]
                 for walk in walks:
                     f.write(" ".join(walk) + "\n")
-                if len(walks) < args.min_count:
-                    print(f"Only found {len(walks)} walks for {entity}")
+                if len(walks) == 0:
+                    print(f"Found zero walks for {entity}")
             except Exception as e:
                 print(f"Failed to generate walks for {entity}: {e}")
 
@@ -129,7 +139,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # Example: python rdf2vec_disk_test --endpoint http://localhost:9999/blazegraph/namespace/yago/sparql
-    # --output walks_temp/ --queries_to_embed .\data\generated_queries\star_yago_gnce\Joined_Queries.json
+    # Updated Example command showcasing the new --base_dir and --glob_pattern interface
+    # Example: python streaming_pyrdf2vec.py --endpoint http://localhost:9000 \
+    # --output data/rdf2vec_embeddings/mixed_yago --base_dir ./data/generated_queries --glob_pattern "mixed_yago/*.json" \
     # --epochs 50 --num_walks 10 --workers 5
     main()

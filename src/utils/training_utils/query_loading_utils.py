@@ -17,6 +17,7 @@ from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
+from src.query_featurizers.featurize_predicate_edges_tp_hll import QueryToEdgePredicateGraphHll
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 
 
@@ -89,14 +90,15 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
                               load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,
-                              multiplicity_location = None,
+                              multiplicity_location = None, hll_location = None,
                               shuffle_train=True, shuffle_val=False):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
                                                     vectors, env,
                                                     occurrences_location,
                                                     tp_cardinality_location,
-                                                    multiplicity_location)
+                                                    multiplicity_location,
+                                                    hll_location=hll_location)
     post_processor = filter_failed_cardinality_queries
 
     train_dataset = QueryCardinalityDataset(root=queries_location_train,
@@ -125,13 +127,14 @@ def load_queries_into_dataset_single(queries_location,
                               feature_type: typing.Literal["labeled_edge", "predicate_edge"],
                               load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,
-                              multiplicity_location = None):
+                              multiplicity_location = None, hll_location = None):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
                                                     vectors, env,
                                                     occurrences_location,
                                                     tp_cardinality_location,
-                                                    multiplicity_location)
+                                                    multiplicity_location,
+                                                    hll_location = hll_location)
     post_processor = filter_failed_cardinality_queries
 
     dataset = QueryCardinalityDataset(root=queries_location,
@@ -143,9 +146,10 @@ def load_queries_into_dataset_single(queries_location,
     return dataset
 
 
-def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge"],
+def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge", "predicate_edge_hll"],
                     vectors, query_env,
-                    occurrences_location=None, tp_cardinality_location=None, multiplicity_location=None):
+                    occurrences_location=None, tp_cardinality_location=None, multiplicity_location=None,
+                    hll_location=None):
 
     occurrences = None
     tp_cardinality = None
@@ -160,12 +164,23 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
             predicate_multiplicities = json.load(f)
     else:
         predicate_multiplicities = None
+    if hll_location:
+        with open(hll_location, 'r') as f:
+            hll = json.load(f)
+    else:
+        hll = None
 
     if featurizer_type == "labeled_edge":
         query_to_graph = QueryToEdgeLabeledGraph(vectors, query_env, tp_cardinalities=tp_cardinality)
     elif featurizer_type == "predicate_edge":
         query_to_graph = QueryToEdgePredicateGraph(vectors, query_env, term_occurrences=occurrences,
                                                    predicate_multiplicities=predicate_multiplicities)
+    elif featurizer_type == "predicate_edge_hll":
+        query_to_graph = QueryToEdgePredicateGraphHll(vectors, query_env,
+                                                      term_occurrences=occurrences,
+                                                      predicate_multiplicities=predicate_multiplicities,
+                                                      tp_cardinalities=tp_cardinality,
+                                                      loaded_hll_json=hll)
     else:
         raise NotImplementedError
     return functools.partial(query_to_graph.transform_undirected)
@@ -174,7 +189,8 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
 def prepare_data(endpoint_location,
                  queries_location_train, queries_location_val,
                  rdf2vec_vector_location,
-                 occurrences_location, tp_cardinality_location):
+                 occurrences_location, tp_cardinality_location,
+                 hll_location=None, multiplicity_location=None):
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
                                                            endpoint_location,
@@ -183,7 +199,9 @@ def prepare_data(endpoint_location,
                                                            to_load=None,
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
-                                                           shuffle_train=True, load_mappings=False
+                                                           shuffle_train=True, load_mappings=True,
+                                                           hll_location=hll_location,
+                                                           multiplicity_location=multiplicity_location,
                                                            )
     return train_dataset, val_dataset
 

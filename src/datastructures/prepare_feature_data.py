@@ -1,3 +1,6 @@
+import base64
+import pickle
+from datasketch import HyperLogLog
 import json
 import os
 from typing import Tuple, Dict, Optional
@@ -121,3 +124,66 @@ def extract_multiplicities(
         multiplicities[p_iri] = (m_so, m_os)
 
     return multiplicities
+
+
+def calculate_hll_sketches(queries, endpoint_url, p=12):
+    """
+    Calculates HyperLogLog sketches for the domain (subjects) and
+    range (objects) of each unique predicate in the query workload.
+
+    p=12 yields an accuracy error of ~1.6%.
+    """
+    print(f"Calculating HLL sketches via: {endpoint_url}")
+    hll_store = {}
+
+    # 1. Extract all unique predicates across all queries
+    unique_predicates = set()
+    for query in queries:
+        for tp_str in query['triple_patterns']:
+            # Assuming tp_str is like "?s <http://predicate> ?o"
+            predicate = tp_str.split()[1]
+            unique_predicates.add(predicate)
+
+    print(f"Found {len(unique_predicates)} unique predicates. Building sketches...")
+
+    # 2. Query and build sketches for each predicate
+    for predicate in tqdm(unique_predicates):
+        domain_hll = HyperLogLog(p=p)
+        range_hll = HyperLogLog(p=p)
+
+        # Query all subjects for this predicate (Domain)
+        query_domain = f"SELECT DISTINCT ?s WHERE {{ ?s {predicate} ?o }}"
+        res_domain = requests.get(
+            endpoint_url,
+            params={'query': query_domain},
+            headers={'Accept': 'application/sparql-results+json'}
+        )
+        if res_domain.status_code == 200:
+            bindings = res_domain.json().get('results', {}).get('bindings', [])
+            for row in bindings:
+                entity = row['s']['value']
+                domain_hll.update(entity.encode('utf-8'))
+
+        # Query all objects for this predicate (Range)
+        query_range = f"SELECT DISTINCT ?o WHERE {{ ?s {predicate} ?o }}"
+        res_range = requests.get(
+            endpoint_url,
+            params={'query': query_range},
+            headers={'Accept': 'application/sparql-results+json'}
+        )
+        if res_range.status_code == 200:
+            bindings = res_range.json().get('results', {}).get('bindings', [])
+            for row in bindings:
+                entity = row['o']['value']
+                range_hll.update(entity.encode('utf-8'))
+
+        # Serialize HLL objects to base64 strings for JSON storage
+        domain_b64 = base64.b64encode(pickle.dumps(domain_hll)).decode('utf-8')
+        range_b64 = base64.b64encode(pickle.dumps(range_hll)).decode('utf-8')
+
+        hll_store[predicate] = {
+            "domain": domain_b64,
+            "range": range_b64
+        }
+
+    return hll_store

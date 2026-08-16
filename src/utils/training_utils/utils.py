@@ -83,7 +83,20 @@ def embed_query_graphs(queries, embedding_models, training=True):
 
 
 def q_error_fn(pred, true, eps=1e-7):
-    return torch.max(true / (pred + eps), pred / (true + eps))
+    # Establish a lower bound of 1.0 to prevent zero values blowing up q-error
+    true = torch.clamp(true, min=1.0)
+    pred = torch.clamp(pred, min=1.0)
+
+    ratio_1 = true / (pred + eps)
+    ratio_2 = pred / (true + eps)
+
+    # Return the element-wise maximum
+    return torch.max(ratio_1, ratio_2)
+
+# def q_error_fn(pred, true, eps=1e-7):
+#     true = torch.max(true, 1)
+#     pred = torch.max(pred, 1)
+#     return torch.max(true / (pred + eps), pred / (true + eps))
 
 
 def mixed_mae_q_error_loss(alpha, pred, true):

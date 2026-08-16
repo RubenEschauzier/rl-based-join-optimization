@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 import queue
+import random
 import textwrap
 import tracemalloc
 from collections import defaultdict
@@ -32,6 +33,7 @@ from main import find_best_epoch_directory
 from src.models.epistemic_neural_network import prepare_epinet_model
 
 from src.query_environments.qlever.qlever_execute_query_default import QLeverOptimizerClient
+from src.random_query_generation.generate_complex import get_queries
 from src.supervised_value_estimation.agents.EpinetCostEstimatorAgent import EpinetCostEstimatorAgent
 
 from src.supervised_value_estimation.agents.EpinetMultiprocessAgent import EpinetMultiprocessAgent
@@ -181,28 +183,6 @@ class RayExecutionStrategy:
                 inflight_futures[future] = (actor, plan_idx, query_data.query)
                 plan_idx += 1
 
-        # # Define the execution instruction for the pool
-        # def submit_query(actor, item):
-        #     query_data = item["query"].to_data_list()[0]
-        #
-        #     query_payload = {
-        #         "query": query_data.query,
-        #         "triple_patterns": query_data.triple_patterns
-        #     }
-        #
-        #     best_plan = item["plan"]["plan"]
-        #
-        #     timeout = self.default_timeout
-        #     if query_data.query in self.query_timeouts:
-        #         timeout = self.local_parser.format_latency(self.query_timeouts[query_data.query])
-        #
-        #     mem_usage = psutil.virtual_memory().percent
-        #     self.logger.debug(f"Submitting query | host_ram_usage={mem_usage}% | ...")
-        #
-        #     execution_result = actor.execute_plan.remote(query_payload, join_order=best_plan, parse_local=True,
-        #                                                  timeout=timeout)
-        #     return execution_result
-
         bar_execute_query = tqdm(total=len(plans), desc="Executing queries..", leave=False, dynamic_ncols=True,
                                  file=sys.stdout)
 
@@ -239,117 +219,6 @@ class RayExecutionStrategy:
 
                 # Submit new task to the actor that produced the result
                 submit_next_task(finished_actor)
-
-        # plan_iterator = self.pool.map(submit_query, plans)
-        #
-        # for i in range(len(plans)):
-        #     query_data = plans[i]["query"].to_data_list()[0]
-        #     query_string = query_data.query
-        #
-        #     try:
-        #         result = next(plan_iterator)
-        #
-        #         self.logger.debug(
-        #             f"[{i}] Raw result received | query={query_string[:120]} | result={result}"
-        #         )
-        #
-        #         time_query = result["time_total"]
-        #         if time_query != "0ms":
-        #             time_in_seconds = self.local_parser.decode_to_seconds(time_query)
-        #             new_timeout = max(min((time_in_seconds * 2), self.default_timeout_s), 1)
-        #             self.logger.debug(
-        #                 f"[{i}] Tightening timeout | query={query_string[:120]} | "
-        #                 f"time={time_query} | new_timeout={new_timeout:.2f}s"
-        #             )
-        #             self.query_timeouts[query_string] = new_timeout
-        #
-        #         raw_results[i] = result
-        #
-        #     except ray.exceptions.OutOfMemoryError as e:
-        #         self.logger.error(
-        #             f"[{i}] OOM on actor | query={query_string[:120]} | error={e}",
-        #             exc_info=True
-        #         )
-        #         self.logger.debug(
-        #             f"[{i}] OOM — actor may have been killed | query={query_string[:120]}"
-        #         )
-        #
-        #     except ray.exceptions.RayActorError as e:
-        #         # Handle direct worker/actor processes dying (e.g., OS OOM Killer)
-        #         error_msg = (
-        #             f"\n{'=' * 60}\n"
-        #             f"FATAL: RAY ACTOR CRASHED DURING POOL MAP\n"
-        #             f"{'=' * 60}\n"
-        #             f"Query Index : {i}\n"
-        #             f"Query String: {query_string[:250]}...\n"
-        #             f"Actor Info  : {e}\n"
-        #             f"{'=' * 60}\n"
-        #             f"Terminating main training script immediately."
-        #         )
-        #         self.logger.critical(error_msg, exc_info=True)
-        #         print(error_msg, file=sys.stderr)
-        #         sys.exit(1)
-        #
-        #     except ray.exceptions.RayTaskError as e:
-        #         # Handle unhandled Python exceptions raised inside the actor code itself
-        #         error_msg = (
-        #             f"\n{'=' * 60}\n"
-        #             f"FATAL: UNHANDLED EXCEPTION IN ACTOR CODE DURING POOL MAP\n"
-        #             f"{'=' * 60}\n"
-        #             f"Query Index : {i}\n"
-        #             f"Query String: {query_string[:250]}...\n"
-        #             f"Traceback   :\n{e}\n"
-        #             f"{'=' * 60}\n"
-        #             f"Terminating main training script immediately."
-        #         )
-        #         self.logger.critical(error_msg, exc_info=True)
-        #         print(error_msg, file=sys.stderr)
-        #         sys.exit(1)
-        #
-        #     except ray.exceptions.WorkerCrashedError as e:
-        #         # Worker was forcibly killed (e.g. by the OS OOM killer)
-        #         self.logger.error(
-        #             f"[{i}] Worker killed by OS | query={query_string[:120]} | error={e}",
-        #             exc_info=True
-        #         )
-        #
-        #     except StopIteration:
-        #         error_msg = (f"FATAL: Pool iterator exhausted early at index {i}. "
-        #                      f"Prior actor failures likely corrupted the stream.")
-        #         self.logger.critical(error_msg)
-        #         print(error_msg, file=sys.stderr)
-        #         sys.exit(1)
-        #
-        #     except Exception as e:
-        #         error_msg = (
-        #             f"\n{'=' * 60}\n"
-        #             f"FATAL: UNEXPECTED ERROR AT INDEX {i}\n"
-        #             f"{'=' * 60}\n"
-        #             f"Error Type  : {type(e).__name__}\n"
-        #             f"Message     : {e}\n"
-        #             f"{'=' * 60}\n"
-        #             f"Terminating main training script immediately."
-        #         )
-        #         self.logger.critical(error_msg, exc_info=True)
-        #         print(error_msg, file=sys.stderr)
-        #         sys.exit(1)
-
-        # # pool.map automatically routes tasks to idle actors.
-        # # It guarantees the output list matches the order of the input 'plans' list,
-        # # ensuring zip() aligns the metrics perfectly with the original items.
-        # raw_results = []
-        # for i, result in enumerate(tqdm(self.pool.map(submit_query, plans), total=len(plans), desc="Executing Plans")):
-        #     # Reconstruct query_data from the original plans list using the index
-        #     query_data = plans[i]["query"].to_data_list()[0]
-        #     query_string = query_data.query
-        #
-        #     # Tighten bounds on successful execution
-        #     time_query = result["time_total"]
-        #     if time_query != "0ms":
-        #         time_in_seconds = self.local_parser.decode_to_seconds(time_query)
-        #         self.query_timeouts[query_string] = max(min((time_in_seconds * 2), self.default_timeout_s),1)
-        #
-        #     raw_results.append(result)
 
         for item, raw_result in zip(plans, raw_results):
             item["rl_metrics"] = raw_result
@@ -776,6 +645,106 @@ def train_step(model, optimizer, normalizers,
         "join_rows": loss_intermediate_size,
     }
 
+def active_query_generation_step(
+        epinet_model,
+        query_queue,
+        plan_queue,
+        endpoint_url,
+        dataset_dir,
+        num_candidates,
+        top_percent,
+        n_epi_indexes,
+        device,
+        rdf2vec_vector_location,
+        occurrences_location,
+        tp_cardinality_location
+):
+    """
+    Generates new complex queries, evaluates their uncertainty using Epinet,
+    and returns the top X% most uncertain queries.
+    """
+    print(f"\n--- Active Learning: Generating {num_candidates} candidate queries ---")
+
+    #TODO: Make this take a range of n_triple instead.
+    #TODO: Make this return the queries instead of saving to file (optional param)
+    raw_candidates = get_queries(
+        dataset_dir=dataset_dir,
+        dataset_name="active_learning_candidates",
+        n_triples=random.choice([6, 8, 10]),
+        n_queries=num_candidates,
+        endpoint_url=endpoint_url
+    )
+
+    if not raw_candidates:
+        return []
+
+    #TODO: Write function that featurizes these queries
+    candidate_dataset = process_raw_queries_to_pyg(
+        raw_candidates,
+        rdf2vec_vector_location,
+        occurrences_location,
+        tp_cardinality_location
+    )
+
+    candidate_uncertainties = []
+    selected_queries = []
+
+    print("Evaluating uncertainty for candidate queries...")
+    epinet_indexes = epinet_model.sample_epistemic_indexes_batched(n_epi_indexes).to(device)
+
+    # 3. Get plans and calculate uncertainty for each candidate
+    for query_data in tqdm(candidate_dataset, desc="Estimating Epistemic Uncertainty"):
+        # Send to CPU workers to run beam search and get tree features
+        safe_query = tensors_to_numpy(query_data.to_dict())
+        query_queue.put(safe_query)
+
+        try:
+            result = plan_queue.get(timeout=60)
+        except queue.Empty:
+            continue
+
+        best_plan = result['top_k_plans'][0]
+        # Get the tree representation of the final join (the root of the query plan)
+        final_join_features = best_plan["history"][-1][1]
+
+        prepared_tree = torch.from_numpy(final_join_features["prepared_trees"]).unsqueeze(0).to(device)
+        prepared_idx = torch.from_numpy(final_join_features["prepared_idx"]).unsqueeze(0).to(device)
+        prepared_mask = torch.from_numpy(final_join_features["prepared_masks"]).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            # Run base model forward pass
+            heads_output, last_feature = epinet_model.estimate_cost_from_prepared(
+                prepared_tree, prepared_idx, prepared_mask
+            )
+
+            # Compute Epinet priors to get ensemble variance
+            last_feature_detached = last_feature.detach()
+            mlp_prior = epinet_model.compute_mlp_prior_batched(last_feature_detached, epinet_indexes)
+            learnable_mlp_prior = epinet_model.compute_learnable_mlp_batched(last_feature_detached, epinet_indexes)
+
+            # We use latency variance as the primary uncertainty signal
+            ensemble_prior = torch.from_numpy(final_join_features["unweighted_ensemble_prior"]["latency"]).to(device)
+            ensemble_prior = torch.matmul(epinet_indexes, ensemble_prior.unsqueeze(-1)).view(-1, 1)
+
+            # Reconstruct the epistemic ensemble predictions
+            base_pred_expanded = heads_output["latency"].repeat(n_epi_indexes, 1)
+            epinet_predictions = base_pred_expanded + learnable_mlp_prior["latency"] + ensemble_prior
+
+            # Variance across the ensemble represents Epistemic Uncertainty
+            variance = torch.var(epinet_predictions, dim=0).mean().item()
+
+        candidate_uncertainties.append((variance, query_data))
+
+    # Sort by variance (highest uncertainty first) and select top X%
+    candidate_uncertainties.sort(key=lambda x: x[0], reverse=True)
+    n_to_select = int(len(candidate_uncertainties) * top_percent)
+
+    print(
+        f"Candidate Latency Variance - Max: {candidate_uncertainties[0][0]:.4f}, Min: {candidate_uncertainties[-1][0]:.4f}")
+
+    top_candidates = [q[1] for q in candidate_uncertainties[:n_to_select]]
+    return top_candidates
+
 
 def build_validation_agent(model_kwargs, agent_kwargs, state_dict, precomputed_indexes, precomputed_masks, device):
     """Wraps the existing validation agent and syncs the latest training weights."""
@@ -812,6 +781,7 @@ def main_validate(val_loader, val_cache,
     current_state_dict = tensors_to_numpy(epinet_latency_estimation.state_dict())
     current_state_dict = {k: torch.from_numpy(v) for k, v in current_state_dict.items()}
 
+    # TODO: Possible bug here
     epoch_summary = {
         "train_loss_total": np.mean(epoch_total_losses)/len(epoch_total_losses),
         "train_loss_latency": np.mean(epoch_latency_losses)/len(epoch_latency_losses),
@@ -847,47 +817,6 @@ def main_validate(val_loader, val_cache,
     search_metrics.pop("timeout_error_rate")
     search_metrics.pop("total_queries")
     epoch_summary.update(search_metrics)
-
-    # query_plans_val = {}
-    # targets = defaultdict(dict)
-    # for res in execution_results:
-    #     q_id = res["query"].query[0]
-    #     best_plan = res["plan"]["plan"] if isinstance(res["plan"], dict) else res["plan"]
-    #
-    #     metrics = res["rl_metrics"]
-    #     is_err = metrics["is_error"]
-    #     lat = np.log1p(client_default_timeout if is_err else metrics["latency"])
-    #     cost = -1 if is_err else np.log1p(metrics["total_cost"])
-    #     cost_join = [-1 if is_err else np.log1p(join_rows) for join_rows in metrics["per_join_rows"]]
-    #
-    #     query_plans_val[q_id] = [(best_plan, {"latency": lat, "plan_cost": cost}, hash(q_id) % 10000)]
-    #     #TODO: These are probably wrong, due to multiple join cost and one plan_cost. How to align?
-    #     #TODO: Probably by aligning it with the plans and saying each plan has same cost
-    #     targets[q_id]["latency"] = torch.tensor([lat], dtype=torch.float32, device=torch.device('cpu'))
-    #     targets[q_id]["plan_cost"] = torch.tensor([cost], dtype=torch.float32, device=torch.device('cpu'))
-    #     targets[q_id]["per_join_rows"] = torch.tensor(cost_join, dtype=torch.float32, device=torch.device('cpu'))
-    #
-    # mean_vals, std_vals, head_tracker = {}, {}, {}
-    #
-    # for head in ["latency", "plan_cost", "per_join_rows"]:
-    #     try:
-    #         mean_vals[head] = normalizers[head].mean.item() if normalizers[head].mean is not None else 0.0
-    #         std_vals[head] = torch.sqrt(normalizers[head].var).item() if normalizers[head].var is not None else 1.0
-    #     except AttributeError:
-    #         mean_vals[head], std_vals[head] = 0.0, 1.0
-    #
-    #     tracker = validate_cached(
-    #         val_loader=val_loader, query_plans_val=query_plans_val, targets=targets,
-    #         epinet_cost_estimation=epinet_latency_estimation, val_cache=val_cache,
-    #         mean_vals=mean_vals, std_vals=std_vals, train_loss=loss_fns[head], device=torch.device('cpu'),
-    #         n_val_epi_indexes=agent_kwargs["n_epinet_samples"], sigma=sigma, alpha_mlp=0.0,
-    #         alpha_ensemble=0.0, precomputed_indexes=precomputed_indexes,
-    #         precomputed_masks=precomputed_masks, head_names_to_val=(head,)
-    #     )
-    #     # TODO: Add total loss (using mixing values)
-    #
-    #     epoch_summary.update(tracker.summarize())
-
     return epoch_summary
 
 
@@ -907,18 +836,7 @@ def main_train(queries_train,
                gpu_device):
     tracemalloc.start()
 
-    train_summary = TrainSummary([
-                                   # ("val_epi_mse_latency", "min"), ("val_epi_mse_latency_scaled", "min"),
-                                   # ("val_epi_mse_plan_cost", "min"), ("val_epi_mse_plan_cost_scaled", "min"),
-                                   # ("val_epi_avg_std", "min"),
-                                   # ("val_joint_gaussian_nll_latency", "min"),
-                                   # ("val_joint_gaussian_nll_plan_cost", "min"),
-                                   # ("val_joint_nll_latency_no_epinet", "min"),
-                                   # ("val_joint_nll_cost_no_epinet", "min"),
-                                   # ("val_loss_total_epinet", "min"),
-                                   # ("val_loss_latency_epinet", "min"),
-                                   # ("val_loss_plan_cost_epinet", "min"),
-                                   ("train_loss_total", "min"),
+    train_summary = TrainSummary([("train_loss_total", "min"),
                                    ("train_loss_latency", "min"),
                                    ("train_loss_plan_cost", "min"),
                                    ("train_loss_join_rows", "min"),
@@ -927,8 +845,6 @@ def main_train(queries_train,
                                    ("execution_latency_p90_s", "min"),
                                    ("execution_latency_p99_s", "min"),
                                    ("execution_latency_max_s", "min"),
-                                   # ("val_calibration_error_latency", "min"), ("val_sharpness_latency", "min"),
-                                   # ("val_calibration_error_plan_cost", "min"), ("val_sharpness_plan_cost", "min"),
                                    ("train_latency_during_epoch", "list"),
                                    ("train_loss_total_during_epoch", "list"),
                                    ("train_loss_latency_during_epoch", "list"),
@@ -1232,16 +1148,14 @@ def main_train(queries_train,
     # Proceed to next steps
 
     #TODO: For generalization we can look into two things
-    # 1. MoE in GNN based on graph structural embedding. Or other MoE mechanism. Maybe use epinet to determine
-    #  how many experts are needed for a query; when uncertainty is high route to more experts?
-    # Actually really cool: Using this MoE: https://gemini.google.com/share/2c059d54fa7e
-    # 2. Use epinet uncertainty estimate to generate unseen query templates. We train epinet on the default shapes
+    # 1. Use epinet uncertainty estimate to generate unseen query templates. We train epinet on the default shapes
     #  then sample using random walks (with restrictions on valid walks and 5% being corrupted walks with no results)
     #  rank the queries based on uncertainty -> top k get entered into the data training pipeline.
-    #  Another option is to dynamically merge queries of different shapes. Then pass those through epinet
-    #  prevent forgetting in some smart way.
-    #  Or we could even do generation through an endpoint and ranking possible next walks by epistemic uncertainty.
-    #  so not only guide plan generation but also training data generation through uncertainty estimates
+    #TODO to achieve this:
+    # 1. Add Adapters to planning model tcnn or unfreeze base layers to train additional adapters
+    # 2. Use weight averaging technique that looks at validation performance for the generalization training
+    # In this, we keep the whole validation set + validation set from generated, we then apply the weight averaging
+    # updates based on validation performance
 
 
 def main_online_estimation_experiment(endpoint_location, queries_location_train, queries_location_val,

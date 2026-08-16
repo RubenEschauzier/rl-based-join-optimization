@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+dataset:
+  endpoint_location: "http://localhost:9000/"
+  queries_train: "data/generated_queries/mixed_yago_hll/dataset_train"
+  queries_val: "data/generated_queries/mixed_yago_hll/dataset_val"
+  rdf2vec_vector_location: "data/rdf2vec_embeddings/mixed_yago/model.json"
+  occurrences_location: "data/term_occurrences/mixed_yago/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago/multiplicities.json"
+  hll_location: "data/term_occurrences/mixed_yago/hll_sketches.json"
+
+  save_loc_simulated: "data/simulated_query_plan_data/mixed_yago/data"
+  save_loc_simulated_val: "data/simulated_query_plan_data/mixed_yago/val_data"
+
+models:
+  oracle:
+    config: "experiments/model_configs/pretrain_model/t_cv_repr_huge_graph_norm_hll.yaml"
+    experiment_dir: "experiments/experiment_outputs/mixed_yago/pretrained_models/pretrain_experiment_huge_oracle_graph_norm_hll.yaml-31-05-2026-22-46-06"
+  embedder:
+    config: "experiments/model_configs/policy_networks/t_cv_repr_separate_head_own_embeddings_hll.yaml"
+    experiment_dir: "experiments/experiment_outputs/mixed_yago/pretrained_models/pretrain_experiment_triple_conv_hll.yaml-27-05-2026-15-37-01"
+  epinet:
+    prior_config: "experiments/model_configs/prior_networks/prior_t_cv_smallest_hll.yaml"
+    experiment_dir: "experiments/experiment_outputs/mixed_yago/supervised_epinet_training/simulated_cost-02-06-2026-09-47-43"
+  output:
+    experiment_base_dir: "experiments/experiment_outputs/mixed_yago/supervised_epinet_training"
+
+hyperparameters:
+  query_batch_size: 16
+  n_epi_indexes_train: 16
+  n_epi_indexes_val: 200
+  sigma: 0.60
+  alpha_mlp: 0.08
+  alpha_ensemble: 0.30
+  lr: 0.001
+  weight_decay: 0.001
+  n_epochs: 100
+  mlp_dimension: 64
+  epinet_index_dim: 32
+  num_workers: 6
+
+execution:
+  train_epi_network: True
+
+debug:
+  debug_single_batch: True

@@ -7,9 +7,10 @@ from src.datastructures.prepare_feature_data import (
     read_queries,
     calculate_occurrences,
     calculate_query_triple_pattern_cardinalities,
-    calculate_multiplicities_queries
+    calculate_multiplicities_queries, calculate_hll_sketches
 )
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
+from src.query_environments.qlever.qlever_execute_query_default import QLeverOptimizerClient
 
 
 def main():
@@ -37,14 +38,14 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["all", "occurrences", "cardinalities", "multiplicities"],
+        choices=["all", "occurrences", "cardinalities", "multiplicities", "hll"],
         default="all",
         help="Specify which metric to calculate. Defaults to 'all'."
     )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
-    query_env = BlazeGraphQueryEnvironment(args.endpoint.format(args.dataset))
+    query_env = QLeverOptimizerClient(args.endpoint.format(args.dataset))
 
     # Expand glob patterns and load queries
     loaded_queries = []
@@ -71,7 +72,11 @@ def main():
         with open(os.path.join(args.output, 'multiplicities.json'), 'w') as f:
             json.dump(predicate_multiplicities, f)
         print("Saved multiplicities.")
-
+    if args.mode in ["all", "hll"]:
+        hll_sketches = calculate_hll_sketches(loaded_queries, args.endpoint.format(args.dataset))
+        with open(os.path.join(args.output, 'hll_sketches.json'), 'w') as f:
+            json.dump(hll_sketches, f)
+        print("Saved HyperLogLog sketches.")
 
 if __name__ == "__main__":
     main()

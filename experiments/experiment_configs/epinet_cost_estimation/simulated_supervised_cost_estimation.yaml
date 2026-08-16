@@ -29,3 +29,4 @@ hyperparameters:
   weight_decay: 0.04
   n_epochs: 50
   mlp_dimension: 64
+

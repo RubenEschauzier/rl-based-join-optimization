@@ -1,0 +1,22 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/mixed_yago_hll/dataset_train"
+  dataset_val: "data/generated_queries/mixed_yago_hll/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/mixed_yago/model.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_moe_graph_norm_separate_head_mixed_queries.yaml"
+  occurrences_location: "data/term_occurrences/mixed_yago/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago/multiplicities.json"
+  hll_location: "data/term_occurrences/mixed_yago/hll_sketches.json"
+  feature_type: "predicate_edge_hll"
+  n_epoch: 50
+  batch_size: 64
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/mixed_yago/pretrained_models"
+

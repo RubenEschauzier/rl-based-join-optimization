@@ -26,35 +26,43 @@ def get_config_name():
     parser.add_argument(
         "--config",
         type=str,
-        default="pretrain_experiment_triple_conv_moe_graph_norm.yaml",
+        default="pretrain_experiment_huge_oracle_graph_norm_hll.yaml",
         help="Optional Hydra config name"
+    )
+    parser.add_argument(
+        "--config_dir",
+        type=str,
+        required=False,
+        default="experiments/experiment_configs/pretraining_experiments/pretrain_experiments_yago_mixed",
+        help="Directory from root of project where experiments are housed"
     )
     args, remaining = parser.parse_known_args()
     # Put back remaining args so Hydra still sees them
     sys.argv = [sys.argv[0]] + remaining
-    return args.config
+    return args.config, args.config_dir
 
 
 # Get config_name before Hydra runs
-config_name = get_config_name()
+config_name, config_dir = get_config_name()
+if config_dir:
+    os.environ["HYDRA_CONFIG_PATH"] = os.path.join(ROOT_DIR, config_dir)
+
 
 @hydra.main(version_base=None, config_path=os.getenv("HYDRA_CONFIG_PATH"),
             config_name=config_name)
 def main(cfg: DictConfig):
-    print(f"Loaded config: {config_name}")
+    hydra_config_path = os.environ["HYDRA_CONFIG_PATH"]
+    print(f"Loaded config: {hydra_config_path}/{config_name}")
     train_set, val_set = None, None
     writer = None
     rl_configs = OmegaConf.select(cfg, "rl_training", default=None)
-
     skip_pretraining = False
     if rl_configs:
         skip_pretraining = OmegaConf.select(list(rl_configs.values())[0], "model_directory", default=None)
-
     if "pretraining" in cfg and not skip_pretraining:
         c1 = cfg.pretraining
         with open(os.path.join(ROOT_DIR, c1.model_config), "r") as f:
             config = yaml.safe_load(f)
-
         writer = ExperimentWriter(c1.experiment_root_directory, config_name,
                                   dict(c1), dict(config['model']))
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,7 +74,8 @@ def main(cfg: DictConfig):
             feature_type=c1.feature_type,
             occurrences_location=c1.occurrences_location,
             tp_cardinality_location=c1.tp_cardinality_location,
-            multiplicity_location=c1.multiplicity_location,
+            multiplicity_location=c1.get("multiplicity_location", None),
+            hll_location=c1.get("hll_location", None),
             writer=writer,
             model_config_location=c1.model_config,
             n_epoch=c1.n_epoch,

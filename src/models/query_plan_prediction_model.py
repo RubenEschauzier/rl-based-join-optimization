@@ -43,8 +43,15 @@ class BasePlanCostEstimator(nn.Module, ABC):
         # Encode the query plan
         emb, idx = self.plan_embedding_nn((trees, indexes))
 
+
         # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
         emb_transposed = emb.transpose(1, 2)
+
+        if self.__class__.__name__ == "PlanCostEstimatorFull":
+
+            emb_numpy = emb.detach().cpu().numpy()
+            emb_transposed_numpy = emb_transposed.detach().cpu().numpy()
+            _debug_anchor = True  # Set your IDE breakpoint on this line
 
         # Stack the node embeddings to a tensor (n_plans * n_nodes, dim) to use with batch variable
         emb_stacked = emb_transposed.reshape((-1, emb_transposed.shape[-1]))
@@ -73,10 +80,27 @@ class BasePlanCostEstimator(nn.Module, ABC):
         # Apply full MLP to plan representation
         mlp_out = self.mlp(combined)
 
+
         # Iterate through the dictionary of heads and collect predictions
         predictions = {
             head_name: head(mlp_out) for head_name, head in self.heads.items()
         }
+
+        # if self.__class__.__name__ == "PlanCostEstimatorFull":
+        #     # Compute and print pairwise Euclidean distances
+        #     distances = torch.cdist(mlp_out, mlp_out, p=2)
+        #     print("\nPairwise distances (mlp_out):")
+        #     print(distances)
+        #
+        #     # Isolate and print pairs that collapse to near-zero distance (excluding self)
+        #     mask = (distances < 1e-5) & ~torch.eye(n_plans, dtype=torch.bool, device=self.device)
+        #     collisions = mask.nonzero(as_tuple=False)
+        #
+        #     if len(collisions) > 0:
+        #         print(f"Representation collisions detected between plan indices:\n{collisions}")
+        #
+        #     mlp_out_numpy = mlp_out.detach().cpu().numpy()
+        #     _debug_anchor = True  # Set your IDE breakpoint on this line
 
         # Return a dictionary of predictions instead of a single tensor
         return predictions, mlp_out
@@ -304,9 +328,17 @@ class QueryPlansPredictionModel(nn.Module):
                                        edge_attr=queries.edge_attr.to(self.device),
                                        batch=queries.batch.to(self.device))
         # Get the embedding head from the model
-        embedded_combined, edge_batch = next(head_output['output']
-                                             for head_output in embedded if
-                                             head_output['output_type'] == 'triple_embedding')
+        try:
+            embedded_combined, edge_batch = next(head_output['output']
+                                                 for head_output in embedded if
+                                                 head_output['output_type'] == 'triple_embedding')
+        except Exception as e:
+            print(queries)
+            print(embedded)
+            print(e)
+            test = 5
+            raise e
+
         n_nodes_in_batch = nn.functional.one_hot(edge_batch).sum(dim=0)
         selection_index = list(torch.cumsum(n_nodes_in_batch, dim=0))[:-1]
 

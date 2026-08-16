@@ -1,3 +1,4 @@
+from _pytest._io import terminalwriter
 import pdb
 from collections import defaultdict
 import os
@@ -18,6 +19,7 @@ from torch_geometric.loader import DataLoader
 
 from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork, prepare_epinet_model
+from src.pretrain_procedure import DualMetricScheduler
 from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
@@ -97,9 +99,10 @@ def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epin
 
     for i in valid_indices:
         q_id = query_batch.query[i]
-        if q_id in cache:
+        cached_priors = cache.get(q_id)
+        if cached_priors is not None:
             # Retrieve all cached heads and move to target device
-            priors[i] = {head: tensor.to(device) for head, tensor in cache[q_id].items()}
+            priors[i] = {head: tensor.to(device) for head, tensor in cached_priors.items()}
         else:
             missing_indices.append(i)
 
@@ -173,82 +176,96 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
 
     total_val_queries = len(val_loader.dataset)
 
-    with tqdm(total=total_val_queries, desc="Validating") as pbar:
-        for query_batch in val_loader:
-            valid_indices = [i for i, q_id in enumerate(query_batch.query) if q_id in query_plans_val]
-            if not valid_indices:
-                continue
+    pbar = tqdm(total=total_val_queries, desc="Validating", leave=False, position=1, dynamic_ncols=True)
 
-            unweighted_ensemble_priors = fetch_or_compute_priors(
-                query_batch, valid_indices, query_plans_val, val_cache, epinet_cost_estimation, precomputed_indexes,
-                precomputed_masks, device
-            )
+    n_empty_plans = 0
+    n_non_empty_plans = 0
+    processed = 0
 
-            with torch.no_grad():
-                embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
+    for query_batch in val_loader:
+        processed += len(query_batch.query)
+        valid_indices = [i for i, q_id in enumerate(query_batch.query)
+                         if q_id in query_plans_val and len(query_plans_val[q_id]) > 0]
+        n_empty_plans += (len(query_batch.query) - len(valid_indices))
+        n_non_empty_plans += len(valid_indices)
+        # Update pbar with stats to track if expected number of empty plans are produced
+        pbar.set_postfix(
+            empty_plans=n_empty_plans,
+            non_empty_plans=n_non_empty_plans,
+            queries=processed
+        )
 
-                for valid_idx, unweighted_ensemble_prior in zip(valid_indices, unweighted_ensemble_priors):
-                    q_id = query_batch.query[valid_idx]
-                    plans_query = query_plans_val[q_id]
+        if not valid_indices:
+            pbar.update(1)
+            continue
 
-                    estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
-                        plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
+        unweighted_ensemble_priors = fetch_or_compute_priors(
+            query_batch, valid_indices, query_plans_val, val_cache, epinet_cost_estimation, precomputed_indexes,
+            precomputed_masks, device
+        )
+
+        with torch.no_grad():
+            embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
+
+            for valid_idx, unweighted_ensemble_prior in zip(valid_indices, unweighted_ensemble_priors):
+                q_id = query_batch.query[valid_idx]
+                plans_query = query_plans_val[q_id]
+
+                estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
+                    plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
+                )
+                for head_name in head_names_to_val:
+                    estimated_head_val = estimated_cost[head_name]
+                    prior_for_head = unweighted_ensemble_prior[head_name]
+
+                    val_loss_epinet, repeated_target, epinet_cost_estimates = loss_epinet(
+                        prior_for_head,
+                        epinet_cost_estimation,
+                        train_loss,
+                        estimated_head_val,
+                        last_feature,
+                        plans_query,
+                        n_val_epi_indexes,
+                        sigma, alpha_mlp, alpha_ensemble,
+                        generator,
+                        device,
+                        head_name=head_name
                     )
-                    for head_name in head_names_to_val:
-                        estimated_head_val = estimated_cost[head_name]
-                        prior_for_head = unweighted_ensemble_prior[head_name]
 
-                        val_loss_epinet, repeated_target, epinet_cost_estimates = loss_epinet(
-                            prior_for_head,
-                            epinet_cost_estimation,
-                            train_loss,
-                            estimated_head_val,
-                            last_feature,
-                            plans_query,
-                            n_val_epi_indexes,
-                            sigma, alpha_mlp, alpha_ensemble,
-                            generator,
-                            device,
-                            head_name=head_name
-                        )
+                    mean_val = mean_vals[head_name]
+                    std_val = std_vals[head_name]
 
-                        mean_val = mean_vals[head_name]
-                        std_val = std_vals[head_name]
+                    val_metrics = compute_validation_metrics_epinet(
+                        epinet_cost_estimates, repeated_target, n_val_epi_indexes, mean_val, std_val, joint_loss,
+                        head_name = head_name
+                    )
 
-                        val_metrics = compute_validation_metrics_epinet(
-                            epinet_cost_estimates, repeated_target, n_val_epi_indexes, mean_val, std_val, joint_loss,
-                            head_name = head_name
-                        )
+                    tracker.update_calibration(
+                        val_metrics.pop(f"val_observed_p_values_{head_name}"),
+                        val_metrics.pop(f"val_distribution_variance_{head_name}"),
+                    )
 
-                        tracker.update_calibration(
-                            val_metrics.pop(f"val_observed_p_values_{head_name}"),
-                            val_metrics.pop(f"val_distribution_variance_{head_name}"),
-                        )
+                    estimated_head_val = estimated_head_val.view(-1)
+                    head_target = targets[q_id][head_name].view(-1)
 
-                        estimated_head_val = estimated_head_val.squeeze()
+                    original_cost = (estimated_head_val * std_val) + mean_val
+                    original_target = (head_target * std_val) + mean_val
 
-                        #TODO: Fix target extraction
-                        head_target = targets[q_id][head_name]
-                        # target = torch.tensor([plan[1] for plan in plans_query], device=device)
+                    tracker.update(
+                        **val_metrics,
+                        **{
+                            f"val_loss_{head_name}_scaled": train_loss(estimated_head_val, head_target).item(),
+                            f"val_loss_{head_name}_unscaled": train_loss(original_cost, original_target).item(),
+                            f"val_mape_{head_name}_scaled": mape(estimated_head_val, head_target).item(),
+                            f"val_mape_{head_name}_unscaled": mape(original_cost, original_target).item(),
+                            f"val_joint_nll_{head_name}_no_epinet": joint_loss(estimated_head_val.unsqueeze(0),
+                                                                               head_target).item(),
+                            f"val_loss_{head_name}_epinet": val_loss_epinet.cpu().item()
+                        }
+                    )
 
-                        original_cost = (estimated_head_val * std_val) + mean_val
-                        original_target = (head_target * std_val) + mean_val
-
-                        tracker.update(
-                            **val_metrics,
-                            **{
-                                f"val_loss_{head_name}_scaled": train_loss(estimated_head_val, head_target).item(),
-                                f"val_loss_{head_name}_unscaled": train_loss(original_cost, original_target).item(),
-                                f"val_mape_{head_name}_scaled": mape(estimated_head_val, head_target).item(),
-                                f"val_mape_{head_name}_unscaled": mape(original_cost, original_target).item(),
-                                f"val_joint_nll_{head_name}_no_epinet": joint_loss(estimated_head_val.unsqueeze(0),
-                                                                                   head_target).item(),
-                                f"val_loss_{head_name}_epinet": val_loss_epinet.cpu().item()
-                            }
-                        )
-
-                    pbar.update(1)
-
+                pbar.update(1)
+    pbar.close()
     return tracker
 
 
@@ -267,6 +284,7 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
     embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
 
     for valid_idx, unweighted_ensemble_prior in zip(valid_indices, unweighted_ensemble_priors):
+        embedded_numpy = embedded[valid_idx].detach().cpu().numpy()
         q_id = query_batch.query[valid_idx]
         plans_query = query_plans[q_id]
 
@@ -288,6 +306,7 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
         )
         acc_loss += loss_epinet_val
 
+    acc_loss /= len(valid_indices)
     acc_loss.backward()
     optimizer.step()
     return acc_loss.detach().cpu().item()
@@ -301,40 +320,75 @@ def loss_epinet(unweighted_ensemble_priors,
                 generator,
                 device,
                 head_name = "plan_cost"):
-    last_feature = last_feature.detach()
+    last_feature_detached = last_feature.detach()
     n_plans = estimated_cost.shape[0]
 
     generator.manual_seed(plans[0][2])
+    # (n_plans, epi_index_dim)
     c_vectors = torch.randn((n_plans, epinet_cost_estimation.epi_index_dim), generator=generator, device=device)
     c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
 
+    # (n_epi_indexes, epi_index_dim)
     epinet_indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(n_epi_indexes)
+    # (n_epi_indexes, n_plans)
     ensemble_prior = torch.matmul(epinet_indexes, unweighted_ensemble_priors)
-
+    # Shape: (n_epi_indexes * n_plans, 1)
+    # Layout: Row-major contiguous flattening.
+    # Elements are grouped by epistemic index (ei), iterating through all plans for a given index before moving to the next:
+    # (plan_1_ei_1, plan_2_ei_1, ..., plan_n_ei_1,  plan_1_ei_2, plan_2_ei_2, ..., plan_n_ei_2,  ..., plan_n_ei_k)
+    # where ei = epistemic index sampled during training.
     ensemble_prior_flat = ensemble_prior.view(-1, 1)
 
-    mlp_prior = epinet_cost_estimation.compute_mlp_prior_batched(last_feature, epinet_indexes)
+    # Shape: (n_epi_indexes * n_plans, 1)
+    # Layout: Row-major contiguous block. Grouped by epistemic index: evaluates all plans
+    # using the first sampled index, then all plans using the second index, etc.
+    mlp_prior = epinet_cost_estimation.compute_mlp_prior_batched(last_feature_detached, epinet_indexes)
     mlp_prior = mlp_prior[head_name]
 
-    learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp_batched(last_feature, epinet_indexes)
+    # Shape: (n_epi_indexes * n_plans, 1)
+    # Layout: Matches the row-major, index-grouped layout of the priors.
+    learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp_batched(last_feature_detached, epinet_indexes)
     learnable_mlp_prior = learnable_mlp_prior[head_name]
 
+    # Shape: (n_epi_indexes * n_plans, 1)
+    # Layout: repeat(n_epi_indexes, 1) copies the full block of base plan costs K times.
+    # This aligns the base costs identically with the row-major, index-grouped layout of the Epinet.
     estimated_cost_exp = estimated_cost.repeat(n_epi_indexes, 1)
-    epinet_estimated_cost = estimated_cost_exp + (
-            learnable_mlp_prior + alpha_mlp * mlp_prior + alpha_ensemble * ensemble_prior_flat
-    )
+    
 
+    # Shape: (n_epi_indexes * n_plans)
+    # Layout: Row-major contiguous flattening.
+    # Grouped by epistemic index: calculates the perturbation (z * c) for all plans using
+    # the first sampled index, then all plans using the second index, etc.
+    
+    # TODO: Maybe this c_vectors should be correlated within a query. Not completely but a little
     anchor_matrix = torch.matmul(epinet_indexes, c_vectors.T)
     anchor_term_flat = anchor_matrix.view(-1)
 
     raw_targets = torch.tensor([plan[1] for plan in plans], device=device)
+
+    # Base model loss (purely deterministic, no variance from z)
+    loss_base = loss(estimated_cost.squeeze(-1), raw_targets.float())
+
+    # Epinet loss (we detach the base model so it doesn't receive z-variance gradients)
+    epinet_estimated_cost_detached = estimated_cost_exp.detach() + (
+            learnable_mlp_prior + alpha_mlp * mlp_prior + alpha_ensemble * ensemble_prior_flat
+    )
+
+    # (n_epi_indexes * n_plans)
     raw_targets_exp = raw_targets.repeat(n_epi_indexes)
 
-    perturbed_targets = raw_targets_exp + sigma * anchor_term_flat
+    # TODO: We removed the epinet perturbation terms. To see if now the epinet works
+    # perturbed_targets = raw_targets_exp + sigma * anchor_term_flat
+    perturbed_targets = raw_targets_exp
+
     unperturbed_target = raw_targets_exp
 
-    query_loss = loss(epinet_estimated_cost.squeeze(), perturbed_targets)
-    return query_loss, unperturbed_target, epinet_estimated_cost
+    
+    loss_epinet_only = loss(epinet_estimated_cost_detached.squeeze(-1), perturbed_targets)
+    loss_total = loss_base + loss_epinet_only
+
+    return loss_total, unperturbed_target, epinet_estimated_cost_detached
 
 
 def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_plans_train,
@@ -348,7 +402,11 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                                   n_epi_indexes_val,
                                   writer,
                                   cache_directory,
+                                  debug_single_batch = False,
                                   trial: optuna.Trial = None):
+
+    import shutil
+    shutil.rmtree(cache_directory, ignore_errors=True)
     os.makedirs(cache_directory, exist_ok=True)
     train_cache = diskcache.Cache(os.path.join(cache_directory, "train_cache"), size_limit=50 * 1024 ** 3)
     val_cache = diskcache.Cache(os.path.join(cache_directory, "val_cache"), size_limit=50 * 1024 ** 3)
@@ -360,28 +418,73 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
     precomputed_indexes = precompute_left_deep_tree_conv_index(20)
     precomputed_masks = precompute_left_deep_tree_node_mask(20)
 
-    train_summary = TrainSummary([ ("val_epi_mse", "min"), ("val_epi_mse_scaled", "min"),
-                                   ("val_epi_avg_std", "min"), ("val_joint_gaussian_nll", "min"),
-                                   ("val_loss_cost_scaled", "min"), ("val_loss_cost_unscaled", "min"),
-                                   ("val_mape_cost_scaled", "min"), ("val_mape_cost_unscaled", "min"),
-                                   ("val_joint_nll_no_epinet", "min"), ("val_loss_epinet", "min"),
+    train_summary = TrainSummary([ ("val_epi_mse_plan_cost", "min"), ("val_epi_mse_plan_cost_scaled", "min"),
+                                   ("val_epi_avg_std_plan_cost", "min"), ("val_joint_gaussian_nll_plan_cost", "min"),
+                                   ("val_loss_plan_cost_scaled", "min"), ("val_loss_plan_cost_unscaled", "min"),
+                                   ("val_mape_plan_cost_scaled", "min"), ("val_mape_plan_cost_unscaled", "min"),
+                                   ("val_joint_nll_plan_cost_no_epinet", "min"), ("val_loss_plan_cost_epinet", "min"),
                                    ("train_loss", "min"), ("val_calibration_error", "min"), ("val_sharpness", "min")])
 
     # Predefine a generator so the perturbation vectors are consistent among epochs
     generator = torch.Generator(device=device)
     epinet_cost_estimation.to(device)
 
+    # TODO: Temp removal shuffle = True for debug
     loader = DataLoader(queries_train, batch_size=query_batch_size, shuffle=True)
     loader_val = DataLoader(queries_val, batch_size=1, shuffle=False)
 
-    # Freeze cost estimation model parameters for epinet training
-    for param in epinet_cost_estimation.cost_estimation_model.parameters():
-        param.requires_grad = False
-    epinet_cost_estimation.cost_estimation_model.eval()
+    val_targets = {query: {"plan_cost": torch.tensor([plan[1] for plan in plans_val], device=device)}
+                   for query, plans_val in query_plans_val.items()}
 
-    params = list(epinet_cost_estimation.parameters())
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3, threshold=1e-2)
+    # Flag to overfit on a single batch to validate that the model works on very small data
+    if debug_single_batch:
+        print("DEBUG MODE: Fitting on a single training batch subset.")
+
+        # Create single valid batch from training data
+        valid_indices = []
+        for idx in range(len(queries_train)):
+            q_id = queries_train[idx].query
+            if q_id in query_plans_train:
+                valid_indices.append(idx)
+            if len(valid_indices) == query_batch_size:
+                break
+
+        if not valid_indices:
+            raise ValueError("No valid training queries found to debug.")
+
+        # Take subset with valid data batch
+        subset_dataset = queries_train[valid_indices]
+
+        # Overwrite data loaders to only use the one training batch
+        loader = DataLoader(subset_dataset, batch_size=query_batch_size, shuffle=False)
+        loader_val = DataLoader(subset_dataset, batch_size=1, shuffle=False)
+
+        query_plans_val = query_plans_train
+        val_targets = {
+            query: {"plan_cost": torch.tensor([plan[1] for plan in plans_train], device=device)}
+            for query, plans_train in query_plans_train.items()
+        }
+
+    # TODO: Temp removal of freezing of cost estimation model parameters for debugging
+    # Freeze cost estimation model parameters for epinet training
+    # for param in epinet_cost_estimation.cost_estimation_model.parameters():
+    #     param.requires_grad = False
+    # epinet_cost_estimation.cost_estimation_model.eval()
+
+    params_all = list(epinet_cost_estimation.parameters())
+    params_trainable = [p for p in epinet_cost_estimation.parameters() if p.requires_grad]
+
+    num_trainable = sum(p.numel() for p in params_trainable)
+    num_fixed = sum(p.numel() for p in params_all if not p.requires_grad)
+
+    print( f"Parameter counts -> Trainable: {num_trainable:,} | Fixed: {num_fixed:,} "
+           f"| Total: {num_trainable + num_fixed:,}")
+
+    optimizer = torch.optim.AdamW(params_trainable, lr=lr, weight_decay=weight_decay)
+    scheduler = DualMetricScheduler(optimizer,
+                                    patience=3,
+                                    threshold=1e-2
+                                    )
     previous_lr = scheduler.get_last_lr()
 
     print_param_count(epinet_cost_estimation, True)
@@ -391,33 +494,48 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
 
     # noinspection PyTypeChecker
     total_train_queries = len(loader.dataset)
+    pbar = tqdm(total=total_train_queries, position=0, leave=True, dynamic_ncols=True)
+
 
     for epoch in range(1, n_epochs + 1):
         batch_losses = []
+        n_empty_plans = 0
+        n_non_empty_plans = 0
+        processed = 0
 
-        with tqdm(total=total_train_queries, desc=f"Epoch {epoch}/{n_epochs} [Train]") as pbar:
-            for query_batch in loader:
-                optimizer.zero_grad()
+        pbar.reset()
+        pbar.set_description(f"Epoch {epoch}/{n_epochs} [Train]")
 
-                valid_indices = [i for i, q_id in enumerate(query_batch.query) if q_id in query_plans_train]
-                if not valid_indices:
-                    continue
+        for query_batch in loader:
+            optimizer.zero_grad()
 
-                batch_loss = train_on_batch_cached(
-                    query_batch, valid_indices, query_plans_train, train_cache,
-                    precomputed_indexes, precomputed_masks,
-                    epinet_cost_estimation, optimizer, loss,
-                    n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble, generator, device
-                )
+            valid_indices = [i for i, q_id in enumerate(query_batch.query)
+                             if q_id in query_plans_train and len(query_plans_train[q_id]) > 0]
 
-                batch_losses.append(batch_loss)
-                pbar.update(len(query_batch.query))
-                break
+            n_empty_plans += (len(query_batch.query) - len(valid_indices))
+            n_non_empty_plans += len(valid_indices)
+            processed += len(query_batch.query)
+
+            pbar.set_postfix(
+                empty_plans=n_empty_plans,
+                non_empty_plans=n_non_empty_plans,
+                queries=processed
+            )
+
+            if not valid_indices:
+                continue
+
+            batch_loss = train_on_batch_cached(
+                query_batch, valid_indices, query_plans_train, train_cache,
+                precomputed_indexes, precomputed_masks,
+                epinet_cost_estimation, optimizer, loss,
+                n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble, generator, device
+            )
+
+            batch_losses.append(batch_loss)
+            pbar.update(len(query_batch.query))
 
         epoch_train_loss = np.mean(batch_losses)
-        val_targets = { query: {"plan_cost": torch.tensor([plan[1] for plan in plans_val], device=device)}
-                        for query, plans_val in query_plans_val.items() }
-        # val_targets = {"plan_cost": torch.tensor([plan[1] for plan in query_plans_val], device=device) }
 
         tracker = validate_cached(
             loader_val, query_plans_val, val_targets, epinet_cost_estimation, val_cache, mean_train, std_train,
@@ -439,7 +557,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
 
         train_summary.update(mean_metrics_val, epoch)
 
-        scheduler.step(mean_metrics_val['val_loss_cost_unscaled'])
+        scheduler.step(mean_metrics_val['val_loss_plan_cost_unscaled'], mean_metrics_val['train_loss'])
 
         best, per_epoch = train_summary.summary()
         writer.write_epoch_to_file([], best, per_epoch, epinet_cost_estimation, epoch)
@@ -450,15 +568,16 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             previous_lr = scheduler.get_last_lr()
 
         if trial:
-            trial.report(mean_metrics_val["val_joint_gaussian_nll"], epoch)
+            trial.report(mean_metrics_val["val_joint_gaussian_nll_plan_cost"], epoch)
             if trial.should_prune():
                 train_cache.close()
                 val_cache.close()
                 raise optuna.TrialPruned()
 
+    pbar.close()
     train_cache.close()
     val_cache.close()
-    return train_summary.best_values["val_joint_gaussian_nll"]
+    return train_summary.best_values["val_joint_gaussian_nll_plan_cost"]
 
 
 def main_simulated_epinet_training(cfg: DictConfig,
@@ -470,12 +589,18 @@ def main_simulated_epinet_training(cfg: DictConfig,
                                    model_builder_fn,
                                    device,
                                    writer):
+
+    debug_single_batch = OmegaConf.select(cfg, "debug.debug_single_batch", default=False)
     writer.create_experiment_directory()
 
-    data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated)
+    data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated,
+                                     debug_single_batch=debug_single_batch,
+                                     query_batch_size=cfg.hyperparameters.query_batch_size)
     query_plans_dict = {k: v for d in data for k, v in d.items()}
 
-    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, cfg.dataset.save_loc_simulated_val)
+    val_data = prepare_simulated_dataset(val_dataset, oracle_model, device, cfg.dataset.save_loc_simulated_val,
+                                         debug_single_batch=debug_single_batch,
+                                         query_batch_size=cfg.hyperparameters.query_batch_size)
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train_cost, std_train_cost = preprocess_plans(query_plans_dict)
@@ -511,12 +636,14 @@ def main_simulated_epinet_training(cfg: DictConfig,
         alpha_ensemble=cfg.hyperparameters.alpha_ensemble,
         lr=cfg.hyperparameters.lr,
         weight_decay=cfg.hyperparameters.weight_decay,
-        n_epochs=cfg.hyperparameters.n_epochs
+        n_epochs=cfg.hyperparameters.n_epochs,
+        debug_single_batch=debug_single_batch,
     )
 
 
 def main_supervised_value_estimation(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
     train_dataset, val_dataset = prepare_data(
         cfg.dataset.endpoint_location,
         cfg.dataset.queries_train,
@@ -552,7 +679,7 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
     epinet_cost_estimation = prepare_epinet_model(**model_kwargs, device=device,
                                                   heads_config=heads_config, heads_config_prior=heads_config_prior)
-    experiment_base_dir = "experiments/experiment_outputs/yago_gnce/supervised_epinet_training"
+    experiment_base_dir = cfg.models.output.experiment_base_dir
 
     writer = ExperimentWriter(experiment_base_dir, "simulated_cost_epinet_training",
                               OmegaConf.to_container(cfg, resolve=True),
@@ -573,14 +700,14 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
 
 @hydra.main(version_base=None,
-            config_path="../../experiments/experiment_configs/epinet_cost_estimation",
-            config_name="simulated_supervised_cost_estimation_train_epinet_v2.yaml")
+            config_path="../../experiments/experiment_configs/epinet_cost_estimation/cost_estimation_yago_mixed",
+            config_name="simulated_supervised_cost_estimation_mixed_yago_train_epinet.yaml")
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
     best_epinet_dir = find_best_epoch_directory(cfg.models.epinet.experiment_dir, "val_loss_cost_unscaled")
     best_embedder_dir = find_best_epoch_directory(cfg.models.embedder.experiment_dir, "val_q_error")
-    best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_q_error")
+    best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_p99_q_error")
 
     cfg.models.embedder.dir = str(best_embedder_dir)
     cfg.models.oracle.dir = str(best_oracle_dir)

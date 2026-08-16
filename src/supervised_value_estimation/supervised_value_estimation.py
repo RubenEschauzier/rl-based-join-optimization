@@ -13,6 +13,7 @@ from torch_geometric.loader import DataLoader
 
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork
 from src.models.query_plan_prediction_model import PlanCostEstimatorFull, QueryPlansPredictionModel
+from src.pretrain_procedure import DualMetricScheduler
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
 from src.utils.training_utils.training_tracking import TrainSummary, ExperimentWriter
@@ -58,12 +59,30 @@ def validate(queries_val, query_plans_val,
     mape.to(device)
 
     val_loader = DataLoader(queries_val, batch_size=1, shuffle=False)
+    pbar = tqdm(val_loader, total=len(val_loader))
 
     query_to_val_metrics = {}
-    for queries in tqdm(val_loader, total=len(val_loader)):
+    processed = 0
+    skipped = 0
+    for queries in pbar:
+        processed += len(queries.query)
+
+        query = queries.query[0]
+
+        if query not in query_plans_val:
+            continue
+        if len(query_plans_val[query]) == 0:
+            skipped += 1
+            continue
+
+        pbar.set_postfix(
+            empty_plans=skipped,
+            queries=processed
+        )
+
         with torch.no_grad():
             embedded = epinet_cost_estimation.embed_query_batched(queries)
-            plans = query_plans_val[queries.query[0]]
+            plans = query_plans_val[query]
 
             estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
                 plans, embedded[0], precomputed_indexes, precomputed_masks
@@ -170,10 +189,11 @@ def train_simulated_cost_model(queries_train, query_plans_train,
         weight_decay=weight_decay
     )
 
-    scheduler = ReduceLROnPlateau(optimizer, 'min',
-                                  patience=3,
-                                  threshold=1e-2
-                                  )
+    scheduler = DualMetricScheduler(optimizer,
+                                    patience=3,
+                                    threshold=1e-2
+                                    )
+
     previous_lr = scheduler.get_last_lr()
 
     total_params_cost_estimation = 0
@@ -194,17 +214,34 @@ def train_simulated_cost_model(queries_train, query_plans_train,
                         device)
 
     for epoch in range(1, n_epochs + 1):
+        n_empty_plans = 0
+        processed = 0
         query_loss_epoch = []
-        for k, queries in tqdm(enumerate(loader), total=len(loader)):
+
+        pbar = tqdm(enumerate(loader), total=len(loader))
+
+        for k, queries in pbar:
+            processed += len(queries.query)
             optimizer.zero_grad()
 
             embedded = epinet_cost_estimation.embed_query_batched(queries)
 
             total_loss_tensor = torch.tensor(0.0, device=device)
             for i in range(len(queries.query)):
-                if queries.query[i] not in query_plans_train:
+
+                pbar.set_postfix(
+                    empty_plans=n_empty_plans,
+                    queries=processed
+                )
+                query = queries.query[i]
+                if query not in query_plans_train:
                     continue
+                if len(query_plans_train[query]) == 0:
+                    n_empty_plans += 1
+                    continue
+
                 plans = query_plans_train[queries.query[i]]
+
                 estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
                     plans, embedded[i], precomputed_indexes, precomputed_masks
                 )
@@ -230,7 +267,7 @@ def train_simulated_cost_model(queries_train, query_plans_train,
             print("INFO: Lr Updated from {} to {}".format(previous_lr, scheduler.get_last_lr()))
             previous_lr = scheduler.get_last_lr()
 
-        scheduler.step(val_loss)
+        scheduler.step(epoch_train_loss, val_loss)
 
     return train_summary.best_values["val_loss_cost_unscaled"]
 
@@ -285,7 +322,9 @@ def main_supervised_value_estimation(cfg: DictConfig):
         cfg.dataset.queries_val,
         cfg.dataset.rdf2vec_vector_location,
         cfg.dataset.occurrences_location,
-        cfg.dataset.tp_cardinality_location
+        cfg.dataset.tp_cardinality_location,
+        hll_location = cfg.dataset.hll_location,
+        multiplicity_location=cfg.dataset.multiplicity_location,
     )
 
     embedding_model = prepare_cardinality_estimator(
@@ -330,15 +369,15 @@ def main_supervised_value_estimation(cfg: DictConfig):
 
 
 @hydra.main(version_base=None,
-            config_path="../../experiments/experiment_configs/epinet_cost_estimation",
-            config_name="simulated_supervised_cost_estimation_v2.yaml")
+            config_path="../../experiments/experiment_configs/epinet_cost_estimation/cost_estimation_yago_mixed",
+            config_name="simulated_supervised_cost_estimation_mixed_yago.yaml")
 def main(cfg: DictConfig):
     # Temporarily unlock the config to allow dynamic updates
     OmegaConf.set_struct(cfg, False)
 
     # Locate the best directories of pretrained models dynamically
-    best_embedder_dir = find_best_epoch_directory(cfg.models.embedder.experiment_dir, "val_q_error")
-    best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_q_error")
+    best_embedder_dir = find_best_epoch_directory(cfg.models.embedder.experiment_dir, "val_p99_q_error")
+    best_oracle_dir = find_best_epoch_directory(cfg.models.oracle.experiment_dir, "val_p99_q_error")
 
     # Inject the resolved path directly into the config state
     cfg.models.embedder.dir = best_embedder_dir

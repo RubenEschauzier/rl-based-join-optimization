@@ -1,4 +1,3 @@
-import math
 from collections import defaultdict
 
 import numpy as np
@@ -13,20 +12,18 @@ from src.utils.generation_utils.generation_utils import convert_binding_to_rdfli
     query_all_terms, sample_start_triples, create_variable_dictionary, filter_isomorphic_queries, cardinality_query, \
     save_queries_to_file, track_predicate_counts
 
-
-def main_sample_paths(endpoint_url, default_graph_uri, max_queries, n_paths, max_size, proportion_unique_predicates,
+def main_sample_paths(endpoint_url, max_queries, n_paths, max_size, proportion_unique_predicates,
                       path_start_type, output_dir, file_name_non_literal, file_name_literal):
-    path_non_literal, path_literal = generate_path_queries(endpoint_url, default_graph_uri, max_queries, n_paths, max_size,
+    path_non_literal, path_literal = generate_path_queries(endpoint_url, max_queries, n_paths, max_size,
                                                            proportion_unique_predicates, path_start_type, output_dir)
     save_queries_to_file(output_dir, file_name_non_literal, path_non_literal)
     save_queries_to_file(output_dir, file_name_literal, path_literal)
 
 
-def generate_path_queries(endpoint_url, default_graph_uri, max_queries,
+def generate_path_queries(endpoint_url, max_queries,
                           n_paths, max_size, proportion_unique_predicates,
                           path_start_type, output_dir):
     sampled_paths, predicate_counts = sample_all_paths(endpoint_url,
-                                                       default_graph_uri,
                                                        max_queries,
                                                        n_paths,
                                                        max_size,
@@ -35,11 +32,11 @@ def generate_path_queries(endpoint_url, default_graph_uri, max_queries,
     save_queries_to_file(output_dir, "predicate_counts_path.json", predicate_counts)
     queries_no_literal = filter_isomorphic_queries(triples_to_query(sampled_paths, False))
     queries_literal = filter_isomorphic_queries(triples_to_query(sampled_paths, True))
-    data_path_no_literal = [cardinality_query(endpoint_url, query, 30, default_graph_uri)
-                            for query in tqdm(queries_no_literal)]
-    data_path_literal = [cardinality_query(endpoint_url, query, 30, default_graph_uri)
-                         for query in tqdm(queries_literal)]
-    return data_path_no_literal, data_path_literal
+    # data_path_no_literal = [cardinality_query(endpoint_url, query, 30)
+    #                         for query in tqdm(queries_no_literal)]
+    # data_path_literal = [cardinality_query(endpoint_url, query, 30)
+    #                      for query in tqdm(queries_literal)]
+    return queries_no_literal, queries_literal
 
 
 def triples_to_query(path_walks, literal_in_path):
@@ -63,26 +60,31 @@ def triples_to_query(path_walks, literal_in_path):
         query += "}"
         if literal_in_path:
             query = query.replace(literal_variable[1], literal_variable[0].n3())
-        queries.append(query)
+        query_obj = {
+            "query": query,
+        }
+        queries.append(query_obj)
     return queries
 
 
-def sample_all_paths(endpoint_url, default_graph_uri, max_queries,
+def sample_all_paths(endpoint_url, max_queries,
                      n_paths, max_size, proportion_unique_predicates, path_start_type: Literal["?s", "?p"]):
     generated_paths = []
     start_terms = query_all_terms(endpoint_url=endpoint_url,
                                   term_type=path_start_type,
-                                  default_graph_uri=default_graph_uri)
+                                  limit=10000
+                                  )
     # Shuffle so we can do early stopping without introducing sampling bias
-    start_terms.shuffle()
+    random.shuffle(start_terms)
+    start_terms = start_terms[:max_queries]
+
     predicate_counts = defaultdict(int)
     for term in tqdm(start_terms):
         start_triples = []
         # Query start triples according to the star seed type in the function
         if path_start_type == "?s":
             start_triples = sample_start_triples(endpoint_url=endpoint_url,
-                                                 default_graph_uri=default_graph_uri,
-                                                 limit=10000,
+                                                 limit=1000,
                                                  samples=n_paths,
                                                  s=term)
         if path_start_type == "?p":
@@ -102,7 +104,7 @@ def sample_all_paths(endpoint_url, default_graph_uri, max_queries,
             if random.random() > proportion_unique_predicates:
                 unique_predicates = False
 
-            path_walk = sample_path(endpoint_url, default_graph_uri,
+            path_walk = sample_path(endpoint_url,
                                     seed_triple=triple,
                                     size=path_size,
                                     sample_strategy='predicate',
@@ -121,7 +123,7 @@ def sample_all_paths(endpoint_url, default_graph_uri, max_queries,
     return generated_paths, predicate_counts
 
 
-def sample_path(endpoint_url, default_graph_uri, seed_triple, size,
+def sample_path(endpoint_url, seed_triple, size,
                 sample_strategy: Literal['uniform', 'predicate'], unique_predicates,
                 predicate_counts=None):
     # Start subject is what acts as subject to get all predicates/objects to extend with
@@ -133,7 +135,6 @@ def sample_path(endpoint_url, default_graph_uri, seed_triple, size,
 
     for i in range(size):
         subj_extensions, obj_extensions = query_path_extension(endpoint_url=endpoint_url,
-                                                               default_graph_uri=default_graph_uri,
                                                                limit=10000,
                                                                subj=start_subject,
                                                                obj=start_object
@@ -201,40 +202,49 @@ def sample_path(endpoint_url, default_graph_uri, seed_triple, size,
     return path
 
 
-def query_path_extension(endpoint_url, default_graph_uri, limit, subj, obj):
-    # If subj and obj are part of one triple, this will include the triple too. This must be filtered by
-    # any code calling the function
-    query_string_obj_side_extension = "SELECT ?p ?o WHERE { { SELECT DISTINCT ?p ?o WHERE " + \
-                                      "{ " + subj.n3() + " ?p ?o . } " + \
-                                      "ORDER BY ASC(?o) } } LIMIT " + str(limit)
-    query_string_subj_side_extension = "SELECT * WHERE { { SELECT DISTINCT ?s ?p WHERE { " + \
-                                       " ?s ?p " + obj.n3() + ". } " + \
-                                       "ORDER BY ASC (?s) } } LIMIT " + str(limit)
-    r_subj_extensions = query_exhaustively(endpoint_url, default_graph_uri, query_string_subj_side_extension, limit)
-    r_obj_extensions = query_exhaustively(endpoint_url, default_graph_uri, query_string_obj_side_extension, limit)
+def query_path_extension(endpoint_url, limit, subj, obj):
+    # If subj and obj are part of one triple, this will include the triple too.
+    # This must be filtered by any code calling the function.
 
-    res_subj, res_obj = [], []
-    for r_subj_ext in r_subj_extensions:
-        res_subj.extend(r_subj_ext.json()["results"]["bindings"])
-    for r_obj_ext in r_obj_extensions:
-        res_obj.extend(r_obj_ext.json()["results"]["bindings"])
+    # Use f-strings for cleaner formatting. Remove the hardcoded LIMIT here
+    # because our refactored `query_exhaustively` will append LIMIT and OFFSET.
+    query_string_obj_side_extension = (
+        f"SELECT ?p ?o WHERE {{ "
+        f"  {{ SELECT DISTINCT ?p ?o WHERE {{ {subj.n3()} ?p ?o . }} ORDER BY ASC(?o) }} "
+        f"}}"
+    )
 
-    obj_extensions = set([(subj, convert_binding_to_rdflib(binding['p']), convert_binding_to_rdflib(binding['o']))
-                          for binding in res_obj])
-    subj_extensions = set([(convert_binding_to_rdflib(binding['s']), convert_binding_to_rdflib(binding['p']), obj)
-                           for binding in res_subj])
+    query_string_subj_side_extension = (
+        f"SELECT * WHERE {{ "
+        f"  {{ SELECT DISTINCT ?s ?p WHERE {{ ?s ?p {obj.n3()} . }} ORDER BY ASC(?s) }} "
+        f"}}"
+    )
+
+    # Call the updated query_exhaustively which now handles the request
+    # headers for QLever and returns bindings directly.
+    bindings_subj = query_exhaustively(endpoint_url, query_string_subj_side_extension, limit)
+    bindings_obj = query_exhaustively(endpoint_url, query_string_obj_side_extension, limit)
+
+    # Build the sets directly from the returned bindings list
+    obj_extensions = set([
+        (subj, convert_binding_to_rdflib(binding['p']), convert_binding_to_rdflib(binding['o']))
+        for binding in bindings_obj
+    ])
+
+    subj_extensions = set([
+        (convert_binding_to_rdflib(binding['s']), convert_binding_to_rdflib(binding['p']), obj)
+        for binding in bindings_subj
+    ])
+
     return subj_extensions, obj_extensions
 
-
 if __name__ == "__main__":
-    main_sample_paths(endpoint_url="http://localhost:8890/sparql",
-                      default_graph_uri=['http://localhost:8890/watdiv'],
+    main_sample_paths(endpoint_url="http://localhost:8888",
                       n_paths=2,
-                      max_queries=10000,
+                      max_queries=2000,
                       max_size=5,
                       proportion_unique_predicates=.90,
                       path_start_type="?s",
-                      output_dir=r"C:\Users\ruben\projects\rl-based-join-optimization\data\pretrain_data"
-                                 r"\generated_queries",
+                      output_dir="generated",
                       file_name_literal="path_with_literal.json",
                       file_name_non_literal="path_without_literal.json")

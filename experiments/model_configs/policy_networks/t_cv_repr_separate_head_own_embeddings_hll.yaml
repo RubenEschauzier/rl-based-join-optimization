@@ -5,7 +5,7 @@ model:
       - type: TripleGINEConv
         nn:
           - type: Linear
-            in_features: 129
+            in_features: 136
             out_features: 101
             id: gine_nn_1_lin_1
           - type: ReLU
@@ -14,11 +14,8 @@ model:
             in_features: 101
             out_features: 101
             id: gine_nn_1_lin_2
-        edge_dim: 129
+        edge_dim: 137
         id: gine_1
-
-      - type: PairNorm
-        id: pair_norm_1
 
       - type: TripleGINEConv
         nn:
@@ -32,15 +29,14 @@ model:
             in_features: 100
             out_features: 200
             id: gine_nn_2_lin_2
-        edge_dim: 129
+        edge_dim: 137
         id: gine_2
-
-      - type: SumAggregation
-        id: sum_agg
 
   heads:
     - estimation_type: cardinality
       layers:
+        - type: SumAggregation
+          id: sum_agg
         - type: Linear
           in_features: 200
           out_features: 50
@@ -51,6 +47,10 @@ model:
           in_features: 50
           out_features: 1
           id: card_nn_lin_2
+    - estimation_type: triple_embedding
+      layers:
+        - type: TriplePatternPooling
+          id: tp_encoding
 
 weight_location:
   directory: ""

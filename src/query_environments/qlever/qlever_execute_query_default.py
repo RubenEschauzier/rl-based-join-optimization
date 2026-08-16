@@ -6,6 +6,8 @@ import os
 import aiohttp
 import json
 
+import requests
+
 
 class QLeverOptimizerClient:
     """Handles HTTP communication with a single QLever endpoint."""
@@ -95,6 +97,63 @@ class QLeverOptimizerClient:
             return signal
         else:
             return result
+
+    def _execute_sparql_count_sync(self, query: str) -> int:
+        """
+        Synchronously executes a standard SPARQL query requesting a single integer count.
+        """
+        headers = {
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/sparql-query"
+        }
+        params = {"timeout": self.default_timeout}
+
+        try:
+            response = requests.post(
+                self.http_endpoint,
+                params=params,
+                headers=headers,
+                data=query,
+                timeout=self.default_timeout_s + 5
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                bindings = result.get('results', {}).get('bindings', [])
+                if not bindings:
+                    return 0
+                return int(bindings[0]['tripleCount']['value'])
+            else:
+                self.logger.error(f"Count query failed: {response.text}")
+                return 0
+        except requests.exceptions.Timeout:
+            self.logger.error("Count query timed out")
+            return 0
+        except Exception as e:
+            self.logger.error(f"Count query exception: {str(e)}")
+            return 0
+
+    def cardinality_triple_pattern(self, triple_pattern: str) -> int:
+        """
+        Estimates or exact-matches the cardinality of a single triple pattern.
+        """
+        query = f"SELECT (COUNT(*) as ?tripleCount) WHERE {{ {triple_pattern} }}"
+        return self._execute_sparql_count_sync(query)
+
+    def cardinality_term(self, term: str) -> int:
+        """
+        Estimates the total global occurrences of a specific term in the dataset
+        across all positions (subject, predicate, or object).
+        """
+        query = f"""
+        SELECT (COUNT(*) AS ?tripleCount)
+        WHERE {{
+          {{ {term} ?p ?o }} UNION   # Term in the subject position
+          {{ ?s {term} ?o }} UNION   # Term in the predicate position
+          {{ ?s ?p {term} }}         # Term in the object position
+        }}
+        """
+        return self._execute_sparql_count_sync(query)
 
     def _walk_tree(self, node: dict, join_sequence: list):
         """Recursively extracts Join operations via post-order traversal."""

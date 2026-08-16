@@ -9,7 +9,6 @@ from torch_geometric.nn.inits import reset
 from typing import Optional, Union
 from torch_geometric.typing import OptPairTensor, OptTensor, Size, Adj
 
-# TODO: This is ALL chatgpt generated, so we need to validate this
 class BatchedKroneckerAdapters(Module):
     """
     Vectorized Kronecker adapters using Parameter-efficient Hypercomplex Multiplication (PHM).
@@ -25,13 +24,17 @@ class BatchedKroneckerAdapters(Module):
         if not in_channels % d_phm == 0 or not out_channels % d_phm == 0:
             raise ValueError(f"in_channels: {in_channels} % d_phm: {d_phm} != 0 "
                              f"or out_channels: {out_channels} % d_phm: {d_phm} != 0")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
         self.in_local = in_channels // d_phm
         self.out_local = out_channels // d_phm
 
-        # Shared PHM factor [cite: 79]
+        # Shared PHM factor
         self.shared_factor = Parameter(torch.Tensor(d_phm, d_phm, d_phm))
 
-        # Expert-specific low-rank factors [cite: 80, 81]
+        # Expert-specific low-rank factors
         self.expert_L = Parameter(torch.Tensor(num_experts, d_phm, self.in_local, rank))
         self.expert_R = Parameter(torch.Tensor(num_experts, d_phm, rank, self.out_local))
 
@@ -48,27 +51,26 @@ class BatchedKroneckerAdapters(Module):
         torch.nn.init.zeros_(self.bias)
 
     def get_expert_matrices(self) -> Tensor:
-        # Reconstruct full weight matrices for all experts simultaneously
-        # H_e = sum_k S_k (x) (L_{e,k} R_{e,k}) [cite: 77, 81]
-
-        # 1. Compute low-rank expert factors: (E, d_phm, in_local, out_local)
+        # Compute low-rank expert factors: (E, d_phm, in_local, out_local)
         expert_factors = torch.einsum('ekir, ekro -> ekio', self.expert_L, self.expert_R)
 
-        # 2. Compute Kronecker product via einsum and reshape
-        # S: (d_phm, d_phm, d_phm) -> use first dim as sum index k
-        h = torch.einsum('kab, ekio -> eaibko', self.shared_factor, expert_factors)
+        # Compute weight matrix using kronecker product for all experts in one go using einsum and reshape
+        # shared_factors: (d_phm, d_phm, d_phm) -> use first dim as sum index k
+        # expert_factors: (E, d_phm, in_local, out_local)
+        # output: (E, d_phm, in_local, d_phm, out_local). As these are nicely aligned we can reshape to obtain
+        # weight_matrix: (E, in, out)
+        kronecker_product = torch.einsum('kab, ekio -> eaibo', self.shared_factor, expert_factors)
+        weight_matrix = kronecker_product.reshape(self.num_experts, self.in_channels, self.out_channels)
 
-        # Reshape to final (E, D_in, D_out)
-        num_experts = self.num_experts
-        d_in = self.d_phm * self.in_local
-        d_out = self.d_phm * self.out_local
-        print(h)
-        h = h.reshape(num_experts, d_in, d_out)
-
-        return self.dropout(h)
+        return self.dropout(weight_matrix)
 
 
 class TripleGineConvMoE(MessagePassing, ABC):
+    """
+        Triple Gine Conv model with MoE Kronecker Adapters. These adapters are low parameter count experts
+        that (hopefully) specialize to specific queries.
+    """
+
     def __init__(self, nn: torch.nn.Module, num_experts: int = 4,
                  d_phm: int = 4, rank: int = 4, top_k: int = 3, eps: float = 0.,
                  train_eps: bool = False, edge_dim: Optional[int] = None, **kwargs):
@@ -108,7 +110,7 @@ class TripleGineConvMoE(MessagePassing, ABC):
         else:
             self.lin = None
 
-        # Frozen backbone component [cite: 61]
+        # Standard triple gine conv neural net
         self.W0 = nn
 
         # MoE Components
@@ -138,14 +140,14 @@ class TripleGineConvMoE(MessagePassing, ABC):
         if isinstance(x, Tensor):
             x = (x, x)
 
-        # 1. Neighborhood Aggregation -> Computes H^{context} [cite: 96]
+        # Neighborhood Aggregation -> Computes H^{context}
         out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size)
 
         x_r = x[1]
         if x_r is not None:
             out += (1 + self.eps) * x_r
 
-        # 2. Routing Mechanism [cite: 98]
+        # Routing depends on neighborhood aggregation
         routing_scores = self.router(out)
         self.current_routing_probs = F.softmax(routing_scores, dim=-1)
 
@@ -158,20 +160,20 @@ class TripleGineConvMoE(MessagePassing, ABC):
             routing_weights = torch.zeros_like(routing_scores)
             routing_weights.scatter_(1, topk_indices, topk_weights)
         else:
-            # Soft Routing (Dense) [cite: 101, 102]
+            # Dense routing
             routing_weights = self.current_routing_probs
 
-        # 3. Expert Evaluation (Vectorized)
-        h_experts = self.experts.get_expert_matrices()  # Shape: (E, D_in, D_out)
+        # Vectorized expert calculation: (E, D_in, D_out)
+        h_experts = self.experts.get_expert_matrices()
 
-        # Frozen pathway output [cite: 61]
+        # Frozen pathway output
         frozen_out = self.W0(out)
 
         # Calculate MoE output in one step
         moe_out = torch.einsum('ne, nd, edf -> nf', routing_weights, out, h_experts)
         moe_bias = torch.einsum('ne, ef -> nf', routing_weights, self.experts.bias)
 
-        # Combine frozen and MoE pathways [cite: 70]
+        # Combine frozen and MoE pathways
         return frozen_out + moe_out + moe_bias
 
     def message(self, x_i, x_j, edge_attr: Tensor) -> Tensor:

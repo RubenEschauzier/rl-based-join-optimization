@@ -460,18 +460,32 @@ class JoinOrderEnumerator:
 
 
 def build_adj_list(query):
+    term_patterns = re.compile(
+        r'\?[a-zA-Z0-9_]+'  # variable, e.g. ?o1
+        r'|<[^>]+>'  # IRI, e.g. <http://example.com/433045>
+        r'|"(?:[^"\\]|\\.)*"(?:@[a-zA-Z-]+|\^\^<[^>]+>)?'  # literal, incl. optional lang tag/datatype
+    )
+
+    def _extract_terms(triple_pattern):
+        """Extract the ordered terms (subject, predicate, object) of a triple pattern."""
+        terms = term_patterns.findall(triple_pattern)
+        if len(terms) < 3:
+            raise ValueError(f"Could not parse triple pattern: {triple_pattern!r}")
+        return terms[:3]
+
     # Parse each triple pattern to extract variables
     triple_patterns = query.triple_patterns
     parsed_patterns = []
 
     for i, pattern in enumerate(triple_patterns):
         # Create a simple SPARQL query to parse the pattern
-        variables = set(re.findall(r'\?[a-zA-Z0-9_]+', pattern))
+        # variables = set(re.findall(r'\?[a-zA-Z0-9_]+', pattern))
+        join_terms = set(_extract_terms(pattern))
 
         parsed_patterns.append({
             'index': i,
             'pattern': pattern,
-            'variables': variables
+            'join_terms': join_terms
         })
     # Create adjacency dictionary - regular dict since we're initializing all keys
     adjacency_dict = {i: set() for i in range(len(triple_patterns))}
@@ -479,8 +493,8 @@ def build_adj_list(query):
     # Check each pair for shared variables
     for i in range(len(parsed_patterns)):
         for j in range(i + 1, len(parsed_patterns)):
-            vars_i = parsed_patterns[i]['variables']
-            vars_j = parsed_patterns[j]['variables']
+            vars_i = parsed_patterns[i]['join_terms']
+            vars_j = parsed_patterns[j]['join_terms']
 
             if vars_i.intersection(vars_j):
                 adjacency_dict[i].add(j)

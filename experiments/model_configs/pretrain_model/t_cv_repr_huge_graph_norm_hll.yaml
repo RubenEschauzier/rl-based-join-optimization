@@ -5,7 +5,7 @@ model:
       - type: TripleGINEConv
         nn:
           - type: Linear
-            in_features: 129
+            in_features: 136
             out_features: 512
             id: gine_nn_1_lin_1
 
@@ -28,8 +28,12 @@ model:
           - type: ReLU
             id: gine_nn_1_relu_2
 
-        edge_dim: 129
+        edge_dim: 137
         id: gine_1
+
+      - type: GraphNorm
+        in_channels: 1024
+        id: graph_norm_1
 
       - type: TripleGINEConv
         nn:
@@ -57,8 +61,12 @@ model:
           - type: ReLU
             id: gine_nn_2_relu_2
 
-        edge_dim: 129
+        edge_dim: 137
         id: gine_2
+
+      - type: GraphNorm
+        in_channels: 2048
+        id: graph_norm_2
 
       - type: TripleGINEConv
         nn:
@@ -90,7 +98,7 @@ model:
             p: 0.2
             id: gine_nn_3_dropout_1
 
-        edge_dim: 129
+        edge_dim: 137
         id: gine_3
 
       - type: SumAggregation
