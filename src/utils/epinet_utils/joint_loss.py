@@ -67,10 +67,51 @@ class GaussianJointLogLoss(nn.Module):
             tau:       The fixed evaluation size for the joint probability.
         """
         super().__init__()
+        if noise_std <= 0:
+            raise ValueError("noise_std must be greater than zero")
+        if tau <= 0:
+            raise ValueError("tau must be greater than zero")
         self.noise_std = noise_std
         self.tau = tau
 
-    def forward(self, predictions: torch.Tensor, targets: torch.Tensor):
+    def sample_plan_indices(self, n_plans, device, generator=None):
+        if n_plans <= 0:
+            raise ValueError("n_plans must be greater than zero")
+        if n_plans >= self.tau:
+            indices = torch.randperm(n_plans, device=device, generator=generator)
+            n_keep = (n_plans // self.tau) * self.tau
+            return indices[:n_keep].view(-1, self.tau)
+
+        return torch.randint(
+            0,
+            n_plans,
+            (1, self.tau),
+            device=device,
+            generator=generator,
+        )
+
+    def sample_dyadic_plan_indices(self, n_plans, n_pairs, device, generator=None):
+        if n_plans <= 0:
+            raise ValueError("n_plans must be greater than zero")
+        if n_pairs <= 0:
+            raise ValueError("n_pairs must be greater than zero")
+        if n_plans == 1:
+            return torch.zeros((n_pairs, self.tau), dtype=torch.long, device=device)
+
+        dyadic_groups = []
+        for _ in range(n_pairs):
+            anchors = torch.randperm(n_plans, device=device, generator=generator)[:2]
+            anchor_choices = torch.randint(
+                0,
+                2,
+                (self.tau,),
+                device=device,
+                generator=generator,
+            )
+            dyadic_groups.append(anchors[anchor_choices])
+        return torch.stack(dyadic_groups)
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, plan_indices=None):
         """
         predictions: Tensor of shape [K, n_plans]
         targets:     Tensor of shape [n_plans]
@@ -79,50 +120,17 @@ class GaussianJointLogLoss(nn.Module):
         var = self.noise_std ** 2
         log_scale = np.log(np.sqrt(2 * np.pi * var))
 
-        # Chunk plans for calculation
-        if n_plans >= self.tau:
-            indices = torch.randperm(n_plans, device=predictions.device)
+        if plan_indices is None:
+            plan_indices = self.sample_plan_indices(n_plans, predictions.device)
 
-            n_chunks = n_plans // self.tau
-            n_keep = n_chunks * self.tau
-            indices = indices[:n_keep]
+        chunked_preds = predictions[:, plan_indices]
+        chunked_targets = targets[plan_indices]
+        targets_exp = chunked_targets.unsqueeze(0).expand(n_z_sampled, -1, -1)
 
-            # 3. Reshape into parallel chunks
-            chunked_preds = predictions[:, indices].view(n_z_sampled, n_chunks, self.tau)
-            chunked_targets = targets[indices].view(n_chunks, self.tau)
+        squared_error = (chunked_preds - targets_exp) ** 2
+        pointwise_ll = -log_scale - (squared_error / (2 * var))
+        joint_ll_per_z = torch.sum(pointwise_ll, dim=2)
+        log_joint_prob_per_chunk = torch.logsumexp(joint_ll_per_z, dim=0) - np.log(n_z_sampled)
 
-            # 4. Expand targets across K samples
-            # targets_exp: [K, n_chunks, tau]
-            targets_exp = chunked_targets.unsqueeze(0).expand(n_z_sampled, -1, -1)
-
-            # 5. Compute pointwise Log-Likelihoods
-            squared_error = (chunked_preds - targets_exp) ** 2
-            pointwise_ll = -log_scale - (squared_error / (2 * var))  # [K, n_chunks, tau]
-
-            # 6. Sum over the tau dimension to get Joint LL per chunk
-            joint_ll_per_z = torch.sum(pointwise_ll, dim=2)  # [K, n_chunks]
-
-            # 7. LogSumExp over K samples
-            log_joint_prob_per_chunk = torch.logsumexp(joint_ll_per_z, dim=0) - np.log(n_z_sampled)  # [n_chunks]
-
-            # We calculate the mean on a per-query basis, otherwise the joint loss is dominated by larger queries
-            # with many more plans
-            return -torch.mean(log_joint_prob_per_chunk)
-
-        # When we have too little observations for a single tau sized batch we resample
-        else:
-            # Sample WITH replacement to pad it up to exactly 'tau' elements
-            indices = torch.randint(0, n_plans, (self.tau,), device=predictions.device)
-
-            sampled_preds = predictions[:, indices]  # [K, tau]
-            sampled_targets = targets[indices]  # [tau]
-
-            targets_exp = sampled_targets.unsqueeze(0).expand(n_z_sampled, -1)  # [K, tau]
-
-            squared_error = (sampled_preds - targets_exp) ** 2
-            pointwise_ll = -log_scale - (squared_error / (2 * var))
-
-            joint_ll_per_z = torch.sum(pointwise_ll, dim=1)  # [K]
-            log_joint_prob = torch.logsumexp(joint_ll_per_z, dim=0) - np.log(n_z_sampled)  # Scalar
-
-            return -log_joint_prob
+        # Average per query so queries with more enumerated plans do not dominate.
+        return -torch.mean(log_joint_prob_per_chunk)

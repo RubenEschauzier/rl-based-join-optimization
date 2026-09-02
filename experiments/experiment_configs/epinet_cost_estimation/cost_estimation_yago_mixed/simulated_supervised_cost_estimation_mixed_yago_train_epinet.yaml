@@ -38,10 +38,10 @@ hyperparameters:
   query_batch_size: 8
   n_epi_indexes_train: 32
   n_epi_indexes_val: 200
-  sigma: 1
-  alpha_mlp: 1
-  alpha_ensemble: 1
-  lr: 0.005
+  sigma: .1
+  alpha_mlp: .1
+  alpha_ensemble: .1
+  lr: 0.001
   weight_decay: 0.001
   n_epochs: 100
   mlp_dimension: 64
@@ -50,6 +50,13 @@ hyperparameters:
 
 execution:
   train_epi_network: True
+
+evaluation:
+  # Shared Gaussian observation noise in standardized target space.
+  noise_std: 0.2
+  joint_tau: 8
+  dyadic_num_pairs: 8
+  seed: 0
 
 debug:
   debug_single_batch: False

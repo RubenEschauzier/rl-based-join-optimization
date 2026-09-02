@@ -3,13 +3,16 @@ from scipy.stats import norm
 import matplotlib.pyplot as plt
 
 
-def compute_calibration_measures(y_true, epinet_predictions):
-    p_values = compute_p_values(y_true, epinet_predictions)
-    epinet_distribution_variance = calculate_predicted_distribution_variance(epinet_predictions)
+def compute_calibration_measures(y_true, epinet_predictions, noise_std=0.0):
+    p_values = compute_p_values(y_true, epinet_predictions, noise_std)
+    epinet_distribution_variance = calculate_predicted_distribution_variance(
+        epinet_predictions,
+        noise_std,
+    )
     return p_values, epinet_distribution_variance
 
-def calculate_predicted_distribution_variance(epinet_predictions):
-    return np.var(epinet_predictions, axis=1, ddof=1)
+def calculate_predicted_distribution_variance(epinet_predictions, noise_std=0.0):
+    return np.var(epinet_predictions, axis=1, ddof=1) + noise_std ** 2
 
 def calculate_sharpness(predicted_distribution_variance):
     return np.mean(predicted_distribution_variance)
@@ -17,13 +20,16 @@ def calculate_sharpness(predicted_distribution_variance):
 def calculate_calibration_error(expected, observed):
     return np.mean(np.abs(expected - observed))
 
-def compute_p_values(y_true, epinet_predictions):
-    n, m = epinet_predictions.shape
+def compute_p_values(y_true, epinet_predictions, noise_std=0.0):
+    if noise_std > 0:
+        standardized_residuals = (np.asarray(y_true)[:, None] - epinet_predictions) / noise_std
+        return np.mean(norm.cdf(standardized_residuals), axis=1)
 
+    n, n_samples = epinet_predictions.shape
     p_values = []
     for i in range(n):
         pred_dist = epinet_predictions[i, :]
-        cdf_value = np.sum(pred_dist <= y_true[i]) / m
+        cdf_value = np.sum(pred_dist <= y_true[i]) / n_samples
         p_values.append(cdf_value)
 
     return np.array(p_values)

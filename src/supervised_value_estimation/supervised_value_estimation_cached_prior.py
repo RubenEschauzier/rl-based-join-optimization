@@ -126,51 +126,192 @@ def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epin
 
     return [priors[i] for i in valid_indices]
 
-def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, n_epi_indexes,
-                                      mean_cost, std_cost, joint_loss, head_name):
+def _nll_metrics(metric_name, nll, tau, noise_std):
+    nll_value = nll.item()
+    gaussian_constant = tau * np.log(np.sqrt(2 * np.pi) * noise_std)
+    excess_nll = nll_value - gaussian_constant
+    return {
+        metric_name: nll_value,
+        f"{metric_name}_per_target": nll_value / tau,
+        f"{metric_name}_excess": excess_nll,
+        f"{metric_name}_excess_per_target": excess_nll / tau,
+    }
+
+
+def _marginal_gaussian_nll(predictions, targets, noise_std):
+    variance = noise_std ** 2
+    log_scale = np.log(np.sqrt(2 * np.pi) * noise_std)
+    squared_error = (predictions - targets.unsqueeze(0)) ** 2
+    pointwise_log_likelihood = -log_scale - squared_error / (2 * variance)
+    marginal_log_likelihood = (
+        torch.logsumexp(pointwise_log_likelihood, dim=0) - np.log(predictions.shape[0])
+    )
+    return -marginal_log_likelihood.mean()
+
+
+def _independently_permute_epistemic_samples(predictions, generator):
+    random_scores = torch.rand(predictions.shape, generator=generator, device=predictions.device)
+    independent_sample_indices = torch.argsort(random_scores, dim=0)
+    return torch.gather(predictions, 0, independent_sample_indices)
+
+
+def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, base_cost_estimates,
+                                      n_epi_indexes, mean_cost, std_cost, joint_loss, head_name,
+                                      evaluation_seed, dyadic_num_pairs):
     n_total = repeated_target.shape[0]
     n_plans = n_total // n_epi_indexes
 
-    pred_flat = epinet_cost_estimates.detach().cpu().numpy().reshape(-1, 1)
-    targets_flat = repeated_target.detach().cpu().numpy().reshape(-1, 1)
+    pred_matrix_scaled = epinet_cost_estimates.detach().cpu().reshape(n_epi_indexes, n_plans)
+    base_predictions_scaled = base_cost_estimates.detach().cpu().reshape(1, n_plans)
+    y_scaled = repeated_target.detach().cpu()[:n_plans].flatten()
 
-    pred_unscaled = (pred_flat * std_cost) + mean_cost
-    y_scaled = targets_flat[:n_plans].flatten()
-    y_true = (y_scaled * std_cost) + mean_cost
-
-    pred_matrix = pred_unscaled.reshape(n_epi_indexes, n_plans)
-    pred_matrix_scaled = pred_flat.reshape(n_epi_indexes, n_plans)
+    pred_matrix = pred_matrix_scaled.numpy() * std_cost + mean_cost
+    base_predictions = base_predictions_scaled.numpy().flatten() * std_cost + mean_cost
+    y_scaled_numpy = y_scaled.numpy()
+    y_true = y_scaled_numpy * std_cost + mean_cost
 
     y_pred_mean = pred_matrix.mean(axis=0)
-    y_pred_mean_scaled = pred_matrix_scaled.mean(axis=0)
+    y_pred_mean_scaled = pred_matrix_scaled.numpy().mean(axis=0)
     y_pred_std = pred_matrix.std(axis=0)
 
     p_values, epinet_distribution_variance = compute_calibration_measures(
-        y_true,
-        pred_matrix.reshape(n_plans, n_epi_indexes),
+        y_scaled_numpy,
+        pred_matrix_scaled.numpy().T,
+        joint_loss.noise_std,
     )
 
-    joint_gaussian_nll = joint_loss(torch.tensor(pred_matrix_scaled), torch.tensor(y_scaled))
+    evaluation_generator = torch.Generator(device=pred_matrix_scaled.device)
+    evaluation_generator.manual_seed(evaluation_seed)
+    plan_indices = joint_loss.sample_plan_indices(
+        n_plans,
+        pred_matrix_scaled.device,
+        evaluation_generator,
+    )
+    dyadic_generator = torch.Generator(device=pred_matrix_scaled.device)
+    dyadic_generator.manual_seed(evaluation_seed + 1)
+    dyadic_plan_indices = joint_loss.sample_dyadic_plan_indices(
+        n_plans,
+        dyadic_num_pairs,
+        pred_matrix_scaled.device,
+        dyadic_generator,
+    )
+    permutation_generator = torch.Generator(device=pred_matrix_scaled.device)
+    permutation_generator.manual_seed(evaluation_seed + 2)
+    independent_predictions_scaled = _independently_permute_epistemic_samples(
+        pred_matrix_scaled,
+        permutation_generator,
+    )
+
+    joint_epinet_nll = joint_loss(pred_matrix_scaled, y_scaled, plan_indices)
+    joint_base_nll = joint_loss(base_predictions_scaled, y_scaled, plan_indices)
+    joint_independent_nll = joint_loss(independent_predictions_scaled, y_scaled, plan_indices)
+    dyadic_epinet_nll = joint_loss(pred_matrix_scaled, y_scaled, dyadic_plan_indices)
+    dyadic_base_nll = joint_loss(base_predictions_scaled, y_scaled, dyadic_plan_indices)
+    dyadic_independent_nll = joint_loss(
+        independent_predictions_scaled,
+        y_scaled,
+        dyadic_plan_indices,
+    )
+
+    marginal_epinet_nll = _marginal_gaussian_nll(
+        pred_matrix_scaled,
+        y_scaled,
+        joint_loss.noise_std,
+    )
+    marginal_base_nll = _marginal_gaussian_nll(
+        base_predictions_scaled,
+        y_scaled,
+        joint_loss.noise_std,
+    )
 
     mse = np.mean((y_pred_mean - y_true) ** 2)
-    mse_scaled = np.mean((y_pred_mean_scaled - y_scaled) ** 2)
+    mse_scaled = np.mean((y_pred_mean_scaled - y_scaled_numpy) ** 2)
+    selected_plan = np.argmin(y_pred_mean)
+    base_selected_plan = np.argmin(base_predictions)
+    plan_selection_regret = y_true[selected_plan] - np.min(y_true)
+    base_plan_selection_regret = y_true[base_selected_plan] - np.min(y_true)
+
+    epinet_joint_metrics = _nll_metrics(
+        f"val_joint_gaussian_nll_{head_name}",
+        joint_epinet_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
+    base_joint_metrics = _nll_metrics(
+        f"val_joint_nll_{head_name}_no_epinet",
+        joint_base_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
+    independent_joint_metrics = _nll_metrics(
+        f"val_joint_nll_{head_name}_independent_epinet",
+        joint_independent_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
+    dyadic_epinet_metrics = _nll_metrics(
+        f"val_dyadic_joint_nll_{head_name}_epinet",
+        dyadic_epinet_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
+    dyadic_base_metrics = _nll_metrics(
+        f"val_dyadic_joint_nll_{head_name}_base",
+        dyadic_base_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
+    dyadic_independent_metrics = _nll_metrics(
+        f"val_dyadic_joint_nll_{head_name}_independent_epinet",
+        dyadic_independent_nll,
+        joint_loss.tau,
+        joint_loss.noise_std,
+    )
 
     return {
         f"val_epi_mse_{head_name}": mse,
         f"val_epi_mse_{head_name}_scaled": mse_scaled,
         f"val_epi_avg_std_{head_name}": np.mean(y_pred_std),
+        f"val_plan_selection_regret_{head_name}_epinet": plan_selection_regret,
+        f"val_plan_selection_regret_{head_name}_base": base_plan_selection_regret,
+        f"val_plan_selection_regret_improvement_{head_name}": (
+            base_plan_selection_regret - plan_selection_regret
+        ),
+        f"val_marginal_nll_{head_name}_epinet_per_target": marginal_epinet_nll.item(),
+        f"val_marginal_nll_{head_name}_base_per_target": marginal_base_nll.item(),
+        f"val_marginal_nll_improvement_{head_name}_per_target": (
+            marginal_base_nll - marginal_epinet_nll
+        ).item(),
+        f"val_joint_nll_improvement_{head_name}_per_target": (
+            joint_base_nll - joint_epinet_nll
+        ).item() / joint_loss.tau,
+        f"val_joint_dependence_improvement_{head_name}_per_target": (
+            joint_independent_nll - joint_epinet_nll
+        ).item() / joint_loss.tau,
+        f"val_dyadic_joint_nll_improvement_{head_name}_per_target": (
+            dyadic_base_nll - dyadic_epinet_nll
+        ).item() / joint_loss.tau,
+        f"val_dyadic_joint_dependence_improvement_{head_name}_per_target": (
+            dyadic_independent_nll - dyadic_epinet_nll
+        ).item() / joint_loss.tau,
         f"val_observed_p_values_{head_name}": p_values,
         f"val_distribution_variance_{head_name}": epinet_distribution_variance,
-        f"val_joint_gaussian_nll_{head_name}": joint_gaussian_nll,
+        **epinet_joint_metrics,
+        **base_joint_metrics,
+        **independent_joint_metrics,
+        **dyadic_epinet_metrics,
+        **dyadic_base_metrics,
+        **dyadic_independent_metrics,
     }
 
 
 def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation, val_cache,
                     mean_vals, std_vals, train_loss, device, n_val_epi_indexes,
                     sigma, alpha_mlp, alpha_ensemble, precomputed_indexes, precomputed_masks,
+                    evaluation_noise_std, joint_tau, evaluation_seed, dyadic_num_pairs,
                     head_names_to_val = ("plan_cost",)):
     mape = MeanAbsolutePercentageError().to(device)
-    joint_loss = GaussianJointLogLoss()
+    joint_loss = GaussianJointLogLoss(noise_std=evaluation_noise_std, tau=joint_tau)
     tracker = MetricsTracker()
     generator = torch.Generator(device=device)
 
@@ -236,8 +377,11 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
                     std_val = std_vals[head_name]
 
                     val_metrics = compute_validation_metrics_epinet(
-                        epinet_cost_estimates, repeated_target, n_val_epi_indexes, mean_val, std_val, joint_loss,
-                        head_name = head_name
+                        epinet_cost_estimates, repeated_target, estimated_head_val,
+                        n_val_epi_indexes, mean_val, std_val, joint_loss,
+                        head_name=head_name,
+                        evaluation_seed=evaluation_seed + plans_query[0][2],
+                        dyadic_num_pairs=dyadic_num_pairs,
                     )
 
                     tracker.update_calibration(
@@ -258,8 +402,6 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
                             f"val_loss_{head_name}_unscaled": train_loss(original_cost, original_target).item(),
                             f"val_mape_{head_name}_scaled": mape(estimated_head_val, head_target).item(),
                             f"val_mape_{head_name}_unscaled": mape(original_cost, original_target).item(),
-                            f"val_joint_nll_{head_name}_no_epinet": joint_loss(estimated_head_val.unsqueeze(0),
-                                                                               head_target).item(),
                             f"val_loss_{head_name}_epinet": val_loss_epinet.cpu().item()
                         }
                     )
@@ -378,9 +520,7 @@ def loss_epinet(unweighted_ensemble_priors,
     # (n_epi_indexes * n_plans)
     raw_targets_exp = raw_targets.repeat(n_epi_indexes)
 
-    # TODO: We removed the epinet perturbation terms. To see if now the epinet works
-    # perturbed_targets = raw_targets_exp + sigma * anchor_term_flat
-    perturbed_targets = raw_targets_exp
+    perturbed_targets = raw_targets_exp + sigma * anchor_term_flat
 
     unperturbed_target = raw_targets_exp
 
@@ -402,6 +542,10 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                                   n_epi_indexes_val,
                                   writer,
                                   cache_directory,
+                                  evaluation_noise_std=0.2,
+                                  joint_tau=10,
+                                  evaluation_seed=0,
+                                  dyadic_num_pairs=8,
                                   debug_single_batch = False,
                                   trial: optuna.Trial = None):
 
@@ -418,12 +562,44 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
     precomputed_indexes = precompute_left_deep_tree_conv_index(20)
     precomputed_masks = precompute_left_deep_tree_node_mask(20)
 
-    train_summary = TrainSummary([ ("val_epi_mse_plan_cost", "min"), ("val_epi_mse_plan_cost_scaled", "min"),
-                                   ("val_epi_avg_std_plan_cost", "min"), ("val_joint_gaussian_nll_plan_cost", "min"),
-                                   ("val_loss_plan_cost_scaled", "min"), ("val_loss_plan_cost_unscaled", "min"),
-                                   ("val_mape_plan_cost_scaled", "min"), ("val_mape_plan_cost_unscaled", "min"),
-                                   ("val_joint_nll_plan_cost_no_epinet", "min"), ("val_loss_plan_cost_epinet", "min"),
-                                   ("train_loss", "min"), ("val_calibration_error", "min"), ("val_sharpness", "min")])
+    tracked_metrics = [
+        ("val_epi_mse_plan_cost", "min"),
+        ("val_epi_mse_plan_cost_scaled", "min"),
+        ("val_epi_avg_std_plan_cost", "min"),
+        ("val_plan_selection_regret_plan_cost_epinet", "min"),
+        ("val_plan_selection_regret_plan_cost_base", "min"),
+        ("val_plan_selection_regret_improvement_plan_cost", "max"),
+        ("val_marginal_nll_plan_cost_epinet_per_target", "min"),
+        ("val_marginal_nll_plan_cost_base_per_target", "min"),
+        ("val_marginal_nll_improvement_plan_cost_per_target", "max"),
+        ("val_joint_nll_improvement_plan_cost_per_target", "max"),
+        ("val_joint_dependence_improvement_plan_cost_per_target", "max"),
+        ("val_dyadic_joint_nll_improvement_plan_cost_per_target", "max"),
+        ("val_dyadic_joint_dependence_improvement_plan_cost_per_target", "max"),
+        ("val_loss_plan_cost_scaled", "min"),
+        ("val_loss_plan_cost_unscaled", "min"),
+        ("val_mape_plan_cost_scaled", "min"),
+        ("val_mape_plan_cost_unscaled", "min"),
+        ("val_loss_plan_cost_epinet", "min"),
+        ("train_loss", "min"),
+        ("val_calibration_error", "min"),
+        ("val_sharpness", "min"),
+    ]
+    for metric_prefix in (
+        "val_joint_gaussian_nll_plan_cost",
+        "val_joint_nll_plan_cost_no_epinet",
+        "val_joint_nll_plan_cost_independent_epinet",
+        "val_dyadic_joint_nll_plan_cost_epinet",
+        "val_dyadic_joint_nll_plan_cost_base",
+        "val_dyadic_joint_nll_plan_cost_independent_epinet",
+    ):
+        tracked_metrics.extend([
+            (metric_prefix, "min"),
+            (f"{metric_prefix}_per_target", "min"),
+            (f"{metric_prefix}_excess", "min"),
+            (f"{metric_prefix}_excess_per_target", "min"),
+        ])
+    train_summary = TrainSummary(tracked_metrics)
 
     # Predefine a generator so the perturbation vectors are consistent among epochs
     generator = torch.Generator(device=device)
@@ -541,7 +717,8 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         tracker = validate_cached(
             loader_val, query_plans_val, val_targets, epinet_cost_estimation, val_cache, mean_train, std_train,
             loss, device, n_epi_indexes_val, sigma, alpha_mlp, alpha_ensemble,
-            precomputed_indexes, precomputed_masks
+            precomputed_indexes, precomputed_masks,
+            evaluation_noise_std, joint_tau, evaluation_seed, dyadic_num_pairs,
         )
 
         mean_metrics_val = tracker.summarize()
@@ -592,6 +769,10 @@ def main_simulated_epinet_training(cfg: DictConfig,
                                    writer):
 
     debug_single_batch = OmegaConf.select(cfg, "debug.debug_single_batch", default=False)
+    evaluation_noise_std = OmegaConf.select(cfg, "evaluation.noise_std", default=0.2)
+    joint_tau = OmegaConf.select(cfg, "evaluation.joint_tau", default=10)
+    evaluation_seed = OmegaConf.select(cfg, "evaluation.seed", default=0)
+    dyadic_num_pairs = OmegaConf.select(cfg, "evaluation.dyadic_num_pairs", default=8)
     writer.create_experiment_directory()
 
     data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated,
@@ -605,7 +786,11 @@ def main_simulated_epinet_training(cfg: DictConfig,
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train_cost, std_train_cost = preprocess_plans(query_plans_dict)
-    val_plans, _, _ = preprocess_plans(query_plans_dict_val)
+    val_plans, _, _ = preprocess_plans(
+        query_plans_dict_val,
+        mean_train_cost,
+        std_train_cost,
+    )
 
     mean_train = {"plan_cost": mean_train_cost}
     std_train = {"plan_cost": std_train_cost}
@@ -638,6 +823,10 @@ def main_simulated_epinet_training(cfg: DictConfig,
         lr=cfg.hyperparameters.lr,
         weight_decay=cfg.hyperparameters.weight_decay,
         n_epochs=cfg.hyperparameters.n_epochs,
+        evaluation_noise_std=evaluation_noise_std,
+        joint_tau=joint_tau,
+        evaluation_seed=evaluation_seed,
+        dyadic_num_pairs=dyadic_num_pairs,
         debug_single_batch=debug_single_batch,
     )
 

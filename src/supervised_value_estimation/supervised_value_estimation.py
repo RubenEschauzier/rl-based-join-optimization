@@ -291,7 +291,11 @@ def main_simulated_training(cfg: DictConfig,
     query_plans_dict_val = {k: v for d in val_data for k, v in d.items()}
 
     train_plans, mean_train, std_train = preprocess_plans(query_plans_dict)
-    val_plans, _, _ = preprocess_plans(query_plans_dict_val)
+    val_plans, _, _ = preprocess_plans(
+        query_plans_dict_val,
+        mean_train,
+        std_train,
+    )
 
     # Execute training
     train_simulated_cost_model(
