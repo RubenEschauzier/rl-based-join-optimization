@@ -14,7 +14,7 @@ WORKDIR /project_ghent/rl-based-join-optimization
 RUN pip install --no-cache-dir pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
 
 # Copy the cleaned requirements file into the image
-COPY requirements-docker.txt .
+COPY dockerfiles/requirements-docker.txt .
 
 # Install the remaining dependencies
 RUN pip install --no-cache-dir -r requirements-docker.txt

@@ -10,6 +10,7 @@ from torch_geometric.nn import GINEConv, Sequential
 
 from src.models.model_layers.directional_gine_conv import DirectionalGINEConv
 from src.models.model_layers.triple_gine_conv import TripleGineConv
+from src.models.model_layers.triple_gine_conv_low_rank_moe import TripleGineConvLowRankMoE
 from src.models.model_layers.triple_gine_conv_moe import TripleGineConvMoE
 from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
 
@@ -22,7 +23,10 @@ class GINEConvModel(torch.nn.Module):
         self.head_types = []
         self.supported_mlp_layers = ['Linear', 'Dropout', 'ReLU', 'Softplus', 'LayerNorm']
         self.supported_pooling = ['SumAggregation', 'MeanAggregation', 'MaxAggregation', 'TriplePatternPooling']
-        self.supported_gnn_layers = ['TripleGINEConv', 'GINEConv', 'TripleGINEConvMoE', 'DirectionalGINEConv']
+        self.supported_gnn_layers = [
+            'TripleGINEConv', 'GINEConv', 'TripleGINEConvMoE',
+            'TripleGINEConvLowRankMoE', 'DirectionalGINEConv'
+        ]
         self.supported_normalization = ['PairNorm', 'GraphNorm']
         self.verbose = 0
 
@@ -99,12 +103,17 @@ class GINEConvModel(torch.nn.Module):
                 'GINEConv': GINEConv,
                 'TripleGINEConv': TripleGineConv,
                 'TripleGINEConvMoE': TripleGineConvMoE,
+                'TripleGINEConvLowRankMoE': TripleGineConvLowRankMoE,
                 'DirectionalGINEConv': DirectionalGINEConv
             }
             conv_class = layer_class_map.get(layer_type)
             if conv_class is None:
                 raise ValueError(f'Unknown GNN layer type: {layer_type}')
-            embedding_layers[layer_id] = (conv_class(nn, **gine_params), 'x, edge_index, edge_attr -> x')
+            conv_layer = conv_class(nn, **gine_params)
+            if layer_type == 'TripleGINEConvLowRankMoE':
+                embedding_layers[layer_id] = (conv_layer, 'x, edge_index, edge_attr, batch -> x')
+            else:
+                embedding_layers[layer_id] = (conv_layer, 'x, edge_index, edge_attr -> x')
 
         elif layer_type in self.supported_pooling:
             pool_params = self.__filter_parameters(layer_config, ['type', 'id'])
@@ -148,7 +157,7 @@ class GINEConvModel(torch.nn.Module):
 
         has_moe_layer = False
         for module in self.modules():
-            if isinstance(module, TripleGineConvMoE):
+            if isinstance(module, (TripleGineConvMoE, TripleGineConvLowRankMoE)):
                 has_moe_layer = True
                 routing_prob = module.get_current_routing_probs()
 
@@ -171,14 +180,12 @@ class GINEConvModel(torch.nn.Module):
                         for label, val in prob_dict.items():
                             writer.log({f'Routing_Distribution/{label}': val, 'step': epoch})
 
-                num_nodes, num_experts = routing_prob.shape
-                # Sum probabilities over all nodes for each expert
-                # sum_P shape: (num_experts,)
-                sum_probability_nodes = routing_prob.sum(dim=0)
-
-                # Compute routing loss https://arxiv.org/abs/2511.04008
-                layer_loss = (num_experts / (num_nodes ** 2)) * torch.sum(sum_probability_nodes ** 2)
-                aux_loss += layer_loss
+                if isinstance(module, TripleGineConvLowRankMoE):
+                    aux_loss += module.load_balancing_loss()
+                else:
+                    num_nodes, num_experts = routing_prob.shape
+                    sum_probability_nodes = routing_prob.sum(dim=0)
+                    aux_loss += (num_experts / (num_nodes ** 2)) * torch.sum(sum_probability_nodes ** 2)
                 moe_layers += 1
 
         if not has_moe_layer:
@@ -198,7 +205,7 @@ class GINEConvModel(torch.nn.Module):
         """
         moe_count = 0
         for name, module in self.named_modules():
-            if isinstance(module, TripleGineConvMoE):
+            if isinstance(module, (TripleGineConvMoE, TripleGineConvLowRankMoE)):
                 moe_layer_id = f"MoE_Layer_{moe_count}"
 
                 # Closure to capture the correct parameter name and layer ID
@@ -244,6 +251,25 @@ class GINEConvModel(torch.nn.Module):
 
         if self.verbose > 0:
             print("Entire GINEConvModel successfully frozen and set to eval mode.")
+
+    def enable_online_adaptation(self, adapt_router=True, adapt_heads=False):
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        moe_layers = 0
+        for module in self.modules():
+            if isinstance(module, TripleGineConvLowRankMoE):
+                module.enable_online_adaptation(adapt_router=adapt_router)
+                moe_layers += 1
+
+        if adapt_heads:
+            for head in self.heads:
+                for parameter in head.parameters():
+                    parameter.requires_grad = True
+
+        if moe_layers == 0:
+            raise RuntimeError('Online adaptation requires at least one TripleGINEConvLowRankMoE layer')
+        return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
     @staticmethod
     def __filter_parameters(params, params_to_exclude):

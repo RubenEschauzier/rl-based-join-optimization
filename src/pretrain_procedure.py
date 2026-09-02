@@ -15,39 +15,44 @@ from src.utils.training_utils.utils import q_error_fn
 
 class DualMetricScheduler:
 
-    def __init__(self, optimizer, patience=3, threshold=1e-2, mode='min'):
+    def __init__(self, optimizer, patience=3, threshold=1e-2, mode='min', factor=0.1):
         self.optimizer = optimizer
-        self.val_tracker = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode, patience=patience, threshold=threshold
-        )
-        self.train_tracker = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode, patience=patience, threshold=threshold
-        )
+        self.patience = patience
+        self.threshold = threshold
+        self.mode = mode
+        self.factor = factor
+        initial_best = float('inf') if mode == 'min' else float('-inf')
+        self.best_train = initial_best
+        self.best_val = initial_best
+        self.bad_train_epochs = 0
+        self.bad_val_epochs = 0
+
+    def _is_better(self, value, best):
+        if self.mode == 'min':
+            return value < best - self.threshold
+        return value > best + self.threshold
+
+    def _update_tracker(self, value, best, bad_epochs):
+        if self._is_better(value, best):
+            return value, 0
+        return best, bad_epochs + 1
 
     def step(self, train_loss, val_metric):
-        # We manually check if BOTH have reached their plateau
-        # Logic: Only reduce if the "patience" has run out for both trajectories
+        self.best_train, self.bad_train_epochs = self._update_tracker(
+            train_loss, self.best_train, self.bad_train_epochs
+        )
+        self.best_val, self.bad_val_epochs = self._update_tracker(
+            val_metric, self.best_val, self.bad_val_epochs
+        )
 
-        # Step both trackers internally
-        self.val_tracker.step(val_metric)
-        self.train_tracker.step(train_loss)
-
-        # Access the underlying counters
-        # num_bad_epochs tracks how many epochs the metric hasn't improved
-        if (self.val_tracker.num_bad_epochs > self.val_tracker.patience and
-                self.train_tracker.num_bad_epochs > self.train_tracker.patience):
-
-            # Manually trigger the LR reduction across the optimizer
-            old_lr = self.optimizer.param_groups[0]['lr']
-            new_lr = old_lr * self.val_tracker.factor
+        if self.bad_train_epochs > self.patience and self.bad_val_epochs > self.patience:
+            new_lr = self.optimizer.param_groups[0]['lr'] * self.factor
 
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = new_lr
 
-            # Reset the internal trackers so they don't trigger again immediately
-            self.val_tracker.num_bad_epochs = 0
-            self.train_tracker.num_bad_epochs = 0
-
+            self.bad_train_epochs = 0
+            self.bad_val_epochs = 0
             return True
         return False
 

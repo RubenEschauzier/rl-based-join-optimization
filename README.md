@@ -4,6 +4,34 @@ pip install torch==2.3.1+cu121 --index-url https://download.pytorch.org/whl/cu12
 Then install using
 pip install -r requirements.txt
 
+## Lightweight low-rank MoE online adaptation
+
+`TripleGINEConvLowRankMoE` layers use a dense backbone plus zero-initialized low-rank residual experts. Query-level routing selects
+two of eight experts, so adding the adapters does not change the initial dense prediction. For online post-training,
+freeze the backbone and cardinality head before constructing the optimizer:
+
+```python
+online_parameters = model.enable_online_adaptation(
+    adapt_router=True,
+    adapt_heads=False,
+)
+optimizer = torch.optim.Adam(online_parameters, lr=1e-4, weight_decay=1e-5)
+```
+
+Use a replay batch containing historical queries alongside each new execution batch. A suitable online objective is
+log-cardinality L1 plus the MoE load-balancing loss and a replay distillation term against predictions captured before
+the update. Keep the router learning rate lower than the adapter learning rate when changing optimizer parameter
+groups, and monitor hard expert assignment counts rather than soft routing probabilities alone.
+
+The focused test bed checks dense-output preservation, query-level routing, frozen-backbone behavior, synthetic online
+adaptation, and scheduler behavior:
+
+```bash
+python3 -m pytest \
+  src/models/model_layers/test/test_triple_gine_conv_low_rank_moe.py \
+  src/models/model_layers/test/test_dual_metric_scheduler.py -q
+```
+
 ##TODO:
 
 - [x] Generate prepare small queries ( 20k )

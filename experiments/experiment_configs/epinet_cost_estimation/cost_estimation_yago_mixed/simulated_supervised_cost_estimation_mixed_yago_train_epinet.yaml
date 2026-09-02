@@ -35,17 +35,17 @@ models:
     experiment_base_dir: "experiments/experiment_outputs/mixed_yago/supervised_epinet_training"
 
 hyperparameters:
-  query_batch_size: 1
-  n_epi_indexes_train: 16
+  query_batch_size: 8
+  n_epi_indexes_train: 32
   n_epi_indexes_val: 200
-  sigma: 0.60
-  alpha_mlp: 0.1
-  alpha_ensemble: 0.1
-  lr: 0.001
-  weight_decay: 0
+  sigma: 1
+  alpha_mlp: 1
+  alpha_ensemble: 1
+  lr: 0.005
+  weight_decay: 0.001
   n_epochs: 100
   mlp_dimension: 64
-  epinet_index_dim: 32
+  epinet_index_dim: 16
   num_workers: 6
 
 execution:

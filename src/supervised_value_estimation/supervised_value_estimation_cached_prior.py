@@ -176,7 +176,7 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
 
     total_val_queries = len(val_loader.dataset)
 
-    pbar = tqdm(total=total_val_queries, desc="Validating", leave=False, position=1, dynamic_ncols=True)
+    pbar = tqdm(total=total_val_queries, desc="Validating", leave=False, position=1, dynamic_ncols=True, mininterval=300)
 
     n_empty_plans = 0
     n_non_empty_plans = 0
@@ -494,7 +494,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
 
     # noinspection PyTypeChecker
     total_train_queries = len(loader.dataset)
-    pbar = tqdm(total=total_train_queries, position=0, leave=True, dynamic_ncols=True)
+    pbar = tqdm(total=total_train_queries, position=0, leave=True, dynamic_ncols=True, mininterval=300)
 
 
     for epoch in range(1, n_epochs + 1):
@@ -523,6 +523,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             )
 
             if not valid_indices:
+                pbar.update(len(query_batch.query))
                 continue
 
             batch_loss = train_on_batch_cached(
