@@ -1,0 +1,18 @@
+# Build from the REPOSITORY ROOT, not from dockerfiles/ -- the Dockerfile copies
+# dockerfiles/requirements-docker.txt, so that path must resolve inside the build context.
+
+# --- Epinet Optuna sweep -------------------------------------------------------
+docker build -f dockerfiles/Dockerfile-Epinet-Sweep -t epinet-sweep:latest .
+
+# Tag and push to your GPULab registry (substitute your own project registry/namespace):
+docker tag epinet-sweep:latest gitlab.ilabt.imec.be:4567/<namespace>/<project>/epinet-sweep:latest
+docker push gitlab.ilabt.imec.be:4567/<namespace>/<project>/epinet-sweep:latest
+
+# --- Existing images -----------------------------------------------------------
+docker build -f dockerfiles/Dockerfile-Epinet-Training -t epinet-training:latest .
+docker build -f dockerfiles/Dockerfile-Cost-Training -t cost-training:latest .
+
+# Local smoke test before pushing (mount the repo where GPULab would mount it):
+docker run --rm --gpus all \
+  -v "$(pwd)":/project_ghent/rl-based-join-optimization \
+  epinet-sweep:latest

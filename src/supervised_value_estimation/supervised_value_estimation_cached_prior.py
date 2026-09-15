@@ -23,6 +23,7 @@ from src.pretrain_procedure import DualMetricScheduler
 from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
 from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
+from src.utils.training_utils.early_stopping import ConvergenceEarlyStopping
 from src.utils.training_utils.training_tracking import TrainSummary, ExperimentWriter
 
 # Get the path of the parent directory (the root of the project)
@@ -128,7 +129,11 @@ def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epin
 
 def _nll_metrics(metric_name, nll, tau, noise_std):
     nll_value = nll.item()
-    gaussian_constant = tau * np.log(np.sqrt(2 * np.pi) * noise_std)
+    # Expected NLL of the *true* law under Gaussian noise is the differential entropy,
+    # log(sqrt(2*pi)*sigma) + 1/2 per target -- not log(sqrt(2*pi)*sigma). Without the
+    # 1/2 a perfect model scores an "excess" of +0.5/target rather than 0, so the metric
+    # cannot be read as a KL-to-optimal.
+    gaussian_constant = tau * (np.log(np.sqrt(2 * np.pi) * noise_std) + 0.5)
     excess_nll = nll_value - gaussian_constant
     return {
         metric_name: nll_value,
@@ -370,7 +375,8 @@ def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation
                         sigma, alpha_mlp, alpha_ensemble,
                         generator,
                         device,
-                        head_name=head_name
+                        head_name=head_name,
+                        epistemic_seed=evaluation_seed + plans_query[0][2],
                     )
 
                     mean_val = mean_vals[head_name]
@@ -416,7 +422,7 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
                           epinet_cost_estimation,
                           optimizer, loss,
                           n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble,
-                          generator, device):
+                          generator, device, l2_lambda=0.0):
     acc_loss = torch.tensor(0.0, device=device)
 
     unweighted_ensemble_priors = fetch_or_compute_priors(
@@ -426,7 +432,6 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
     embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
 
     for valid_idx, unweighted_ensemble_prior in zip(valid_indices, unweighted_ensemble_priors):
-        embedded_numpy = embedded[valid_idx].detach().cpu().numpy()
         q_id = query_batch.query[valid_idx]
         plans_query = query_plans[q_id]
 
@@ -449,9 +454,99 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
         acc_loss += loss_epinet_val
 
     acc_loss /= len(valid_indices)
+
+    if l2_lambda > 0.0:
+        # Equation 9 regularizes lambda * (||zeta||^2 + ||eta||^2) over both the base and
+        # epinet parameters. Kept in the loss (as deepmind/enn's add_l2_weight_decay does)
+        # rather than as AdamW's decoupled decay, so the coefficient means what Theorem 4
+        # says it means.
+        acc_loss = acc_loss + l2_lambda * squared_parameter_norm(epinet_cost_estimation)
+
     acc_loss.backward()
     optimizer.step()
     return acc_loss.detach().cpu().item()
+
+
+def squared_parameter_norm(model):
+    """||theta||^2 over the trainable parameters, i.e. Equation 9's penalty term."""
+    return torch.stack([
+        parameter.square().sum() for parameter in model.parameters() if parameter.requires_grad
+    ]).sum()
+
+
+@torch.no_grad()
+def measure_prior_scale(loader, query_plans, cache, epinet_cost_estimation,
+                        precomputed_indexes, precomputed_masks,
+                        alpha_mlp, alpha_ensemble, device,
+                        n_batches=4, n_epi_indexes=128, head_name="plan_cost"):
+    """Measure sigma_0: the std over the epistemic index of the total prior term.
+
+    Also reports the two prior terms separately. They are scaled independently
+    (alpha_mlp, alpha_ensemble) but nothing keeps them balanced, and a term that is an
+    order of magnitude smaller than the other contributes almost nothing to the epistemic
+    signal no matter how expensive it was to compute.
+    """
+    totals = {"mlp": [], "ensemble": [], "combined": []}
+
+    for batch_index, query_batch in enumerate(loader):
+        if batch_index >= n_batches:
+            break
+        valid_indices = [i for i, q_id in enumerate(query_batch.query)
+                         if q_id in query_plans and len(query_plans[q_id]) > 0]
+        if not valid_indices:
+            continue
+
+        priors = fetch_or_compute_priors(
+            query_batch, valid_indices, query_plans, cache, epinet_cost_estimation,
+            precomputed_indexes, precomputed_masks, device
+        )
+        embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
+        indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(n_epi_indexes)
+
+        for valid_idx, prior in zip(valid_indices, priors):
+            plans_query = query_plans[query_batch.query[valid_idx]]
+            _, last_feature = epinet_cost_estimation.estimate_cost_full(
+                plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
+            )
+            n_plans = last_feature.shape[0]
+
+            mlp_term = alpha_mlp * epinet_cost_estimation.compute_mlp_prior_batched(
+                last_feature, indexes
+            )[head_name].reshape(n_epi_indexes, n_plans)
+            ensemble_term = alpha_ensemble * torch.matmul(indexes, prior[head_name])
+
+            totals["mlp"].append(mlp_term.std(dim=0).mean().item())
+            totals["ensemble"].append(ensemble_term.std(dim=0).mean().item())
+            totals["combined"].append((mlp_term + ensemble_term).std(dim=0).mean().item())
+
+    if not totals["combined"]:
+        raise ValueError("Could not measure the prior scale: no valid queries in the loader.")
+
+    means = {key: float(np.mean(values)) for key, values in totals.items()}
+    print(f"Prior scale (std over epistemic index) -> "
+          f"alpha_mlp * mlp_prior: {means['mlp']:.4f} | "
+          f"alpha_ensemble * ensemble_prior: {means['ensemble']:.4f} | "
+          f"combined sigma_0: {means['combined']:.4f}")
+    return means["combined"]
+
+
+def theorem_4_lambda(sigma, n_train_points, prior_scale):
+    """Equation 9's regularization coefficient, lambda = sigma^2 / (N * sigma_0^2).
+
+    Theorem 4 fixes lambda rather than leaving it free: a *weak* prior (small sigma_0)
+    demands a *large* penalty. `prior_scale` is sigma_0, the standard deviation over the
+    epistemic index of the total prior term, measured on the training data.
+
+    Note this is the coefficient for a loss that averages over the N data points; the
+    paper sums over them and so writes the same constant against a summed loss.
+    """
+    if sigma <= 0:
+        return 0.0
+    if n_train_points <= 0 or prior_scale <= 0:
+        raise ValueError(
+            f"Need positive n_train_points and prior_scale, got {n_train_points} and {prior_scale}"
+        )
+    return (sigma ** 2) / (n_train_points * prior_scale ** 2)
 
 def loss_epinet(unweighted_ensemble_priors,
                 epinet_cost_estimation,
@@ -461,7 +556,8 @@ def loss_epinet(unweighted_ensemble_priors,
                 sigma, alpha_mlp, alpha_ensemble,
                 generator,
                 device,
-                head_name = "plan_cost"):
+                head_name = "plan_cost",
+                epistemic_seed=None):
     last_feature_detached = last_feature.detach()
     n_plans = estimated_cost.shape[0]
 
@@ -471,7 +567,14 @@ def loss_epinet(unweighted_ensemble_priors,
     c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
 
     # (n_epi_indexes, epi_index_dim)
-    epinet_indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(n_epi_indexes)
+    epistemic_generator = None
+    if epistemic_seed is not None:
+        epistemic_generator = torch.Generator(device=device)
+        epistemic_generator.manual_seed(epistemic_seed)
+    epinet_indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(
+        n_epi_indexes,
+        generator=epistemic_generator,
+    )
     # (n_epi_indexes, n_plans)
     ensemble_prior = torch.matmul(epinet_indexes, unweighted_ensemble_priors)
     # Shape: (n_epi_indexes * n_plans, 1)
@@ -542,22 +645,37 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                                   n_epi_indexes_val,
                                   writer,
                                   cache_directory,
+                                  l2_mode="manual",
+                                  prior_scale_target=None,
+                                  clear_prior_cache=True,
+                                  validate_every=1,
+                                  plot_calibration=True,
                                   evaluation_noise_std=0.2,
                                   joint_tau=10,
                                   evaluation_seed=0,
                                   dyadic_num_pairs=8,
+                                  objective_metric="val_joint_gaussian_nll_plan_cost",
+                                  early_stopping_patience=None,
+                                  early_stopping_min_delta=0.0,
+                                  early_stopping_min_epochs=0,
                                   debug_single_batch = False,
                                   trial: optuna.Trial = None):
 
     import shutil
-    shutil.rmtree(cache_directory, ignore_errors=True)
+    # The frozen priors depend only on the prior config and the seed that built them, so a
+    # caller that guarantees those are unchanged (a sweep reusing one ensemble across
+    # trials) can keep the cache. Rebuilding it is a pass over epi_index_dim GNNs for
+    # every query and dominates everything else in a short run.
+    if clear_prior_cache:
+        shutil.rmtree(cache_directory, ignore_errors=True)
     os.makedirs(cache_directory, exist_ok=True)
     train_cache = diskcache.Cache(os.path.join(cache_directory, "train_cache"), size_limit=50 * 1024 ** 3)
     val_cache = diskcache.Cache(os.path.join(cache_directory, "val_cache"), size_limit=50 * 1024 ** 3)
 
-    # Actively clear the cache to prevent stale priors between runs, as weights are randomly initialized
-    train_cache.clear()
-    val_cache.clear()
+    if clear_prior_cache:
+        # Prevents stale priors between runs when the ensemble is randomly re-initialized.
+        train_cache.clear()
+        val_cache.clear()
 
     precomputed_indexes = precompute_left_deep_tree_conv_index(20)
     precomputed_masks = precompute_left_deep_tree_node_mask(20)
@@ -600,6 +718,18 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             (f"{metric_prefix}_excess_per_target", "min"),
         ])
     train_summary = TrainSummary(tracked_metrics)
+    if objective_metric not in train_summary.best_values:
+        raise ValueError(f"Unknown objective metric: {objective_metric}")
+
+    early_stopper = None
+    if early_stopping_patience is not None:
+        objective_mode = train_summary.best_values[objective_metric]["type"]
+        early_stopper = ConvergenceEarlyStopping(
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+            min_epochs=early_stopping_min_epochs,
+            mode=objective_mode,
+        )
 
     # Predefine a generator so the perturbation vectors are consistent among epochs
     generator = torch.Generator(device=device)
@@ -656,10 +786,44 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
     print( f"Parameter counts -> Trainable: {num_trainable:,} | Fixed: {num_fixed:,} "
            f"| Total: {num_trainable + num_fixed:,}")
 
-    optimizer = torch.optim.AdamW(params_trainable, lr=lr, weight_decay=weight_decay)
+    prior_scale = measure_prior_scale(
+        loader, query_plans_train, train_cache, epinet_cost_estimation,
+        precomputed_indexes, precomputed_masks, alpha_mlp, alpha_ensemble, device
+    )
+
+    if prior_scale_target:
+        # Targets are standardized, so a randomized prior of unit scale says "before
+        # seeing data this plan's cost could plausibly sit anywhere within ~1 std of the
+        # mean". Left uncalibrated the prior scale is an artifact of the feature width and
+        # Glorot fan-in, not a modelling choice -- at feature width 264 it comes out
+        # several times the target range and swamps the signal.
+        rescale = prior_scale_target / prior_scale
+        alpha_mlp *= rescale
+        alpha_ensemble *= rescale
+        prior_scale = prior_scale_target
+        print(f"Prior auto-calibration -> target sigma_0={prior_scale_target:g}, "
+              f"scaling alphas by {rescale:.4f} => alpha_mlp={alpha_mlp:.4f}, "
+              f"alpha_ensemble={alpha_ensemble:.4f} (their ratio is preserved; adjust the "
+              f"configured ratio if one prior term dominates the other above)")
+
+    l2_lambda = 0.0
+    optimizer_weight_decay = weight_decay
+    if l2_mode == "theorem4":
+        n_train_points = sum(len(plans) for plans in query_plans_train.values())
+        l2_lambda = theorem_4_lambda(sigma, n_train_points, prior_scale)
+        # Equation 9's penalty now lives in the loss, so decoupled decay would double count.
+        optimizer_weight_decay = 0.0
+        print(f"Theorem 4 L2 -> sigma={sigma:g} N={n_train_points:,} "
+              f"sigma_0={prior_scale:.4f} => lambda={l2_lambda:.3e} "
+              f"(config weight_decay={weight_decay:g} ignored)")
+
+    optimizer = torch.optim.AdamW(params_trainable, lr=lr, weight_decay=optimizer_weight_decay)
     scheduler = DualMetricScheduler(optimizer,
-                                    patience=3,
-                                    threshold=1e-2
+                                    patience=5,
+                                    threshold=1e-3,
+                                    threshold_mode='rel',
+                                    factor=0.3,
+                                    min_lr=lr * 1e-3,
                                     )
     previous_lr = scheduler.get_last_lr()
 
@@ -706,13 +870,22 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                 query_batch, valid_indices, query_plans_train, train_cache,
                 precomputed_indexes, precomputed_masks,
                 epinet_cost_estimation, optimizer, loss,
-                n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble, generator, device
+                n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble, generator, device,
+                l2_lambda=l2_lambda
             )
 
             batch_losses.append(batch_loss)
             pbar.update(len(query_batch.query))
 
         epoch_train_loss = np.mean(batch_losses)
+
+        # Validation is expensive: batch_size=1 over every validation query, n_epi_indexes_val
+        # index samples each, and six NLL variants per query. Running it every epoch is worth
+        # it for a final run and wasteful inside a sweep, where only the final ranking matters.
+        is_last_epoch = epoch == n_epochs
+        if validate_every > 1 and epoch % validate_every != 0 and not is_last_epoch:
+            pbar.update(0)
+            continue
 
         tracker = validate_cached(
             loader_val, query_plans_val, val_targets, epinet_cost_estimation, val_cache, mean_train, std_train,
@@ -722,9 +895,12 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         )
 
         mean_metrics_val = tracker.summarize()
+        # The plot is a matplotlib figure written to disk every epoch; across a sweep that
+        # is thousands of PDFs nobody looks at. The scalars are computed either way.
         calibration_error, sharpness = calculate_calibration_metrics(
             tracker.p_values, tracker.distribution_variances, 100,
             os.path.join(writer.get_epoch_dir(epoch), 'calibration_plot.pdf')
+            if plot_calibration else None
         )
 
         mean_metrics_val.update({
@@ -735,7 +911,8 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
 
         train_summary.update(mean_metrics_val, epoch)
 
-        scheduler.step(mean_metrics_val['val_loss_plan_cost_unscaled'], mean_metrics_val['train_loss'])
+        scheduler.step(train_loss=mean_metrics_val['train_loss'],
+                       val_metric=mean_metrics_val['val_loss_plan_cost_unscaled'])
 
         best, per_epoch = train_summary.summary()
         writer.write_epoch_to_file([], best, per_epoch, epinet_cost_estimation, epoch)
@@ -745,17 +922,26 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             print(f"INFO: Lr Updated from {previous_lr} to {scheduler.get_last_lr()}")
             previous_lr = scheduler.get_last_lr()
 
+        objective_value = mean_metrics_val[objective_metric]
         if trial:
-            trial.report(mean_metrics_val["val_joint_gaussian_nll_plan_cost"], epoch)
+            trial.report(objective_value, epoch)
             if trial.should_prune():
                 train_cache.close()
                 val_cache.close()
                 raise optuna.TrialPruned()
 
+        if early_stopper and early_stopper.step(objective_value, epoch):
+            print(
+                f"EARLY STOP: {objective_metric} did not improve by "
+                f"{early_stopping_min_delta:g} for {early_stopping_patience} epochs. "
+                f"Best value {early_stopper.best_value:.6f} at epoch {early_stopper.best_epoch}."
+            )
+            break
+
     pbar.close()
     train_cache.close()
     val_cache.close()
-    return train_summary.best_values["val_joint_gaussian_nll_plan_cost"]
+    return train_summary.best_values[objective_metric]
 
 
 def main_simulated_epinet_training(cfg: DictConfig,
@@ -773,6 +959,19 @@ def main_simulated_epinet_training(cfg: DictConfig,
     joint_tau = OmegaConf.select(cfg, "evaluation.joint_tau", default=10)
     evaluation_seed = OmegaConf.select(cfg, "evaluation.seed", default=0)
     dyadic_num_pairs = OmegaConf.select(cfg, "evaluation.dyadic_num_pairs", default=8)
+    objective_metric = OmegaConf.select(
+        cfg,
+        "training.objective_metric",
+        default="val_joint_gaussian_nll_plan_cost",
+    )
+    early_stopping_patience = OmegaConf.select(cfg, "training.early_stopping_patience", default=None)
+    early_stopping_min_delta = OmegaConf.select(cfg, "training.early_stopping_min_delta", default=0.0)
+    early_stopping_min_epochs = OmegaConf.select(cfg, "training.early_stopping_min_epochs", default=0)
+    # "theorem4" derives lambda = sigma^2 / (N * sigma_0^2) from the measured prior scale
+    # and puts it in the loss; "manual" keeps hyperparameters.weight_decay in AdamW.
+    l2_mode = OmegaConf.select(cfg, "hyperparameters.l2_mode", default="manual")
+    # Rescales alpha_mlp/alpha_ensemble so the measured prior std hits this value.
+    prior_scale_target = OmegaConf.select(cfg, "hyperparameters.prior_scale_target", default=None)
     writer.create_experiment_directory()
 
     data = prepare_simulated_dataset(train_dataset, oracle_model, device, cfg.dataset.save_loc_simulated,
@@ -827,6 +1026,12 @@ def main_simulated_epinet_training(cfg: DictConfig,
         joint_tau=joint_tau,
         evaluation_seed=evaluation_seed,
         dyadic_num_pairs=dyadic_num_pairs,
+        l2_mode=l2_mode,
+        prior_scale_target=prior_scale_target,
+        objective_metric=objective_metric,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_min_epochs=early_stopping_min_epochs,
         debug_single_batch=debug_single_batch,
     )
 
@@ -854,6 +1059,12 @@ def main_supervised_value_estimation(cfg: DictConfig):
         "mlp_dimension": cfg.hyperparameters.mlp_dimension,
         "model_weights": cfg.models.epinet.model_file,
         "cost_only": True,
+        "epinet_feature_mode": OmegaConf.select(
+            cfg, "hyperparameters.epinet_feature_mode", default="mlp"
+        ),
+        "epinet_hidden_dim": OmegaConf.select(
+            cfg, "hyperparameters.epinet_hidden_dim", default=None
+        ),
     }
 
     heads_config = {

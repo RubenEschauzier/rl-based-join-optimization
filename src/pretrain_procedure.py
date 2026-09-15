@@ -1,4 +1,5 @@
 import faulthandler
+import math
 
 import numpy as np
 import torch
@@ -15,22 +16,46 @@ from src.utils.training_utils.utils import q_error_fn
 
 class DualMetricScheduler:
 
-    def __init__(self, optimizer, patience=3, threshold=1e-2, mode='min', factor=0.1):
+    def __init__(self, optimizer, patience=3, threshold=1e-2, mode='min', factor=0.1,
+                 threshold_mode='rel', min_lr=1e-6):
+        """
+        :param threshold: Minimum improvement that counts as progress.
+        :param threshold_mode: 'rel' interprets `threshold` as a fraction of the current
+            best value, 'abs' as a raw offset. Prefer 'rel': an absolute threshold that is
+            large relative to the loss makes every epoch look like a plateau and decays the
+            learning rate into oblivion (e.g. threshold=1e-2 on a loss of ~0.07).
+        :param min_lr: Floor on the learning rate, so a run cannot silently become a no-op.
+        """
+        if threshold_mode not in ('rel', 'abs'):
+            raise ValueError(f"threshold_mode must be 'rel' or 'abs', got {threshold_mode!r}")
         self.optimizer = optimizer
         self.patience = patience
         self.threshold = threshold
+        self.threshold_mode = threshold_mode
         self.mode = mode
         self.factor = factor
+        self.min_lr = min_lr
         initial_best = float('inf') if mode == 'min' else float('-inf')
         self.best_train = initial_best
         self.best_val = initial_best
         self.bad_train_epochs = 0
         self.bad_val_epochs = 0
 
+    def _margin(self, best):
+        """Improvement required over `best` to count as progress."""
+        if self.threshold_mode == 'abs' or not math.isfinite(best):
+            return self.threshold
+        # abs() keeps the margin a genuine tightening for negative metrics too
+        # (e.g. joint NLL), where scaling by (1 - threshold) would flip its sign.
+        return self.threshold * abs(best)
+
     def _is_better(self, value, best):
+        if not math.isfinite(best):
+            return True
+        margin = self._margin(best)
         if self.mode == 'min':
-            return value < best - self.threshold
-        return value > best + self.threshold
+            return value < best - margin
+        return value > best + margin
 
     def _update_tracker(self, value, best, bad_epochs):
         if self._is_better(value, best):
@@ -46,13 +71,17 @@ class DualMetricScheduler:
         )
 
         if self.bad_train_epochs > self.patience and self.bad_val_epochs > self.patience:
-            new_lr = self.optimizer.param_groups[0]['lr'] * self.factor
-
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = new_lr
+            current_lr = self.optimizer.param_groups[0]['lr']
+            new_lr = max(current_lr * self.factor, self.min_lr)
 
             self.bad_train_epochs = 0
             self.bad_val_epochs = 0
+
+            if new_lr == current_lr:
+                return False
+
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
             return True
         return False
 

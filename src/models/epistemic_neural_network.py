@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import sys
@@ -25,6 +26,32 @@ from src.models.query_plan_prediction_model import QueryPlansPredictionModel, Pl
 import torch
 import torch.nn as nn
 
+def instantiate_heads_config(heads_config):
+    """Return a heads config holding a *fresh* module per head.
+
+    ``BasePlanCostEstimator.init_model`` registers ``config['layer']`` directly rather
+    than a copy. Passing one config dict to several models therefore gives them a single
+    shared output head. For the randomized-prior ensemble that is fatal: every prior
+    collapses to a common projection of its own body, which destroys the ensemble
+    diversity the epistemic index is supposed to resolve.
+
+    ``layer`` may be either an ``nn.Module`` used as a shape template (deep-copied here)
+    or a zero-argument callable invoked once per model. Weights carried by a template are
+    not meaningful: callers re-initialize the ensemble afterwards (see the
+    ``apply(init_weights)`` call in ``MultiHeadEpistemicNetwork.__init__``), which is what
+    makes the copies differ from one another.
+    """
+    instantiated = {}
+    for head_name, config in heads_config.items():
+        layer = config['layer']
+        instantiated[head_name] = {
+            **config,
+            'layer': layer() if callable(layer) and not isinstance(layer, nn.Module)
+            else copy.deepcopy(layer),
+        }
+    return instantiated
+
+
 class MultiHeadEpistemicNetwork(nn.Module):
     def __init__(self,
                  epi_index_dim, prior_config,
@@ -32,6 +59,8 @@ class MultiHeadEpistemicNetwork(nn.Module):
                  ensemble_prior_heads_config=None,
                  head_names=None,
                  mlp_dimension=5,
+                 epinet_hidden_dim=None,
+                 prior_epinet_hidden_dim=None,
                  device=torch.device('cpu'),
                  verbose = 0):
         super().__init__()
@@ -42,6 +71,14 @@ class MultiHeadEpistemicNetwork(nn.Module):
 
         self.prior_config = prior_config
         self.mlp_output_dim_cost_model = cost_estimation_model.query_plan_model.mlp_output_dim
+        # Width of sg[phi(x)] as actually returned by the cost model, which may be wider
+        # than the MLP output when epinet_feature_mode == "mlp_plus_plan".
+        self.epinet_feature_dim = cost_estimation_model.query_plan_model.epinet_feature_dim
+        # Kept tied to the MLP width so the epinet's capacity does not silently grow with
+        # the feature width; deepmind/enn uses a single hidden layer of 50 units here.
+        self.epinet_hidden_dim = epinet_hidden_dim or max(self.mlp_output_dim_cost_model // 2, 1)
+        # The learnable vs fixed prior gets its own width.
+        self.prior_epinet_hidden_dim = prior_epinet_hidden_dim or self.epinet_hidden_dim
 
         # Glorot initialization as described in Epistemic Neural Networks paper
         def init_weights(m):
@@ -66,7 +103,8 @@ class MultiHeadEpistemicNetwork(nn.Module):
             gnn.freeze_model()
 
         ensemble_plan_cost = [PlanCostEstimatorTiny(
-            ensemble_prior_heads_config, device, mlp_output_dim=mlp_dimension
+            instantiate_heads_config(ensemble_prior_heads_config), device,
+            mlp_output_dim=mlp_dimension
         ).to(device) for _ in range(epi_index_dim)]
 
         for plan_cost in ensemble_plan_cost:
@@ -88,14 +126,14 @@ class MultiHeadEpistemicNetwork(nn.Module):
 
         # Initialize learnable epinet with bae feature extractor and multiple heads
         self.learnable_epinet_features = nn.Sequential(
-            nn.Linear(self.mlp_output_dim_cost_model + epi_index_dim, self.mlp_output_dim_cost_model // 2),
+            nn.Linear(self.epinet_feature_dim + epi_index_dim, self.epinet_hidden_dim),
             nn.ReLU(),
         ).to(device)
         self.learnable_epinet_features.apply(init_weights)
 
         self.learnable_epinet_heads = nn.ModuleDict()
         for head_name in self.head_names:
-            head_layer = nn.Linear(self.mlp_output_dim_cost_model // 2, epi_index_dim)
+            head_layer = nn.Linear(self.epinet_hidden_dim, epi_index_dim)
             nn.init.zeros_(head_layer.weight)
             nn.init.zeros_(head_layer.bias)
             self.learnable_epinet_heads[head_name] = head_layer.to(device)
@@ -106,9 +144,10 @@ class MultiHeadEpistemicNetwork(nn.Module):
         # self.learnable_epinet.apply(init_weights)
         # self.learnable_epinet.add_module("last_layer", last_layer)
 
-        # Prior MLP should just be Glorot initialized
+        # Prior MLP mirrors the learnable one (same architecture, different parameters),
+        # as in deepmind/enn's MLPEpinetWithPrior.
         self.prior_epinet_features = nn.Sequential(
-            nn.Linear(self.mlp_output_dim_cost_model + epi_index_dim, self.mlp_output_dim_cost_model // 2),
+            nn.Linear(self.epinet_feature_dim + epi_index_dim, self.prior_epinet_hidden_dim),
             nn.ReLU(),
         ).to(device)
         self.prior_epinet_features.apply(init_weights)
@@ -119,7 +158,7 @@ class MultiHeadEpistemicNetwork(nn.Module):
 
         self.prior_epinet_heads = nn.ModuleDict()
         for head_name in self.head_names:
-            prior_head = nn.Linear(self.mlp_output_dim_cost_model // 2, epi_index_dim)
+            prior_head = nn.Linear(self.prior_epinet_hidden_dim, epi_index_dim)
             prior_head.apply(init_weights)
 
             # Freeze prior head
@@ -319,8 +358,12 @@ class MultiHeadEpistemicNetwork(nn.Module):
     def sample_epistemic_indexes(self):
         return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
 
-    def sample_epistemic_indexes_batched(self, n_epi_indexes):
-        return torch.randn((n_epi_indexes, self.epi_index_dim), device=self.device)
+    def sample_epistemic_indexes_batched(self, n_epi_indexes, generator=None):
+        return torch.randn(
+            (n_epi_indexes, self.epi_index_dim),
+            device=self.device,
+            generator=generator,
+        )
 
     def get_learnable_epinet_params(self):
         """Returns parameters for the learnable MLP features and heads of the Epinet."""
@@ -401,7 +444,9 @@ def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_di
                          heads_config, heads_config_prior,
                          device,
                          model_weights=None, cost_only=False, strict=True,
-                         freeze_embedding=True, diff_filter=None):
+                         freeze_embedding=True, diff_filter=None,
+                         epinet_feature_mode="mlp", epinet_hidden_dim=None,
+                         prior_epinet_hidden_dim=None):
     model_factory_gine_conv = ModelFactory(full_gnn_config)
     embedding_model_full = model_factory_gine_conv.load_gine_conv()
 
@@ -410,11 +455,15 @@ def prepare_epinet_model(full_gnn_config, config_ensemble_prior, epinet_index_di
         embedding_model_full.freeze_model()
 
     cost_net_full = PlanCostEstimatorFull(
-        heads_config, device, mlp_output_dim=mlp_dimension
+        heads_config, device, mlp_output_dim=mlp_dimension,
+        epinet_feature_mode=epinet_feature_mode
     )
     combined_model_full = QueryPlansPredictionModel(embedding_model_full, cost_net_full, device)
     epinet_cost_estimation = MultiHeadEpistemicNetwork(epinet_index_dim, config_ensemble_prior, combined_model_full,
-                                                       ensemble_prior_heads_config=heads_config_prior, device=device)
+                                                       ensemble_prior_heads_config=heads_config_prior,
+                                                       epinet_hidden_dim=epinet_hidden_dim,
+                                                       prior_epinet_hidden_dim=prior_epinet_hidden_dim,
+                                                       device=device)
     epinet_cost_estimation.to(device)
     if model_weights:
         epinet_cost_estimation.load_epinet(model_weights,

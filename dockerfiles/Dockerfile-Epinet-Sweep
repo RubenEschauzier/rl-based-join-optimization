@@ -1,0 +1,44 @@
+# Optuna hyperparameter sweep for the epinet cost model, for imec GPULab.
+#
+# As with Dockerfile-Epinet-Training, the repository itself is NOT baked into the image:
+# GPULab mounts project storage at /project_ghent, so the code is picked up from the
+# mount at run time and you can re-run a sweep after editing without rebuilding.
+#
+# Build (from the repository root, so the requirements file resolves):
+#   docker build -f dockerfiles/Dockerfile-Epinet-Sweep -t <registry>/epinet-sweep:latest .
+#   docker push <registry>/epinet-sweep:latest
+#
+# The sweep resumes: the study lives in a SQLite file under sweep.storage_path with
+# load_if_exists=True, so a job that is pre-empted or hits its wall clock can simply be
+# resubmitted and will continue from the completed trials. Keep that path on the mounted
+# project storage, never inside the container filesystem, or resuming silently starts over.
+
+# Development image: provides nvcc and build tools matching the pinned PyTorch version.
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
+
+# Build tools required for compiling Python C-extensions
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Match the GPULab storage mount
+WORKDIR /project_ghent/rl-based-join-optimization
+
+# PyTorch Geometric extensions from pre-compiled wheels, to avoid source builds
+RUN pip install --no-cache-dir pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+    -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
+
+COPY dockerfiles/requirements-docker.txt .
+
+# Already includes optuna, optuna-dashboard, SQLAlchemy and diskcache, which the sweep
+# needs for the study storage and the frozen-prior cache.
+RUN pip install --no-cache-dir -r requirements-docker.txt
+
+ENV PYTHONPATH="/project_ghent/rl-based-join-optimization"
+# Surface trial progress in the job log instead of buffering it until the job ends.
+ENV PYTHONUNBUFFERED=1
+
+# Hydra writes run artifacts relative to the working directory; the sweep config already
+# pins hydra.run.dir to '.' so nothing is scattered outside the project mount.
+CMD ["python", "-m", "src.supervised_value_estimation.optuna_epinet_sweep"]

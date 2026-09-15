@@ -1,0 +1,76 @@
+defaults:
+  - simulated_supervised_cost_estimation_mixed_yago_train_epinet
+  - _self_
+
+sweep:
+  study_name: mixed_yago_epinet_scale_sweep
+  storage_path: experiments/experiment_outputs/mixed_yago/optuna_epinet_sweep/study.db
+  output_directory: experiments/experiment_outputs/mixed_yago/optuna_epinet_sweep
+  cache_root: .prior_cache/optuna_epinet_sweep
+  n_trials: 128
+  max_epochs: 30
+
+  # Fraction of QUERIES each trial trains and validates on. Sweeps need the ranking
+  # between configurations, not final numbers, so this trades absolute quality for
+  # throughput. Normalisation statistics are still computed on the full training set, so
+  # the target scale does not drift. Re-validate the winning trial on the full data.
+  data_fraction: 0.25
+  data_subset_seed: 0
+  subsample_validation: true
+
+  # --- architecture -------------------------------------------------------------
+  tune_widths: true
+  epinet_hidden_values: [16, 32, 64, 128, 256]
+  prior_epinet_hidden_values: [8, 16, 32, 64, 128]
+
+  # Index dimension drives joint-prediction quality: spurious cross-plan correlation
+  # from the anchor vectors has std 1/sqrt(D), i.e. 0.18 at D=30. Costly, though --
+  # one prior GNN per dimension, and the prior cache scales linearly with it.
+  tune_index_dim: true
+  epinet_index_dim_values: [16, 32, 64, 128]
+
+  # Num sampled epinet indexes. Monte-carlo simulation has irreducible variance,
+  # so higher is better
+  tune_n_epi_indexes: true
+  n_epi_indexes_values: [32, 128, 256, 512]
+
+  # --- uncertainty scales -------------------------------------------------------
+  sigma_min: 0.03
+  sigma_max: 0.10
+  # Only the RATIO of these matters: prior_scale_target rescales both so the combined
+  # prior std hits its target. Prefer tune_prior_mix, which searches that ratio directly:
+  #   alpha_mlp = mix, alpha_ensemble = 1 - mix
+  # 0.0 = GNN-ensemble prior only, 1.0 = MLP prior only. The endpoints ablate each prior,
+  # which is the test of whether the GNN prior -- built from an embedding the learnable
+  # net never sees, and so arguably not cancellable at all -- is pulling its weight.
+  tune_prior_mix: true
+  prior_mix_values: [0.0, 0.25, 0.5, 0.75, 1.0]
+  # Legacy path, used only when tune_prior_mix is false. Samples the two independently,
+  # which duplicates configurations and can hit the degenerate (0, 0) corner.
+  alpha_values: [0.0, 0.03, 0.05, 0.10]
+  tune_lr: false
+  lr_min: 0.0005
+  lr_max: 0.002
+
+  # Minimize natural-query excess joint NLL per target.
+  objective_metric: val_joint_gaussian_nll_plan_cost_excess_per_target
+  early_stopping_min_epochs: 15
+  # Counted in VALIDATION events, not epochs. With validate_every: 3 a patience of 8 would
+  # be 24 epochs and could never fire inside max_epochs: 30.
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0001
+
+  # Validation is the second-biggest cost after the priors: batch_size=1 over every
+  # validation query with n_epi_indexes_val samples and six NLL variants each. Inside a
+  # sweep only the final ranking matters, so validate every few epochs. The last epoch is
+  # always validated, so the reported objective is never stale.
+  validate_every: 3
+  # Thousands of matplotlib PDFs nobody opens; the scalars are computed regardless.
+  plot_calibration: false
+
+  # Prune early. With max_epochs 30 a warmup of 15 meant no trial could be killed before
+  # halfway, so every bad configuration cost a full half-run.
+  pruner_startup_trials: 4
+  pruner_warmup_epochs: 5
+  sampler_seed: 0
+  model_seed: 0

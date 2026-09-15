@@ -44,11 +44,19 @@ def compute_calibration_curve(p_values, n_confidences):
         observed_p.append(fraction)
     return observed_p, expected_p
 
-def calculate_calibration_metrics(p_values, predicted_distribution_variance, n_confidences, save_location):
+def calculate_calibration_metrics(p_values, predicted_distribution_variance, n_confidences,
+                                  save_location):
+    """Calibration error and sharpness; draws the plot only when given somewhere to put it.
+
+    `save_location=None` means "scalars only". Building the figure is far more expensive
+    than the two numbers, and in a headless container plt.show() is at best a warning per
+    call, so a sweep should leave it off.
+    """
     observed_p, expected_p = compute_calibration_curve(p_values, n_confidences)
     calibration_error = calculate_calibration_error(expected_p, observed_p)
     sharpness = calculate_sharpness(predicted_distribution_variance)
-    plot_calibration(observed_p, expected_p, calibration_error, save_location)
+    if save_location is not None:
+        plot_calibration(observed_p, expected_p, calibration_error, save_location)
     return calibration_error, sharpness
 
 def plot_calibration(observed, expected, error, save_location=None):

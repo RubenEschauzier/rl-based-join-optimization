@@ -39,13 +39,31 @@ hyperparameters:
   n_epi_indexes_train: 32
   n_epi_indexes_val: 200
   sigma: .1
-  alpha_mlp: .1
-  alpha_ensemble: .1
+  # deepmind/enn's ImageNet epinet uses epi_prior_scale = add_prior_scale = 1.0, but its
+  # outputs are logits; ours are standardized log-costs. Only the *ratio* of these two
+  # matters -- prior_scale_target below rescales both so the measured prior std lands on
+  # a chosen value, since the raw scale is otherwise an artifact of feature width and
+  # Glorot fan-in (it comes out ~4 at feature width 264, several times the target range).
+  alpha_mlp: 1.0
+  alpha_ensemble: 1.0
+  # Targets are standardized, so sigma_0 = 1 says "before seeing data this plan's cost
+  # could plausibly sit within ~1 std of the mean". Set to null to disable calibration.
+  prior_scale_target: 1.0
   lr: 0.001
   weight_decay: 0.001
+  l2_mode: manual
   n_epochs: 100
   mlp_dimension: 64
-  epinet_index_dim: 16
+  # ImageNet epinet uses index_dim = 30. At 16 the anchor vectors c_i have
+  # std[c_i . c_j] = 1/sqrt(16) = 0.25, i.e. sizeable spurious cross-plan correlation;
+  # Theorem 4 and Lemma 2 are asymptotic in this dimension.
+  epinet_index_dim: 30
+  # "mlp" = epinet sees only the cost head's input. "mlp_plus_plan" also gives it the
+  # wider pre-MLP plan representation, which retains structural novelty the cost-trained
+  # MLP discards (cf. drop_inputs=False in deepmind/enn).
+  epinet_feature_mode: mlp_plus_plan
+  # Held fixed so widening the feature does not silently grow epinet capacity.
+  epinet_hidden_dim: 50
   num_workers: 6
 
 execution:

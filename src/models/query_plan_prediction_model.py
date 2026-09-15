@@ -21,37 +21,57 @@ import torch.nn as nn
 
 
 class BasePlanCostEstimator(nn.Module, ABC):
-    def __init__(self, heads_config, device, feature_dim=100, mlp_output_dim=64):
+    #: What is handed to the epinet as ``sg[phi(x)]``.
+    #:   "mlp"           - the MLP output only (the vector the cost heads read).
+    #:   "mlp_plus_plan" - that, concatenated with the pre-MLP plan representation
+    #:                     [tree-conv root ; attention pool].
+    EPINET_FEATURE_MODES = ("mlp", "mlp_plus_plan")
+
+    def __init__(self, heads_config, device, feature_dim=100, mlp_output_dim=64,
+                 epinet_feature_mode="mlp"):
         """
 
         :param heads_config: Configuration of estimation heads: {name, layer: nn.Linear(...)}
         :param device:
         :param feature_dim: The dimension of the embedding plans
         :param mlp_output_dim: The dimension after applying an MLP to the embedded plans
+        :param epinet_feature_mode: Which representation to expose to the epinet. The MLP
+            output is trained to predict cost, so it discards everything that does not move
+            the cost estimate -- including the structural novelty an epinet needs in order
+            to widen on unfamiliar plans. "mlp_plus_plan" also exposes the wider, less
+            compressed representation one layer upstream. Compare `drop_inputs=False` in
+            deepmind/enn, where the epinet reads the hidden features *and* the raw input.
         """
         super().__init__()
+        if epinet_feature_mode not in self.EPINET_FEATURE_MODES:
+            raise ValueError(
+                f"epinet_feature_mode must be one of {self.EPINET_FEATURE_MODES}, "
+                f"got {epinet_feature_mode!r}"
+            )
         self.device = device
 
         self.heads_config = heads_config
         self.mlp_output_dim = mlp_output_dim
+        self.epinet_feature_mode = epinet_feature_mode
+        self.plan_representation_dim = feature_dim * 2  # [root ; attention pool]
 
         self.plan_embedding_nn, self.attn_pool, self.mlp, self.heads = (
             self.init_model(feature_dim, device)
         )
 
+    @property
+    def epinet_feature_dim(self):
+        """Width of the second element returned by forward(), i.e. the epinet's input."""
+        if self.epinet_feature_mode == "mlp_plus_plan":
+            return self.mlp_output_dim + self.plan_representation_dim
+        return self.mlp_output_dim
+
     def forward(self, trees, indexes, mask_padding):
         # Encode the query plan
         emb, idx = self.plan_embedding_nn((trees, indexes))
 
-
         # We reshape the (n_plans, dim, n_nodes) tensor to (n_plans, n_nodes, dim)
         emb_transposed = emb.transpose(1, 2)
-
-        if self.__class__.__name__ == "PlanCostEstimatorFull":
-
-            emb_numpy = emb.detach().cpu().numpy()
-            emb_transposed_numpy = emb_transposed.detach().cpu().numpy()
-            _debug_anchor = True  # Set your IDE breakpoint on this line
 
         # Stack the node embeddings to a tensor (n_plans * n_nodes, dim) to use with batch variable
         emb_stacked = emb_transposed.reshape((-1, emb_transposed.shape[-1]))
@@ -86,6 +106,13 @@ class BasePlanCostEstimator(nn.Module, ABC):
             head_name: head(mlp_out) for head_name, head in self.heads.items()
         }
 
+        # The epinet consumes this as sg[phi(x)]; see epinet_feature_mode.
+        epinet_features = (
+            torch.cat([mlp_out, combined], dim=1)
+            if self.epinet_feature_mode == "mlp_plus_plan"
+            else mlp_out
+        )
+
         # if self.__class__.__name__ == "PlanCostEstimatorFull":
         #     # Compute and print pairwise Euclidean distances
         #     distances = torch.cdist(mlp_out, mlp_out, p=2)
@@ -103,7 +130,7 @@ class BasePlanCostEstimator(nn.Module, ABC):
         #     _debug_anchor = True  # Set your IDE breakpoint on this line
 
         # Return a dictionary of predictions instead of a single tensor
-        return predictions, mlp_out
+        return predictions, epinet_features
 
     def serialize_model(self, model_dir, model_file_name: str = None):
         state_dict = self.state_dict()
