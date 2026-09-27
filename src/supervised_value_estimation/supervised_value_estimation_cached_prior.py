@@ -1,9 +1,6 @@
-from _pytest._io import terminalwriter
-import pdb
-from collections import defaultdict
 import os
 import sys
-from time import sleep
+from time import perf_counter, sleep
 
 import diskcache
 import hydra
@@ -14,14 +11,13 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.data import Batch
 
 from tqdm import tqdm
-from torchmetrics.regression import MeanAbsolutePercentageError
 from torch_geometric.loader import DataLoader
 
 from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork, prepare_epinet_model
 from src.pretrain_procedure import DualMetricScheduler
-from src.utils.epinet_utils.calibration_plot import compute_calibration_measures, calculate_calibration_metrics
-from src.utils.epinet_utils.joint_loss import GaussianJointLogLoss
+from src.utils.epinet_utils.epinet_evaluation import SplitAccumulator, metric_names, query_statistics
+from src.utils.epinet_utils.epinet_report import RunReporter, write_json
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
 from src.utils.training_utils.early_stopping import ConvergenceEarlyStopping
 from src.utils.training_utils.training_tracking import TrainSummary, ExperimentWriter
@@ -37,33 +33,6 @@ from src.rl_fine_tuning_qr_dqn_learning import load_weights_from_pretraining
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset, prepare_data
 from src.utils.tree_conv_utils import precompute_left_deep_tree_conv_index, precompute_left_deep_tree_node_mask
 import torch
-
-
-class MetricsTracker:
-    """Tracks and aggregates validation metrics."""
-
-    def __init__(self):
-        self.metrics = defaultdict(list)
-        self.p_values = []
-        self.distribution_variances = []
-
-    def update(self, **kwargs):
-        for key, value in kwargs.items():
-            self.metrics[key].append(value)
-
-    def update_calibration(self, p_vals, dist_vars):
-        self.p_values.extend(p_vals)
-        self.distribution_variances.extend(dist_vars)
-
-    def reset_calibration_stats(self):
-        self.p_values = []
-        self.distribution_variances = []
-
-    def summarize(self):
-        """Returns the mean for all scalar metrics."""
-        return {k: np.mean(v).item() for k, v in self.metrics.items()}
-
-
 
 
 def prepare_cardinality_estimator(model_config, model_directory=None):
@@ -93,8 +62,20 @@ def print_param_count(epinet_cost_estimation, train_epi_network):
 
 
 def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epinet, precomputed_indexes,
-                            precomputed_masks, device):
-    """Retrieves priors for all heads from cache or computes and stores them if missing."""
+                            precomputed_masks, device, zero_ensemble_prior=False):
+    """Retrieves priors for all heads from cache or computes and stores them if missing.
+
+    With `zero_ensemble_prior` (alpha_ensemble == 0) the GNN-ensemble prior is multiplied
+    by zero everywhere it is used, so it is returned as zeros instead of being computed:
+    a pass over epi_index_dim GNNs per query, and the dominant cost of a run.
+    """
+    if zero_ensemble_prior:
+        return [
+            {head: torch.zeros((epinet.epi_index_dim, len(query_plans[query_batch.query[i]])), device=device)
+             for head in epinet.head_names}
+            for i in valid_indices
+        ]
+
     priors = {}
     missing_indices = []
 
@@ -127,294 +108,95 @@ def fetch_or_compute_priors(query_batch, valid_indices, query_plans, cache, epin
 
     return [priors[i] for i in valid_indices]
 
-def _nll_metrics(metric_name, nll, tau, noise_std):
-    nll_value = nll.item()
-    # Expected NLL of the *true* law under Gaussian noise is the differential entropy,
-    # log(sqrt(2*pi)*sigma) + 1/2 per target -- not log(sqrt(2*pi)*sigma). Without the
-    # 1/2 a perfect model scores an "excess" of +0.5/target rather than 0, so the metric
-    # cannot be read as a KL-to-optimal.
-    gaussian_constant = tau * (np.log(np.sqrt(2 * np.pi) * noise_std) + 0.5)
-    excess_nll = nll_value - gaussian_constant
-    return {
-        metric_name: nll_value,
-        f"{metric_name}_per_target": nll_value / tau,
-        f"{metric_name}_excess": excess_nll,
-        f"{metric_name}_excess_per_target": excess_nll / tau,
-    }
+def _synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
-def _marginal_gaussian_nll(predictions, targets, noise_std):
-    variance = noise_std ** 2
-    log_scale = np.log(np.sqrt(2 * np.pi) * noise_std)
-    squared_error = (predictions - targets.unsqueeze(0)) ** 2
-    pointwise_log_likelihood = -log_scale - squared_error / (2 * variance)
-    marginal_log_likelihood = (
-        torch.logsumexp(pointwise_log_likelihood, dim=0) - np.log(predictions.shape[0])
-    )
-    return -marginal_log_likelihood.mean()
-
-
-def _independently_permute_epistemic_samples(predictions, generator):
-    random_scores = torch.rand(predictions.shape, generator=generator, device=predictions.device)
-    independent_sample_indices = torch.argsort(random_scores, dim=0)
-    return torch.gather(predictions, 0, independent_sample_indices)
-
-
-def compute_validation_metrics_epinet(epinet_cost_estimates, repeated_target, base_cost_estimates,
-                                      n_epi_indexes, mean_cost, std_cost, joint_loss, head_name,
-                                      evaluation_seed, dyadic_num_pairs):
-    n_total = repeated_target.shape[0]
-    n_plans = n_total // n_epi_indexes
-
-    pred_matrix_scaled = epinet_cost_estimates.detach().cpu().reshape(n_epi_indexes, n_plans)
-    base_predictions_scaled = base_cost_estimates.detach().cpu().reshape(1, n_plans)
-    y_scaled = repeated_target.detach().cpu()[:n_plans].flatten()
-
-    pred_matrix = pred_matrix_scaled.numpy() * std_cost + mean_cost
-    base_predictions = base_predictions_scaled.numpy().flatten() * std_cost + mean_cost
-    y_scaled_numpy = y_scaled.numpy()
-    y_true = y_scaled_numpy * std_cost + mean_cost
-
-    y_pred_mean = pred_matrix.mean(axis=0)
-    y_pred_mean_scaled = pred_matrix_scaled.numpy().mean(axis=0)
-    y_pred_std = pred_matrix.std(axis=0)
-
-    p_values, epinet_distribution_variance = compute_calibration_measures(
-        y_scaled_numpy,
-        pred_matrix_scaled.numpy().T,
-        joint_loss.noise_std,
-    )
-
-    evaluation_generator = torch.Generator(device=pred_matrix_scaled.device)
-    evaluation_generator.manual_seed(evaluation_seed)
-    plan_indices = joint_loss.sample_plan_indices(
-        n_plans,
-        pred_matrix_scaled.device,
-        evaluation_generator,
-    )
-    dyadic_generator = torch.Generator(device=pred_matrix_scaled.device)
-    dyadic_generator.manual_seed(evaluation_seed + 1)
-    dyadic_plan_indices = joint_loss.sample_dyadic_plan_indices(
-        n_plans,
-        dyadic_num_pairs,
-        pred_matrix_scaled.device,
-        dyadic_generator,
-    )
-    permutation_generator = torch.Generator(device=pred_matrix_scaled.device)
-    permutation_generator.manual_seed(evaluation_seed + 2)
-    independent_predictions_scaled = _independently_permute_epistemic_samples(
-        pred_matrix_scaled,
-        permutation_generator,
-    )
-
-    joint_epinet_nll = joint_loss(pred_matrix_scaled, y_scaled, plan_indices)
-    joint_base_nll = joint_loss(base_predictions_scaled, y_scaled, plan_indices)
-    joint_independent_nll = joint_loss(independent_predictions_scaled, y_scaled, plan_indices)
-    dyadic_epinet_nll = joint_loss(pred_matrix_scaled, y_scaled, dyadic_plan_indices)
-    dyadic_base_nll = joint_loss(base_predictions_scaled, y_scaled, dyadic_plan_indices)
-    dyadic_independent_nll = joint_loss(
-        independent_predictions_scaled,
-        y_scaled,
-        dyadic_plan_indices,
-    )
-
-    marginal_epinet_nll = _marginal_gaussian_nll(
-        pred_matrix_scaled,
-        y_scaled,
-        joint_loss.noise_std,
-    )
-    marginal_base_nll = _marginal_gaussian_nll(
-        base_predictions_scaled,
-        y_scaled,
-        joint_loss.noise_std,
-    )
-
-    mse = np.mean((y_pred_mean - y_true) ** 2)
-    mse_scaled = np.mean((y_pred_mean_scaled - y_scaled_numpy) ** 2)
-    selected_plan = np.argmin(y_pred_mean)
-    base_selected_plan = np.argmin(base_predictions)
-    plan_selection_regret = y_true[selected_plan] - np.min(y_true)
-    base_plan_selection_regret = y_true[base_selected_plan] - np.min(y_true)
-
-    epinet_joint_metrics = _nll_metrics(
-        f"val_joint_gaussian_nll_{head_name}",
-        joint_epinet_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-    base_joint_metrics = _nll_metrics(
-        f"val_joint_nll_{head_name}_no_epinet",
-        joint_base_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-    independent_joint_metrics = _nll_metrics(
-        f"val_joint_nll_{head_name}_independent_epinet",
-        joint_independent_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-    dyadic_epinet_metrics = _nll_metrics(
-        f"val_dyadic_joint_nll_{head_name}_epinet",
-        dyadic_epinet_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-    dyadic_base_metrics = _nll_metrics(
-        f"val_dyadic_joint_nll_{head_name}_base",
-        dyadic_base_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-    dyadic_independent_metrics = _nll_metrics(
-        f"val_dyadic_joint_nll_{head_name}_independent_epinet",
-        dyadic_independent_nll,
-        joint_loss.tau,
-        joint_loss.noise_std,
-    )
-
-    return {
-        f"val_epi_mse_{head_name}": mse,
-        f"val_epi_mse_{head_name}_scaled": mse_scaled,
-        f"val_epi_avg_std_{head_name}": np.mean(y_pred_std),
-        f"val_plan_selection_regret_{head_name}_epinet": plan_selection_regret,
-        f"val_plan_selection_regret_{head_name}_base": base_plan_selection_regret,
-        f"val_plan_selection_regret_improvement_{head_name}": (
-            base_plan_selection_regret - plan_selection_regret
-        ),
-        f"val_marginal_nll_{head_name}_epinet_per_target": marginal_epinet_nll.item(),
-        f"val_marginal_nll_{head_name}_base_per_target": marginal_base_nll.item(),
-        f"val_marginal_nll_improvement_{head_name}_per_target": (
-            marginal_base_nll - marginal_epinet_nll
-        ).item(),
-        f"val_joint_nll_improvement_{head_name}_per_target": (
-            joint_base_nll - joint_epinet_nll
-        ).item() / joint_loss.tau,
-        f"val_joint_dependence_improvement_{head_name}_per_target": (
-            joint_independent_nll - joint_epinet_nll
-        ).item() / joint_loss.tau,
-        f"val_dyadic_joint_nll_improvement_{head_name}_per_target": (
-            dyadic_base_nll - dyadic_epinet_nll
-        ).item() / joint_loss.tau,
-        f"val_dyadic_joint_dependence_improvement_{head_name}_per_target": (
-            dyadic_independent_nll - dyadic_epinet_nll
-        ).item() / joint_loss.tau,
-        f"val_observed_p_values_{head_name}": p_values,
-        f"val_distribution_variance_{head_name}": epinet_distribution_variance,
-        **epinet_joint_metrics,
-        **base_joint_metrics,
-        **independent_joint_metrics,
-        **dyadic_epinet_metrics,
-        **dyadic_base_metrics,
-        **dyadic_independent_metrics,
-    }
-
-
-def validate_cached(val_loader, query_plans_val, targets, epinet_cost_estimation, val_cache,
+def validate_cached(val_loader, query_plans_val, epinet_cost_estimation, val_cache,
                     mean_vals, std_vals, train_loss, device, n_val_epi_indexes,
                     sigma, alpha_mlp, alpha_ensemble, precomputed_indexes, precomputed_masks,
-                    evaluation_noise_std, joint_tau, evaluation_seed, dyadic_num_pairs,
-                    head_names_to_val = ("plan_cost",)):
-    mape = MeanAbsolutePercentageError().to(device)
-    joint_loss = GaussianJointLogLoss(noise_std=evaluation_noise_std, tau=joint_tau)
-    tracker = MetricsTracker()
+                    evaluation_noise_std, joint_taus, evaluation_seed,
+                    split="val", zero_ensemble_prior=False, head_name="plan_cost"):
+    """One pass over a split, returning a SplitAccumulator of per-query statistics.
+
+    Metrics that depend on the fitted base-noise baseline are produced by
+    `accumulator.summarize(base_noise_std)` afterwards, so validation can fit the noise
+    and test can reuse it without a second pass.
+    """
+    accumulator = SplitAccumulator(split, joint_taus, evaluation_noise_std, std_vals[head_name])
     generator = torch.Generator(device=device)
-
-    total_val_queries = len(val_loader.dataset)
-
-    pbar = tqdm(total=total_val_queries, desc="Validating", leave=False, position=1, dynamic_ncols=True, mininterval=300)
-
-    n_empty_plans = 0
-    n_non_empty_plans = 0
-    processed = 0
+    pbar = tqdm(total=len(val_loader.dataset), desc=f"Evaluating [{split}]", leave=False, position=1,
+                dynamic_ncols=True, mininterval=300)
+    start = perf_counter()
 
     for query_batch in val_loader:
-        processed += len(query_batch.query)
         valid_indices = [i for i, q_id in enumerate(query_batch.query)
                          if q_id in query_plans_val and len(query_plans_val[q_id]) > 0]
-        n_empty_plans += (len(query_batch.query) - len(valid_indices))
-        n_non_empty_plans += len(valid_indices)
-        # Update pbar with stats to track if expected number of empty plans are produced
-        pbar.set_postfix(
-            empty_plans=n_empty_plans,
-            non_empty_plans=n_non_empty_plans,
-            queries=processed
-        )
-
         if not valid_indices:
-            pbar.update(1)
+            pbar.update(len(query_batch.query))
             continue
 
         unweighted_ensemble_priors = fetch_or_compute_priors(
             query_batch, valid_indices, query_plans_val, val_cache, epinet_cost_estimation, precomputed_indexes,
-            precomputed_masks, device
+            precomputed_masks, device, zero_ensemble_prior=zero_ensemble_prior,
         )
 
         with torch.no_grad():
+            _synchronize(device)
+            base_start = perf_counter()
             embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
+            _synchronize(device)
+            accumulator.seconds_base += perf_counter() - base_start
 
             for valid_idx, unweighted_ensemble_prior in zip(valid_indices, unweighted_ensemble_priors):
-                q_id = query_batch.query[valid_idx]
-                plans_query = query_plans_val[q_id]
+                plans_query = query_plans_val[query_batch.query[valid_idx]]
+                query_seed = evaluation_seed + plans_query[0][2]
 
+                base_start = perf_counter()
                 estimated_cost, last_feature = epinet_cost_estimation.estimate_cost_full(
                     plans_query, embedded[valid_idx], precomputed_indexes, precomputed_masks
                 )
-                for head_name in head_names_to_val:
-                    estimated_head_val = estimated_cost[head_name]
-                    prior_for_head = unweighted_ensemble_prior[head_name]
+                _synchronize(device)
+                epinet_start = perf_counter()
+                accumulator.seconds_base += epinet_start - base_start
 
-                    val_loss_epinet, repeated_target, epinet_cost_estimates = loss_epinet(
-                        prior_for_head,
-                        epinet_cost_estimation,
-                        train_loss,
+                estimated_head_val = estimated_cost[head_name]
+                val_loss_epinet, repeated_target, epinet_cost_estimates = loss_epinet(
+                    unweighted_ensemble_prior[head_name],
+                    epinet_cost_estimation,
+                    train_loss,
+                    estimated_head_val,
+                    last_feature,
+                    plans_query,
+                    n_val_epi_indexes,
+                    sigma, alpha_mlp, alpha_ensemble,
+                    generator,
+                    device,
+                    head_name=head_name,
+                    epistemic_seed=query_seed,
+                )
+                _synchronize(device)
+                accumulator.seconds_epinet += perf_counter() - epinet_start
+
+                n_plans = estimated_head_val.shape[0]
+                accumulator.add(
+                    query_statistics(
+                        epinet_cost_estimates.reshape(n_val_epi_indexes, n_plans),
                         estimated_head_val,
-                        last_feature,
-                        plans_query,
-                        n_val_epi_indexes,
-                        sigma, alpha_mlp, alpha_ensemble,
-                        generator,
-                        device,
-                        head_name=head_name,
-                        epistemic_seed=evaluation_seed + plans_query[0][2],
-                    )
+                        repeated_target[:n_plans],
+                        evaluation_noise_std,
+                        joint_taus,
+                        query_seed,
+                        std_vals[head_name],
+                    ),
+                    loss_epinet=val_loss_epinet.item(),
+                )
+        pbar.update(len(query_batch.query))
 
-                    mean_val = mean_vals[head_name]
-                    std_val = std_vals[head_name]
-
-                    val_metrics = compute_validation_metrics_epinet(
-                        epinet_cost_estimates, repeated_target, estimated_head_val,
-                        n_val_epi_indexes, mean_val, std_val, joint_loss,
-                        head_name=head_name,
-                        evaluation_seed=evaluation_seed + plans_query[0][2],
-                        dyadic_num_pairs=dyadic_num_pairs,
-                    )
-
-                    tracker.update_calibration(
-                        val_metrics.pop(f"val_observed_p_values_{head_name}"),
-                        val_metrics.pop(f"val_distribution_variance_{head_name}"),
-                    )
-
-                    estimated_head_val = estimated_head_val.view(-1)
-                    head_target = targets[q_id][head_name].view(-1)
-
-                    original_cost = (estimated_head_val * std_val) + mean_val
-                    original_target = (head_target * std_val) + mean_val
-
-                    tracker.update(
-                        **val_metrics,
-                        **{
-                            f"val_loss_{head_name}_scaled": train_loss(estimated_head_val, head_target).item(),
-                            f"val_loss_{head_name}_unscaled": train_loss(original_cost, original_target).item(),
-                            f"val_mape_{head_name}_scaled": mape(estimated_head_val, head_target).item(),
-                            f"val_mape_{head_name}_unscaled": mape(original_cost, original_target).item(),
-                            f"val_loss_{head_name}_epinet": val_loss_epinet.cpu().item()
-                        }
-                    )
-
-                pbar.update(1)
     pbar.close()
-    return tracker
+    accumulator.eval_seconds = perf_counter() - start
+    return accumulator
 
 
 def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
@@ -422,11 +204,12 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
                           epinet_cost_estimation,
                           optimizer, loss,
                           n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble,
-                          generator, device, l2_lambda=0.0):
+                          generator, device, l2_lambda=0.0, anchor_seed=0, zero_ensemble_prior=False):
     acc_loss = torch.tensor(0.0, device=device)
 
     unweighted_ensemble_priors = fetch_or_compute_priors(
-        query_batch, valid_indices, query_plans, cache, epinet_cost_estimation, precomputed_indexes, precomputed_masks, device
+        query_batch, valid_indices, query_plans, cache, epinet_cost_estimation, precomputed_indexes, precomputed_masks,
+        device, zero_ensemble_prior=zero_ensemble_prior,
     )
 
     embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
@@ -449,7 +232,8 @@ def train_on_batch_cached(query_batch, valid_indices, query_plans, cache,
             plans_query,
             n_epi_indexes_train,
             sigma, alpha_mlp, alpha_ensemble,
-            generator, device
+            generator, device,
+            anchor_seed=anchor_seed,
         )
         acc_loss += loss_epinet_val
 
@@ -478,7 +262,7 @@ def squared_parameter_norm(model):
 def measure_prior_scale(loader, query_plans, cache, epinet_cost_estimation,
                         precomputed_indexes, precomputed_masks,
                         alpha_mlp, alpha_ensemble, device,
-                        n_batches=4, n_epi_indexes=128, head_name="plan_cost"):
+                        n_batches=4, n_epi_indexes=128, head_name="plan_cost", zero_ensemble_prior=False):
     """Measure sigma_0: the std over the epistemic index of the total prior term.
 
     Also reports the two prior terms separately. They are scaled independently
@@ -498,7 +282,7 @@ def measure_prior_scale(loader, query_plans, cache, epinet_cost_estimation,
 
         priors = fetch_or_compute_priors(
             query_batch, valid_indices, query_plans, cache, epinet_cost_estimation,
-            precomputed_indexes, precomputed_masks, device
+            precomputed_indexes, precomputed_masks, device, zero_ensemble_prior=zero_ensemble_prior,
         )
         embedded = epinet_cost_estimation.embed_query_batched(query_batch.to(device))
         indexes = epinet_cost_estimation.sample_epistemic_indexes_batched(n_epi_indexes)
@@ -557,11 +341,16 @@ def loss_epinet(unweighted_ensemble_priors,
                 generator,
                 device,
                 head_name = "plan_cost",
-                epistemic_seed=None):
+                epistemic_seed=None,
+                anchor_seed=0):
     last_feature_detached = last_feature.detach()
     n_plans = estimated_cost.shape[0]
 
-    generator.manual_seed(plans[0][2])
+    # The anchor vectors c_i are the per-plan target perturbations; they are fixed per plan
+    # so they stay consistent across epochs. `anchor_seed` gives each training seed its own
+    # draw, so seed-to-seed variance includes this source of randomness. 0 keeps the
+    # original per-plan seeds.
+    generator.manual_seed(plans[0][2] + anchor_seed * 2 ** 32)
     # (n_plans, epi_index_dim)
     c_vectors = torch.randn((n_plans, epinet_cost_estimation.epi_index_dim), generator=generator, device=device)
     c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
@@ -645,21 +434,34 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                                   n_epi_indexes_val,
                                   writer,
                                   cache_directory,
+                                  queries_test=None,
+                                  query_plans_test=None,
                                   l2_mode="manual",
                                   prior_scale_target=None,
                                   clear_prior_cache=True,
                                   validate_every=1,
                                   plot_calibration=True,
+                                  use_tensorboard=False,
                                   evaluation_noise_std=0.2,
-                                  joint_tau=10,
+                                  joint_taus=(1, 2, 4, 8, 16),
                                   evaluation_seed=0,
-                                  dyadic_num_pairs=8,
-                                  objective_metric="val_joint_gaussian_nll_plan_cost",
+                                  anchor_seed=0,
+                                  objective_metric="val_jnll_tau8_epinet_excess_per_target",
                                   early_stopping_patience=None,
                                   early_stopping_min_delta=0.0,
                                   early_stopping_min_epochs=0,
                                   debug_single_batch = False,
                                   trial: optuna.Trial = None):
+    """Train the epinet and evaluate it on validation (and optionally test) every epoch.
+
+    Model selection -- early stopping, the LR schedule, Optuna pruning and the best epoch
+    in final_summary.json -- only ever looks at validation. Test is evaluated alongside
+    so its curves can be inspected, but a paper number should be read at the best
+    *validation* epoch, which is what final_summary.json reports.
+
+    `plot_calibration` now controls all per-epoch figures (report_<split>.png), and
+    `use_tensorboard` additionally logs scalars and figures to <run>/tensorboard.
+    """
 
     import shutil
     # The frozen priors depend only on the prior config and the seed that built them, so a
@@ -670,6 +472,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         shutil.rmtree(cache_directory, ignore_errors=True)
     os.makedirs(cache_directory, exist_ok=True)
     train_cache = diskcache.Cache(os.path.join(cache_directory, "train_cache"), size_limit=50 * 1024 ** 3)
+    # Test queries are a subset of the original validation file, so they share its cache.
     val_cache = diskcache.Cache(os.path.join(cache_directory, "val_cache"), size_limit=50 * 1024 ** 3)
 
     if clear_prior_cache:
@@ -677,49 +480,20 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         train_cache.clear()
         val_cache.clear()
 
+    joint_taus = tuple(int(tau) for tau in joint_taus)
+    # A zero-weighted ensemble prior never reaches any output, so skip computing it.
+    zero_ensemble_prior = alpha_ensemble == 0.0
+
     precomputed_indexes = precompute_left_deep_tree_conv_index(20)
     precomputed_masks = precompute_left_deep_tree_node_mask(20)
 
-    tracked_metrics = [
-        ("val_epi_mse_plan_cost", "min"),
-        ("val_epi_mse_plan_cost_scaled", "min"),
-        ("val_epi_avg_std_plan_cost", "min"),
-        ("val_plan_selection_regret_plan_cost_epinet", "min"),
-        ("val_plan_selection_regret_plan_cost_base", "min"),
-        ("val_plan_selection_regret_improvement_plan_cost", "max"),
-        ("val_marginal_nll_plan_cost_epinet_per_target", "min"),
-        ("val_marginal_nll_plan_cost_base_per_target", "min"),
-        ("val_marginal_nll_improvement_plan_cost_per_target", "max"),
-        ("val_joint_nll_improvement_plan_cost_per_target", "max"),
-        ("val_joint_dependence_improvement_plan_cost_per_target", "max"),
-        ("val_dyadic_joint_nll_improvement_plan_cost_per_target", "max"),
-        ("val_dyadic_joint_dependence_improvement_plan_cost_per_target", "max"),
-        ("val_loss_plan_cost_scaled", "min"),
-        ("val_loss_plan_cost_unscaled", "min"),
-        ("val_mape_plan_cost_scaled", "min"),
-        ("val_mape_plan_cost_unscaled", "min"),
-        ("val_loss_plan_cost_epinet", "min"),
-        ("train_loss", "min"),
-        ("val_calibration_error", "min"),
-        ("val_sharpness", "min"),
-    ]
-    for metric_prefix in (
-        "val_joint_gaussian_nll_plan_cost",
-        "val_joint_nll_plan_cost_no_epinet",
-        "val_joint_nll_plan_cost_independent_epinet",
-        "val_dyadic_joint_nll_plan_cost_epinet",
-        "val_dyadic_joint_nll_plan_cost_base",
-        "val_dyadic_joint_nll_plan_cost_independent_epinet",
-    ):
-        tracked_metrics.extend([
-            (metric_prefix, "min"),
-            (f"{metric_prefix}_per_target", "min"),
-            (f"{metric_prefix}_excess", "min"),
-            (f"{metric_prefix}_excess_per_target", "min"),
-        ])
-    train_summary = TrainSummary(tracked_metrics)
+    evaluate_test = queries_test is not None and query_plans_test is not None and not debug_single_batch
+    splits = ("val", "test") if evaluate_test else ("val",)
+    train_summary = TrainSummary(metric_names(splits, joint_taus))
     if objective_metric not in train_summary.best_values:
         raise ValueError(f"Unknown objective metric: {objective_metric}")
+    if not objective_metric.startswith("val_"):
+        raise ValueError(f"The objective must be a validation metric, got {objective_metric}")
 
     early_stopper = None
     if early_stopping_patience is not None:
@@ -735,12 +509,9 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
     generator = torch.Generator(device=device)
     epinet_cost_estimation.to(device)
 
-    # TODO: Temp removal shuffle = True for debug
     loader = DataLoader(queries_train, batch_size=query_batch_size, shuffle=True)
     loader_val = DataLoader(queries_val, batch_size=1, shuffle=False)
-
-    val_targets = {query: {"plan_cost": torch.tensor([plan[1] for plan in plans_val], device=device)}
-                   for query, plans_val in query_plans_val.items()}
+    loader_test = DataLoader(queries_test, batch_size=1, shuffle=False) if evaluate_test else None
 
     # Flag to overfit on a single batch to validate that the model works on very small data
     if debug_single_batch:
@@ -764,12 +535,7 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
         # Overwrite data loaders to only use the one training batch
         loader = DataLoader(subset_dataset, batch_size=query_batch_size, shuffle=False)
         loader_val = DataLoader(subset_dataset, batch_size=1, shuffle=False)
-
         query_plans_val = query_plans_train
-        val_targets = {
-            query: {"plan_cost": torch.tensor([plan[1] for plan in plans_train], device=device)}
-            for query, plans_train in query_plans_train.items()
-        }
 
     # TODO: Temp removal of freezing of cost estimation model parameters for debugging
     # Freeze cost estimation model parameters for epinet training
@@ -788,7 +554,8 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
 
     prior_scale = measure_prior_scale(
         loader, query_plans_train, train_cache, epinet_cost_estimation,
-        precomputed_indexes, precomputed_masks, alpha_mlp, alpha_ensemble, device
+        precomputed_indexes, precomputed_masks, alpha_mlp, alpha_ensemble, device,
+        zero_ensemble_prior=zero_ensemble_prior,
     )
 
     if prior_scale_target:
@@ -831,17 +598,29 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
     sleep(1)
 
     loss = torch.nn.MSELoss(reduction='mean')
+    reporter = RunReporter(writer.experiment_directory, use_tensorboard=use_tensorboard,
+                           write_figures=plot_calibration)
+    metrics_per_epoch = {}
 
     # noinspection PyTypeChecker
     total_train_queries = len(loader.dataset)
     pbar = tqdm(total=total_train_queries, position=0, leave=True, dynamic_ncols=True, mininterval=300)
 
+    def evaluate(split_loader, split_plans, split_name):
+        return validate_cached(
+            split_loader, split_plans, epinet_cost_estimation, val_cache, mean_train, std_train,
+            loss, device, n_epi_indexes_val, sigma, alpha_mlp, alpha_ensemble,
+            precomputed_indexes, precomputed_masks,
+            evaluation_noise_std, joint_taus, evaluation_seed,
+            split=split_name, zero_ensemble_prior=zero_ensemble_prior,
+        )
 
     for epoch in range(1, n_epochs + 1):
         batch_losses = []
         n_empty_plans = 0
         n_non_empty_plans = 0
         processed = 0
+        epoch_start = perf_counter()
 
         pbar.reset()
         pbar.set_description(f"Epoch {epoch}/{n_epochs} [Train]")
@@ -871,61 +650,61 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
                 precomputed_indexes, precomputed_masks,
                 epinet_cost_estimation, optimizer, loss,
                 n_epi_indexes_train, sigma, alpha_mlp, alpha_ensemble, generator, device,
-                l2_lambda=l2_lambda
+                l2_lambda=l2_lambda, anchor_seed=anchor_seed, zero_ensemble_prior=zero_ensemble_prior,
             )
 
             batch_losses.append(batch_loss)
             pbar.update(len(query_batch.query))
 
         epoch_train_loss = np.mean(batch_losses)
+        epoch_train_seconds = perf_counter() - epoch_start
 
-        # Validation is expensive: batch_size=1 over every validation query, n_epi_indexes_val
-        # index samples each, and six NLL variants per query. Running it every epoch is worth
-        # it for a final run and wasteful inside a sweep, where only the final ranking matters.
+        # Evaluation is expensive: batch_size=1 over every query, n_epi_indexes_val index
+        # samples each. Worth it every epoch for a final run, wasteful inside a sweep.
         is_last_epoch = epoch == n_epochs
         if validate_every > 1 and epoch % validate_every != 0 and not is_last_epoch:
-            pbar.update(0)
             continue
 
-        tracker = validate_cached(
-            loader_val, query_plans_val, val_targets, epinet_cost_estimation, val_cache, mean_train, std_train,
-            loss, device, n_epi_indexes_val, sigma, alpha_mlp, alpha_ensemble,
-            precomputed_indexes, precomputed_masks,
-            evaluation_noise_std, joint_tau, evaluation_seed, dyadic_num_pairs,
-        )
+        val_accumulator = evaluate(loader_val, query_plans_val, "val")
+        # The fitted-noise baseline is fitted on validation only and reused for test.
+        base_noise_std = val_accumulator.fitted_base_noise_std()
+        epoch_metrics, val_curves = val_accumulator.summarize(base_noise_std)
+        curves_per_split = {"val": val_curves}
+        del val_accumulator
+        if evaluate_test:
+            test_metrics, curves_per_split["test"] = evaluate(
+                loader_test, query_plans_test, "test"
+            ).summarize(base_noise_std)
+            epoch_metrics.update(test_metrics)
 
-        mean_metrics_val = tracker.summarize()
-        # The plot is a matplotlib figure written to disk every epoch; across a sweep that
-        # is thousands of PDFs nobody looks at. The scalars are computed either way.
-        calibration_error, sharpness = calculate_calibration_metrics(
-            tracker.p_values, tracker.distribution_variances, 100,
-            os.path.join(writer.get_epoch_dir(epoch), 'calibration_plot.pdf')
-            if plot_calibration else None
-        )
-
-        mean_metrics_val.update({
-            "train_loss": epoch_train_loss.item(),
-            "val_calibration_error": calibration_error.item(),
-            "val_sharpness": sharpness.item()
+        epoch_metrics.update({
+            "train_loss": float(epoch_train_loss),
+            "train_epoch_seconds": epoch_train_seconds,
         })
+        metrics_per_epoch[epoch] = epoch_metrics
+        train_summary.update(epoch_metrics, epoch)
 
-        train_summary.update(mean_metrics_val, epoch)
-
-        scheduler.step(train_loss=mean_metrics_val['train_loss'],
-                       val_metric=mean_metrics_val['val_loss_plan_cost_unscaled'])
+        scheduler.step(train_loss=epoch_metrics['train_loss'],
+                       val_metric=epoch_metrics['val_loss_plan_cost_unscaled'])
 
         best, per_epoch = train_summary.summary()
         writer.write_epoch_to_file([], best, per_epoch, epinet_cost_estimation, epoch)
+        reporter.log_epoch(epoch, writer.get_epoch_dir(epoch), epoch_metrics, curves_per_split)
 
-        tracker.reset_calibration_stats()
+        objective_value = epoch_metrics[objective_metric]
+        print(f"Epoch {epoch}: {objective_metric}={objective_value:.5f} | "
+              f"tau8 dependence gain val={epoch_metrics.get('val_jnll_tau8_dependence_gain', float('nan')):.4f}"
+              + (f" test={epoch_metrics.get('test_jnll_tau8_dependence_gain', float('nan')):.4f}"
+                 if evaluate_test else ""))
+
         if scheduler.get_last_lr() != previous_lr:
             print(f"INFO: Lr Updated from {previous_lr} to {scheduler.get_last_lr()}")
             previous_lr = scheduler.get_last_lr()
 
-        objective_value = mean_metrics_val[objective_metric]
         if trial:
             trial.report(objective_value, epoch)
             if trial.should_prune():
+                reporter.close()
                 train_cache.close()
                 val_cache.close()
                 raise optuna.TrialPruned()
@@ -939,8 +718,20 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             break
 
     pbar.close()
+    reporter.close()
     train_cache.close()
     val_cache.close()
+
+    best_epoch = train_summary.best_values[objective_metric]["epoch"]
+    if metrics_per_epoch:
+        # Written last, so its presence marks a finished run (used to skip done seeds).
+        write_json(os.path.join(writer.experiment_directory, "final_summary.json"), {
+            "objective_metric": objective_metric,
+            "best_epoch": best_epoch,
+            "last_epoch": max(metrics_per_epoch),
+            "metrics_at_best_epoch": metrics_per_epoch.get(best_epoch, {}),
+            "metrics_at_last_epoch": metrics_per_epoch[max(metrics_per_epoch)],
+        })
     return train_summary.best_values[objective_metric]
 
 
@@ -956,13 +747,12 @@ def main_simulated_epinet_training(cfg: DictConfig,
 
     debug_single_batch = OmegaConf.select(cfg, "debug.debug_single_batch", default=False)
     evaluation_noise_std = OmegaConf.select(cfg, "evaluation.noise_std", default=0.2)
-    joint_tau = OmegaConf.select(cfg, "evaluation.joint_tau", default=10)
+    joint_taus = OmegaConf.select(cfg, "evaluation.joint_taus", default=[1, 2, 4, 8, 16])
     evaluation_seed = OmegaConf.select(cfg, "evaluation.seed", default=0)
-    dyadic_num_pairs = OmegaConf.select(cfg, "evaluation.dyadic_num_pairs", default=8)
     objective_metric = OmegaConf.select(
         cfg,
         "training.objective_metric",
-        default="val_joint_gaussian_nll_plan_cost",
+        default="val_jnll_tau8_epinet_excess_per_target",
     )
     early_stopping_patience = OmegaConf.select(cfg, "training.early_stopping_patience", default=None)
     early_stopping_min_delta = OmegaConf.select(cfg, "training.early_stopping_min_delta", default=0.0)
@@ -1023,9 +813,8 @@ def main_simulated_epinet_training(cfg: DictConfig,
         weight_decay=cfg.hyperparameters.weight_decay,
         n_epochs=cfg.hyperparameters.n_epochs,
         evaluation_noise_std=evaluation_noise_std,
-        joint_tau=joint_tau,
+        joint_taus=joint_taus,
         evaluation_seed=evaluation_seed,
-        dyadic_num_pairs=dyadic_num_pairs,
         l2_mode=l2_mode,
         prior_scale_target=prior_scale_target,
         objective_metric=objective_metric,

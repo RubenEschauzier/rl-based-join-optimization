@@ -34,7 +34,8 @@ class TrainSummary:
 
     def update_best(self, values, epoch):
         for key, value in values.items():
-            if self.best_values[key]["type"] == "list":
+            # Only min/max metrics have a "best"; others ("list", "none") are just logged.
+            if self.best_values[key]["type"] not in ("min", "max"):
                 continue
             best_value = getattr(builtins, self.best_values[key]["type"])(value, self.best_values[key]["value"])
             # We found a better value

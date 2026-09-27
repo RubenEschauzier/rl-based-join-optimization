@@ -1,0 +1,73 @@
+defaults:
+  - simulated_supervised_cost_estimation_mixed_yago_train_epinet
+  - _self_
+
+# Full-data, multi-seed rerun of the best sweep configuration (study
+# mixed_yago_epinet_scale_sweep-a52a2de8, trial 85), for the paper numbers.
+#
+# Every trial-85 setting is pinned HERE rather than inherited: the base config changed
+# after the sweep ran (alpha 0.1 -> 1.0, prior_scale_target added, index dim 16 -> 30,
+# epinet_feature_mode mlp -> mlp_plus_plan), so inheriting would silently train a
+# different model. The only deliberate change is n_epi_indexes_train 32 -> 256.
+hyperparameters:
+  sigma: 0.033892799072006555
+  # prior_mix = 1.0 -> MLP prior only; the GNN-ensemble prior has weight 0 and is skipped.
+  alpha_mlp: 1.0
+  alpha_ensemble: 0.0
+  # The sweep ran without prior calibration.
+  prior_scale_target: null
+  epinet_index_dim: 16
+  epinet_hidden_dim: 64
+  prior_epinet_hidden_dim: 128
+  epinet_feature_mode: mlp
+  # Trial 85 used 32. More index samples per step reduce the Monte-Carlo part of the
+  # prior-cancellation error, i.e. less spurious spread on plans the model has learned.
+  n_epi_indexes_train: 256
+  n_epi_indexes_val: 200
+  lr: 0.001
+  weight_decay: 0.001
+  l2_mode: manual
+  query_batch_size: 8
+
+evaluation:
+  noise_std: 0.2
+  joint_taus: [1, 2, 4, 8, 16]
+  # Fixed across seeds: every seed is scored on the same plan groups and index samples,
+  # so seed-to-seed differences are differences between models, not between evaluations.
+  seed: 0
+
+rerun:
+  output_directory: experiments/experiment_outputs/mixed_yago/epinet_rerun_trial85
+  # One cache per seed: the frozen MLP prior is built from the seed. With alpha_ensemble
+  # 0 the expensive GNN-ensemble prior is never computed, so the cache stays small.
+  cache_root: .prior_cache/epinet_rerun_trial85
+
+  # The full experiment. The cross-seed summary is written once all of these finish.
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # What one invocation trains (both null = every seed in `seeds`, back to back):
+  #   rerun.seed=3            one seed
+  #   rerun.run_seeds=[0,1]   these seeds, back to back in one process
+  # To run several seeds AT THE SAME TIME on one GPU, use launch_seeds_parallel instead.
+  # Seeds with a final_summary.json are skipped, so a pre-empted job can be resubmitted.
+  seed: null
+  run_seeds: null
+
+  # Held-out test split, carved from the original validation file (train is untouched).
+  # The queries the sweep validated on -- and therefore selected trial 85 with -- are
+  # forced into the validation side, so the test set never influenced any choice.
+  # The split is identical for every seed and saved as split.json in the output dir.
+  test_fraction: 0.5
+  split_seed: 0
+  sweep_validation_fraction: 0.05
+  sweep_validation_seed: 1
+
+  n_epochs: 30
+  validate_every: 1
+  objective_metric: val_jnll_tau8_epinet_excess_per_target
+  # Counted in validation events (= epochs here).
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0001
+  early_stopping_min_epochs: 8
+
+  write_figures: true
+  tensorboard: true

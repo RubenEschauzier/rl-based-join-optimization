@@ -51,37 +51,6 @@ def test_plan_sampling_is_reproducible_and_shared_across_models():
     assert torch.unique(first_indices).numel() == 6
 
 
-def test_dyadic_sampling_is_reproducible_and_uses_two_anchors_per_group():
-    loss = GaussianJointLogLoss(noise_std=0.2, tau=10)
-    first_generator = torch.Generator().manual_seed(23)
-    second_generator = torch.Generator().manual_seed(23)
-
-    first_indices = loss.sample_dyadic_plan_indices(
-        20,
-        8,
-        torch.device("cpu"),
-        first_generator,
-    )
-    second_indices = loss.sample_dyadic_plan_indices(
-        20,
-        8,
-        torch.device("cpu"),
-        second_generator,
-    )
-
-    assert torch.equal(first_indices, second_indices)
-    assert first_indices.shape == (8, 10)
-    assert all(torch.unique(group).numel() == 2 for group in first_indices)
-
-
-def test_dyadic_sampling_repeats_the_only_available_plan():
-    loss = GaussianJointLogLoss(noise_std=0.2, tau=4)
-
-    indices = loss.sample_dyadic_plan_indices(1, 3, torch.device("cpu"))
-
-    assert torch.equal(indices, torch.zeros((3, 4), dtype=torch.long))
-
-
 def test_predictive_calibration_includes_gaussian_observation_noise():
     targets = np.array([0.0, 1.0])
     epistemic_means = np.array([
@@ -106,10 +75,3 @@ def test_predictive_calibration_includes_gaussian_observation_noise():
 def test_joint_loss_rejects_invalid_evaluation_parameters(noise_std, tau):
     with pytest.raises(ValueError):
         GaussianJointLogLoss(noise_std=noise_std, tau=tau)
-
-
-def test_dyadic_sampling_rejects_invalid_pair_count():
-    loss = GaussianJointLogLoss(noise_std=0.2, tau=4)
-
-    with pytest.raises(ValueError, match="n_pairs"):
-        loss.sample_dyadic_plan_indices(4, 0, torch.device("cpu"))

@@ -1,4 +1,6 @@
 import gc
+import hashlib
+import json
 import os
 import shutil
 from functools import partial
@@ -18,6 +20,34 @@ from src.supervised_value_estimation.supervised_value_estimation_cached_prior im
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
 from src.utils.training_utils.query_loading_utils import prepare_data
 from src.utils.training_utils.training_tracking import ExperimentWriter
+
+
+def _study_name_for_search_space(cfg) -> str:
+    """Append a fingerprint of the search space to the configured study name.
+
+    Optuna stores a distribution per parameter and refuses to change it
+    ("CategoricalDistribution does not support dynamic value space"), so editing any value
+    list invalidates the study -- and resuming into it fails at the first trial that
+    samples the changed parameter. Fingerprinting means an edited space transparently
+    starts a new study while an unchanged one still resumes.
+    """
+    select = lambda key, default=None: OmegaConf.select(cfg, key, default=default)
+    space = {
+        "sigma": [select("sweep.sigma_min"), select("sweep.sigma_max")],
+        "lr": [select("sweep.tune_lr"), select("sweep.lr_min"), select("sweep.lr_max")],
+        "prior_mix": [select("sweep.tune_prior_mix", False),
+                      list(select("sweep.prior_mix_values", []) or []),
+                      list(select("sweep.alpha_values", []) or [])],
+        "widths": [select("sweep.tune_widths", False),
+                   list(select("sweep.epinet_hidden_values", []) or []),
+                   list(select("sweep.prior_epinet_hidden_values", []) or [])],
+        "index_dim": [select("sweep.tune_index_dim", False),
+                      list(select("sweep.epinet_index_dim_values", []) or [])],
+        "n_epi_indexes": [select("sweep.tune_n_epi_indexes", False),
+                          list(select("sweep.n_epi_indexes_values", []) or [])],
+    }
+    digest = hashlib.sha1(json.dumps(space, sort_keys=True).encode()).hexdigest()[:8]
+    return f"{cfg.sweep.study_name}-{digest}"
 
 
 def _resolve_model_paths(cfg):
@@ -256,9 +286,8 @@ def _objective(trial, cfg, prepared_data, device, output_directory, cache_root):
             validate_every=select("sweep.validate_every", default=1),
             plot_calibration=select("sweep.plot_calibration", default=False),
             evaluation_noise_std=cfg.evaluation.noise_std,
-            joint_tau=cfg.evaluation.joint_tau,
+            joint_taus=cfg.evaluation.joint_taus,
             evaluation_seed=cfg.evaluation.seed,
-            dyadic_num_pairs=cfg.evaluation.dyadic_num_pairs,
             objective_metric=cfg.sweep.objective_metric,
             early_stopping_patience=cfg.sweep.early_stopping_patience,
             early_stopping_min_delta=cfg.sweep.early_stopping_min_delta,
@@ -306,8 +335,17 @@ def main(cfg: DictConfig):
         n_warmup_steps=cfg.sweep.pruner_warmup_epochs,
         interval_steps=1,
     )
+    study_name = _study_name_for_search_space(cfg)
+    existing = optuna.study.get_all_study_names(f"sqlite:///{storage_path}") \
+        if storage_path.exists() else []
+    print(f"Study: {study_name}"
+          f"{'  (resuming)' if study_name in existing else '  (new -- search space changed)'}")
+    for other in existing:
+        if other != study_name:
+            print(f"  sibling study in this storage, left untouched: {other}")
+
     study = optuna.create_study(
-        study_name=cfg.sweep.study_name,
+        study_name=study_name,
         storage=f"sqlite:///{storage_path}",
         load_if_exists=True,
         direction="minimize",

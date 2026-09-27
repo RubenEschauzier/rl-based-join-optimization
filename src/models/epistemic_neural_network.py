@@ -20,6 +20,7 @@ if project_root not in sys.path:
 
 from src.models.model_instantiator import ModelFactory
 from src.utils.tree_conv_utils import get_shared_structure, apply_features_to_structure
+from src.models.model_layers.batched_ensemble_plan_cost import BatchedEnsemblePlanCost
 from src.models.query_plan_prediction_model import QueryPlansPredictionModel, PlanCostEstimatorTiny, \
     PlanCostEstimatorFull
 
@@ -123,6 +124,13 @@ class MultiHeadEpistemicNetwork(nn.Module):
         for combined_prior in self.ensemble_combined_prior_models:
             for param in combined_prior.parameters():
                 param.requires_grad = False
+
+        # Evaluating the ensemble as a Python loop over members is ~56% of all epinet time
+        # and dominates planning latency; the members are tiny, so it is kernel-launch
+        # bound rather than compute bound. This snapshot runs them as grouped ops instead,
+        # to within float32 noise. Priors are frozen, so a snapshot stays valid -- except
+        # after load_state_dict, which calls refresh_batched_ensemble().
+        self.refresh_batched_ensemble()
 
         # Initialize learnable epinet with bae feature extractor and multiple heads
         self.learnable_epinet_features = nn.Sequential(
@@ -229,9 +237,27 @@ class MultiHeadEpistemicNetwork(nn.Module):
 
         return prepared_trees_list, prepared_indexes, prepared_masks
 
-    def compute_ensemble_prior_from_prepared(self, prepared_trees_list, prepared_indexes, prepared_masks):
-        """Pure PyTorch forward pass for priors. Runs on CPU, returns to main device."""
+    def refresh_batched_ensemble(self):
+        """(Re)snapshot the frozen ensemble weights into the grouped-op evaluator.
+
+        Must be called after anything that changes the prior members' weights, i.e. after
+        loading a checkpoint. The snapshot buffers are non-persistent, so they never enter
+        a state_dict and cannot go stale on disk.
+        """
+        members = [model.query_plan_model for model in self.ensemble_combined_prior_models]
+        self.batched_ensemble_prior = BatchedEnsemblePlanCost.from_members(
+            members, head_name=self.head_names[0]
+        ).to(self.device)
+
+    def compute_ensemble_prior_from_prepared(self, prepared_trees_list, prepared_indexes, prepared_masks,
+                                             use_batched=True):
+        """Forward pass for the frozen priors, returning {head: (epi_index_dim, n_plans)}."""
         with torch.no_grad():
+            if use_batched and len(self.head_names) == 1:
+                stacked = torch.cat(prepared_trees_list, dim=1)
+                values = self.batched_ensemble_prior(stacked, prepared_indexes, prepared_masks)
+                return {self.head_names[0]: values.to(self.device)}
+
             num_plans = prepared_trees_list[0].shape[0]
             num_ensembles = self.epi_index_dim
 
@@ -428,6 +454,8 @@ class MultiHeadEpistemicNetwork(nn.Module):
                 missing, unexpected = self.load_state_dict(checkpoint['state_dict'], strict=strict)
             else:
                 raise ValueError("Checkpoint does not contain 'state_dict'. It might be a raw cost model file.")
+            # Prior weights may have changed; the grouped snapshot must follow them.
+            self.refresh_batched_ensemble()
         if not strict:
             if diff_filter:
                 pattern = re.compile(diff_filter)

@@ -14,7 +14,7 @@ sweep:
   # between configurations, not final numbers, so this trades absolute quality for
   # throughput. Normalisation statistics are still computed on the full training set, so
   # the target scale does not drift. Re-validate the winning trial on the full data.
-  data_fraction: 0.25
+  data_fraction: 0.05
   data_subset_seed: 0
   subsample_validation: true
 
@@ -27,7 +27,7 @@ sweep:
   # from the anchor vectors has std 1/sqrt(D), i.e. 0.18 at D=30. Costly, though --
   # one prior GNN per dimension, and the prior cache scales linearly with it.
   tune_index_dim: true
-  epinet_index_dim_values: [16, 32, 64, 128]
+  epinet_index_dim_values: [16, 32, 64]
 
   # Num sampled epinet indexes. Monte-carlo simulation has irreducible variance,
   # so higher is better
@@ -52,8 +52,10 @@ sweep:
   lr_min: 0.0005
   lr_max: 0.002
 
-  # Minimize natural-query excess joint NLL per target.
-  objective_metric: val_joint_gaussian_nll_plan_cost_excess_per_target
+  # Minimize natural-query excess joint NLL per target at tau = 8. Renamed from
+  # val_joint_gaussian_nll_plan_cost_excess_per_target, which also padded queries with
+  # fewer than 8 plans by repeating plans; the current metric skips those queries.
+  objective_metric: val_jnll_tau8_epinet_excess_per_target
   early_stopping_min_epochs: 15
   # Counted in VALIDATION events, not epochs. With validate_every: 3 a patience of 8 would
   # be 24 epochs and could never fire inside max_epochs: 30.

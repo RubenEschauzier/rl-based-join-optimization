@@ -72,8 +72,9 @@ execution:
 evaluation:
   # Shared Gaussian observation noise in standardized target space.
   noise_std: 0.2
-  joint_tau: 8
-  dyadic_num_pairs: 8
+  # Group sizes for the joint NLL. Each tau is scored only on queries with >= tau
+  # distinct plans (no padding with repeated plans); *_n_queries reports coverage.
+  joint_taus: [1, 2, 4, 8, 16]
   seed: 0
 
 debug:

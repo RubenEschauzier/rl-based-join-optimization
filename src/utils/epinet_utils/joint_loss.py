@@ -90,27 +90,6 @@ class GaussianJointLogLoss(nn.Module):
             generator=generator,
         )
 
-    def sample_dyadic_plan_indices(self, n_plans, n_pairs, device, generator=None):
-        if n_plans <= 0:
-            raise ValueError("n_plans must be greater than zero")
-        if n_pairs <= 0:
-            raise ValueError("n_pairs must be greater than zero")
-        if n_plans == 1:
-            return torch.zeros((n_pairs, self.tau), dtype=torch.long, device=device)
-
-        dyadic_groups = []
-        for _ in range(n_pairs):
-            anchors = torch.randperm(n_plans, device=device, generator=generator)[:2]
-            anchor_choices = torch.randint(
-                0,
-                2,
-                (self.tau,),
-                device=device,
-                generator=generator,
-            )
-            dyadic_groups.append(anchors[anchor_choices])
-        return torch.stack(dyadic_groups)
-
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor, plan_indices=None):
         """
         predictions: Tensor of shape [K, n_plans]
