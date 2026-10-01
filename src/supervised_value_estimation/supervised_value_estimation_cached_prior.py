@@ -121,7 +121,7 @@ def validate_cached(val_loader, query_plans_val, epinet_cost_estimation, val_cac
     """One pass over a split, returning a SplitAccumulator of per-query statistics.
 
     Metrics that depend on the fitted base-noise baseline are produced by
-    `accumulator.summarize(base_noise_std)` afterwards, so validation can fit the noise
+    `accumulator.summarize(base_noise_std, epinet_noise_std)` afterwards, so validation can fit the noise
     and test can reuse it without a second pass.
     """
     accumulator = SplitAccumulator(split, joint_taus, evaluation_noise_std, std_vals[head_name])
@@ -666,15 +666,17 @@ def train_simulated_epinet_cached(queries_train: QueryCardinalityDataset, query_
             continue
 
         val_accumulator = evaluate(loader_val, query_plans_val, "val")
-        # The fitted-noise baseline is fitted on validation only and reused for test.
+        # Both fitted noise stds (base network and epinet) are fitted on validation only
+        # and reused for test, so no fitted model ever sees the test residuals.
         base_noise_std = val_accumulator.fitted_base_noise_std()
-        epoch_metrics, val_curves = val_accumulator.summarize(base_noise_std)
+        epinet_noise_std = val_accumulator.fitted_epinet_noise_std()
+        epoch_metrics, val_curves = val_accumulator.summarize(base_noise_std, epinet_noise_std)
         curves_per_split = {"val": val_curves}
         del val_accumulator
         if evaluate_test:
             test_metrics, curves_per_split["test"] = evaluate(
                 loader_test, query_plans_test, "test"
-            ).summarize(base_noise_std)
+            ).summarize(base_noise_std, epinet_noise_std)
             epoch_metrics.update(test_metrics)
 
         epoch_metrics.update({

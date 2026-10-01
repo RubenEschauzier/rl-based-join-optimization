@@ -18,15 +18,32 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 # Categorical slots in fixed order (validated for CVD separation). Two of them sit below
 # 3:1 contrast on white, so every series also gets a marker, a line style and a legend.
+BLUE, ORANGE, AQUA, YELLOW, MAGENTA = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"
 MODEL_STYLES = {
-    "epinet": {"color": "#2a78d6", "marker": "o", "linestyle": "-", "label": "Epinet"},
-    "independent": {"color": "#eb6834", "marker": "s", "linestyle": "--",
-                    "label": "Epinet, samples shuffled across plans"},
-    "base_fixed": {"color": "#1baf7a", "marker": "^", "linestyle": "-.",
-                   "label": "Base, fixed noise"},
-    "base_fitted": {"color": "#eda100", "marker": "D", "linestyle": ":",
-                    "label": "Base, fitted noise"},
+    "epinet_fitted": {"color": BLUE, "marker": "o", "linestyle": "-", "label": "Epinet, fitted noise"},
+    "independent_fitted": {"color": ORANGE, "marker": "s", "linestyle": "--",
+                           "label": "Epinet, fitted noise, samples shuffled across plans"},
+    "base_fixed": {"color": AQUA, "marker": "^", "linestyle": "-.", "label": "Base, fixed noise"},
+    "base_fitted": {"color": YELLOW, "marker": "D", "linestyle": ":", "label": "Base, fitted noise"},
+    "epinet": {"color": MAGENTA, "marker": "v", "linestyle": (0, (6, 2)), "label": "Epinet, fixed noise"},
+    # Only drawn for curves written before the fitted-noise evaluation existed.
+    "independent": {"color": ORANGE, "marker": "s", "linestyle": "--",
+                    "label": "Epinet, fixed noise, samples shuffled across plans"},
 }
+
+
+def joint_models_to_plot(curves):
+    """Fitted-noise models first; the fixed-noise shuffle control only as a fallback."""
+    available = curves["jnll_excess_per_target"]
+    models = [m for m in ("epinet_fitted", "independent_fitted", "base_fixed", "base_fitted", "epinet")
+              if m in available]
+    if "independent_fitted" not in available and "independent" in available:
+        models.insert(1, "independent")
+    return models
+
+
+def calibration_models_to_plot(curves):
+    return [m for m in ("epinet_fitted", "epinet", "base_fitted") if m in curves["calibration"]]
 REFERENCE_COLOR = "#52514e"
 INK = "#0b0b0b"
 GRID = "#e4e3df"
@@ -73,9 +90,9 @@ def plot_split_report(curves, title, save_path=None):
 
     axis = axes[0, 0]
     taus = curves["taus"]
-    for model, style in MODEL_STYLES.items():
+    for model in joint_models_to_plot(curves):
         values = [math.nan if v is None else v for v in curves["jnll_excess_per_target"][model]]
-        axis.plot(taus, values, linewidth=2, markersize=7, **style)
+        axis.plot(taus, values, linewidth=2, markersize=7, **MODEL_STYLES[model])
     axis.axhline(0.0, color=REFERENCE_COLOR, linewidth=1, linestyle="--")
     axis.set_xscale("log", base=2)
     axis.set_xticks(taus)
@@ -87,7 +104,7 @@ def plot_split_report(curves, title, save_path=None):
     axis = axes[0, 1]
     selective = curves["selective"]
     axis.plot(selective["coverage"], selective["epinet"], linewidth=2,
-              color=MODEL_STYLES["epinet"]["color"], label="Epinet (drop most uncertain)")
+              color=BLUE, label="Epinet (drop most uncertain)")
     axis.plot(selective["coverage"], selective["oracle"], linewidth=1.5, linestyle="--",
               color=REFERENCE_COLOR, label="Oracle (drop largest errors)")
     axis.axhline(selective["random"], linewidth=1.5, linestyle=":", color=REFERENCE_COLOR,
@@ -99,15 +116,22 @@ def plot_split_report(curves, title, save_path=None):
     axis = axes[1, 0]
     calibration = curves["calibration"]
     axis.plot([0, 1], [0, 1], color=REFERENCE_COLOR, linewidth=1, linestyle="--", label="Perfect calibration")
-    for model in ("epinet", "base_fitted"):
+    for model in calibration_models_to_plot(curves):
         style = MODEL_STYLES[model]
         axis.plot(calibration["expected"], calibration[model], linewidth=2,
                   color=style["color"], linestyle=style["linestyle"], label=style["label"])
     coverage = curves["coverage"]
+    fitted = coverage.get("epinet_fitted")
     coverage_text = "\n".join(
-        f"{int(round(level * 100))}% interval: epinet {e:.1%} · base {b:.1%}"
-        for level, e, b in zip(coverage["levels"], coverage["epinet"], coverage["base_fitted"])
+        f"{int(round(level * 100))}% interval: "
+        + (f"epinet fitted {fitted[i]:.1%} · " if fitted else "")
+        + f"epinet fixed {coverage['epinet'][i]:.1%} · base {coverage['base_fitted'][i]:.1%}"
+        for i, level in enumerate(coverage["levels"])
     )
+    noise = curves.get("noise")
+    if noise:
+        coverage_text += (f"\nnoise std: epinet fitted {noise['epinet_fitted']:.3g} · "
+                          f"fixed {noise['epinet_fixed']:.3g} · base fitted {noise['base_fitted']:.3g}")
     axis.text(0.98, 0.04, coverage_text, transform=axis.transAxes, ha="right", va="bottom",
               fontsize=8.5, color=INK)
     _style_axis(axis, "Calibration", "Predicted quantile", "Observed fraction below")
@@ -116,8 +140,7 @@ def plot_split_report(curves, title, save_path=None):
     axis = axes[1, 1]
     regret = curves["regret"]
     labels = {"base": "Base mean", "epinet_mean": "Epinet mean", "epinet_thompson": "Epinet Thompson"}
-    colors = {"base": MODEL_STYLES["base_fixed"]["color"], "epinet_mean": MODEL_STYLES["epinet"]["color"],
-              "epinet_thompson": MODEL_STYLES["independent"]["color"]}
+    colors = {"base": AQUA, "epinet_mean": BLUE, "epinet_thompson": ORANGE}
     names = list(labels)
     bars = axis.bar([labels[n] for n in names], [regret[n] for n in names],
                     color=[colors[n] for n in names], width=0.6, edgecolor="white", linewidth=2)

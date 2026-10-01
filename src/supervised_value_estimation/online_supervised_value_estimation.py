@@ -616,7 +616,7 @@ def train_step(model, optimizer, normalizers,
                                              intermediate_join_target,
                                              valid_intermediate_join_mask)
 
-    # # Right censored loss to reflect that timeouts mean the plan would take at least timeout seconds
+    # Right censored loss to reflect that timeouts mean the plan would take at least timeout seconds
     normalized_threshold = normalizers["latency"].normalize(torch.tensor(np.log1p(client_default_timeout))).item()
 
     # All perturbed targets have shape (n_epinet_indexes * batch_size) in n_epinet_indexes blocks of batch_size

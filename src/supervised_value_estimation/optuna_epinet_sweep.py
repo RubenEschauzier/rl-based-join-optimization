@@ -98,7 +98,7 @@ def _prepare_datasets_and_plans(cfg, device):
     train_plan_dict = {key: value for batch in train_data for key, value in batch.items()}
     val_plan_dict = {key: value for batch in val_data for key, value in batch.items()}
     # Normalisation statistics are taken from the FULL training set before subsampling,
-    # so mean/std -- and therefore the target scale every metric is reported in -- do not
+    # so mean/stdand, therefore the target scale every metric is reported in, do not
     # drift with the sweep fraction.
     train_plans, mean_cost, std_cost = preprocess_plans(train_plan_dict)
     val_plans, _, _ = preprocess_plans(val_plan_dict, mean_cost, std_cost)

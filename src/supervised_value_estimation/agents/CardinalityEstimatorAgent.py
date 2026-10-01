@@ -20,25 +20,56 @@ class CardinalityEstimatorValidationAgent(AbstractCostAgent):
 
     def setup_episode(self, query):
         """
-        Starts a search episode. Samples a single z and embeds the query based on this z
+        Starts a search episode for one query and clears the per-query cardinality cache.
         :param query:
         :return:
         """
         self.current_query = query
+        self.cardinality_cache = {}
         return
 
     def estimate_costs(self, possible_next, query_state):
-        # Construct subqueries from plans
-        sub_queries = [self.reduced_form_query(self.current_query.to_data_list()[0], plan) for plan in possible_next]
+        """Estimated C_out of each candidate prefix, the cost JoinPlan and the DP use:
 
-        # For ML-based methods (like GNCE) we pass the features as batch
+            min(card(p1), card(p2)) + card({p1, p2}) + card({p1, p2, p3}) + ...
+
+        Ranking by the cardinality of the newest intermediate alone is not a plan cost: at
+        the last depth every candidate joins the same full set, so all scores tie and the
+        final choice among the beam is arbitrary. The first join counts its cheaper side,
+        since beam_search emits each first pair in only one orientation.
+        """
+        self._estimate_cardinalities(possible_next)
+        return ([self._prefix_cost(plan) for plan in possible_next],
+                [None for _ in range(len(possible_next))])
+
+    def _estimate_cardinalities(self, plans):
+        """Estimate every sub-query the plans need that this episode has not seen yet."""
+        needed = {}
+        for plan in plans:
+            for sub_plan in [plan[1:2]] + [plan[:size] for size in range(1, len(plan) + 1)]:
+                key = frozenset(sub_plan)
+                if key not in self.cardinality_cache and key not in needed:
+                    needed[key] = sorted(sub_plan)
+        if not needed:
+            return
+        query = self.current_query.to_data_list()[0]
+        sub_queries = [self.reduced_form_query(query, join_order) for join_order in needed.values()]
+        # For ML-based methods (like GNCE) we pass the features as batch; cardinality
+        # estimators in G-Care get the sub-query strings.
         if self.estimator_requires_features:
-            batch = Batch.from_data_list(sub_queries)
-            estimates = self.estimator_fn(batch)
-            return estimates, [None for _ in range(len(possible_next))]
+            estimates = self.estimator_fn(Batch.from_data_list(sub_queries))
+        else:
+            estimates = self.estimator_fn(sub_queries)
+        estimates = torch.as_tensor(estimates, dtype=torch.float64).reshape(-1).tolist()
+        for key, estimate in zip(needed, estimates):
+            self.cardinality_cache[key] = estimate
 
-        # For cardinality estimators in G-Care we pass the subqueries to the estimator
-        return self.estimator_fn(sub_queries), [None for _ in range(len(possible_next))]
+    def _prefix_cost(self, plan):
+        cache = self.cardinality_cache
+        cost = min(cache[frozenset(plan[:1])], cache[frozenset(plan[1:2])])
+        for size in range(2, len(plan) + 1):
+            cost += cache[frozenset(plan[:size])]
+        return cost
 
     def reduced_form_query(self, query, join_order, device=torch.device('cpu')):
         # Only get set join_order, slice out all unset 0 padding entries of join order array

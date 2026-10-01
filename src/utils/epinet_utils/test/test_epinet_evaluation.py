@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from src.utils.epinet_utils.epinet_evaluation import (
+    NOISE_GRID,
     SplitAccumulator,
     excess_constant,
     metric_mode,
@@ -169,3 +170,66 @@ def test_train_summary_logs_directionless_metrics_without_ranking_them():
     best, per_epoch = summary.summary()
     assert per_epoch["val_jnll_tau8_n_queries"] == [5, 7]
     assert best["train_loss"]["epoch"] == 2
+
+
+def test_noise_grid_nll_matches_the_joint_loss_at_the_fixed_noise():
+    samples, base, targets = _random_query(20, seed=3, shared_error=0.4)
+    statistics = query_statistics(samples, base, targets, NOISE, TAUS, seed=3, std_cost=1.0)
+    fixed_index = int(np.argmin(np.abs(NOISE_GRID - NOISE)))
+    assert NOISE_GRID[fixed_index] == pytest.approx(NOISE)
+    for tau in TAUS:
+        assert statistics["joint"][tau]["epinet_grid"][fixed_index] == pytest.approx(
+            statistics["joint"][tau]["epinet"], rel=1e-5)
+        assert statistics["joint"][tau]["independent_grid"][fixed_index] == pytest.approx(
+            statistics["joint"][tau]["independent"], rel=1e-5)
+
+
+def test_fitted_epinet_noise_recovers_the_residual_std_without_epistemic_spread():
+    generator = torch.Generator().manual_seed(0)
+    queries = []
+    for _ in range(20):
+        targets = torch.randn(30, generator=generator)
+        base = targets + 0.3 * torch.randn(30, generator=generator)
+        queries.append((base.repeat(8, 1), base, targets))
+    accumulator = SplitAccumulator("val", TAUS, NOISE, 1.0)
+    for index, (samples, base, targets) in enumerate(queries):
+        accumulator.add(query_statistics(samples, base, targets, NOISE, TAUS, seed=index, std_cost=1.0))
+    assert accumulator.fitted_epinet_noise_std() == pytest.approx(0.3, rel=0.1)
+
+
+def test_fitted_noise_drops_when_the_epistemic_spread_already_covers_the_error():
+    generator = torch.Generator().manual_seed(1)
+    accumulator = SplitAccumulator("val", TAUS, NOISE, 1.0)
+    for index in range(20):
+        targets = torch.randn(30, generator=generator)
+        base = targets.clone()
+        # Samples spread ~0.2 around a mean that is itself ~0.2 off: the spread alone
+        # explains the error, so adding a further 0.2 of noise double counts it.
+        mean = targets + 0.2 * torch.randn(30, generator=generator)
+        samples = mean + 0.2 * torch.randn(64, 30, generator=generator)
+        accumulator.add(query_statistics(samples, base, targets, NOISE, TAUS, seed=index, std_cost=1.0))
+    fitted = accumulator.fitted_epinet_noise_std()
+    assert fitted < 0.1
+    metrics, curves = accumulator.summarize(accumulator.fitted_base_noise_std(), fitted)
+    assert metrics["val_jnll_tau1_epinet_fitted_excess_per_target"] < metrics["val_jnll_tau1_epinet_excess_per_target"]
+    assert metrics["val_coverage50_epinet_fitted"] < metrics["val_coverage50_epinet"]
+    assert metrics["val_jnll_tau1_dependence_gain_fitted"] == pytest.approx(0.0, abs=1e-6)
+    assert curves["noise"]["epinet_fitted"] == fitted
+
+
+def test_fitted_noise_never_scores_worse_than_the_fixed_noise_where_it_was_fitted():
+    accumulator = SplitAccumulator("val", TAUS, NOISE, 2.0)
+    for index in range(6):
+        samples, base, targets = _random_query(12, seed=index, shared_error=0.3)
+        accumulator.add(query_statistics(samples, base, targets, NOISE, TAUS, seed=index, std_cost=2.0))
+    metrics, _ = accumulator.summarize(accumulator.fitted_base_noise_std())
+    assert (metrics["val_jnll_tau1_epinet_fitted_excess_per_target"]
+            <= metrics["val_jnll_tau1_epinet_excess_per_target"] + 1e-9)
+
+
+def test_summarize_rejects_a_noise_that_is_not_on_the_grid():
+    accumulator = SplitAccumulator("val", TAUS, NOISE, 1.0)
+    samples, base, targets = _random_query(10, seed=0)
+    accumulator.add(query_statistics(samples, base, targets, NOISE, TAUS, seed=0, std_cost=1.0))
+    with pytest.raises(ValueError, match="NOISE_GRID"):
+        accumulator.summarize(0.1, epinet_noise_std=0.123456)

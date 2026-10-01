@@ -28,24 +28,35 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from scipy import stats  # noqa: E402
 
-from src.utils.epinet_utils.epinet_report import INK, MODEL_STYLES, REFERENCE_COLOR, _style_axis  # noqa: E402
+from src.utils.epinet_utils.epinet_report import (  # noqa: E402
+    AQUA, BLUE, INK, MODEL_STYLES, ORANGE, REFERENCE_COLOR, _style_axis,
+    calibration_models_to_plot, joint_models_to_plot,
+)
+
+# Written by evaluate_epinet_checkpoints: the best checkpoint re-scored with the epinet's
+# observation noise fitted on validation. When present it overrides the training-time
+# metrics and curves of that epoch (the model is identical; only the scoring differs).
+NOISE_FITTED_DIRECTORY = "noise_fitted_eval"
 
 SECTIONS = [
     ("Point accuracy (does the uncertainty cost accuracy?)", r"_(mse_scaled|qerror)_"),
     ("Joint NLL (excess per target, 0 = optimal)", r"_jnll_tau\d+_\w+_excess_per_target$"),
-    ("Joint NLL gains (positive = epinet better)", r"_jnll_tau\d+_(dependence_gain|gain_vs_base_fitted|gain_vs_base_fixed)$"),
+    ("Joint NLL gains (positive = epinet better)",
+     r"_jnll_tau\d+_(dependence_gain(_fitted)?|(fitted_)?gain_vs_base_fitted|gain_vs_base_fixed)$"),
     ("Joint NLL coverage (queries with >= tau plans)", r"_jnll_tau\d+_n_queries$"),
     ("Selective prediction", r"_(aurc|selective_skill|mse_at_coverage)"),
-    ("Calibration", r"_(calibration_error|coverage|sharpness|epistemic_std_mean|base_noise_std)"),
+    ("Calibration", r"_(calibration_error|coverage|sharpness|epistemic_std_mean|noise_std)"),
     ("Plan selection (log-cost regret; exp = cost ratio)", r"_(regret|optimal_rate)_"),
     ("Cost", r"(_ms_per_query_|_eval_seconds$|^train_epoch_seconds$)"),
 ]
 TRAINING_CURVE_METRICS = [
-    ("jnll_tau8_epinet_excess_per_target", "Joint NLL τ=8, epinet (excess)"),
-    ("jnll_tau8_dependence_gain", "Dependence gain τ=8 (vs shuffled)"),
-    ("jnll_tau8_gain_vs_base_fitted", "Gain τ=8 vs base, fitted noise"),
+    ("jnll_tau8_epinet_excess_per_target", "Joint NLL τ=8, epinet, fixed noise"),
+    ("jnll_tau8_dependence_gain", "Dependence gain τ=8, fixed noise"),
+    ("jnll_tau8_gain_vs_base_fitted", "Gain τ=8 vs base (fitted), epinet fixed noise"),
     ("selective_skill", "Selective-prediction skill"),
-    ("calibration_error_epinet", "Calibration error, epinet"),
+    ("jnll_tau8_dependence_gain_fitted", "Dependence gain τ=8, fitted noise"),
+    ("jnll_tau8_fitted_gain_vs_base_fitted", "Gain τ=8 vs base, both fitted"),
+    ("calibration_error_epinet_fitted", "Calibration error, epinet fitted noise"),
     ("mse_scaled_epinet", "MSE of epinet mean (standardized)"),
 ]
 
@@ -96,7 +107,8 @@ def _section_of(metric):
 
 def _table(final):
     rows = []
-    metric_columns = [c for c in final.columns if c not in ("seed", "best_epoch", "finished", "epoch")]
+    metric_columns = [c for c in final.columns
+                      if c not in ("seed", "best_epoch", "finished", "epoch", "noise_fitted_eval")]
     for metric in metric_columns:
         mean, std, half_width, n = _confidence_interval(final[metric].tolist())
         values = final[metric].dropna()
@@ -163,7 +175,11 @@ def _plot_test_report(curves_by_seed, path, split="test"):
 
     axis = axes[0, 0]
     taus = curves[0]["taus"]
-    for model, style in MODEL_STYLES.items():
+    # Only models every seed has, so a mix of old and re-scored curves never breaks the plot.
+    models = [m for m in joint_models_to_plot(curves[0])
+              if all(m in c["jnll_excess_per_target"] for c in curves)]
+    for model in models:
+        style = MODEL_STYLES[model]
         matrix = [[math.nan if v is None else v for v in c["jnll_excess_per_target"][model]] for c in curves]
         _band(axis, taus, matrix, style["color"], style["label"], style["linestyle"], style["marker"])
     axis.axhline(0.0, color=REFERENCE_COLOR, linewidth=1, linestyle="--")
@@ -176,7 +192,7 @@ def _plot_test_report(curves_by_seed, path, split="test"):
 
     axis = axes[0, 1]
     coverage = curves[0]["selective"]["coverage"]
-    _band(axis, coverage, [c["selective"]["epinet"] for c in curves], MODEL_STYLES["epinet"]["color"],
+    _band(axis, coverage, [c["selective"]["epinet"] for c in curves], BLUE,
           "Epinet (drop most uncertain)")
     _band(axis, coverage, [c["selective"]["oracle"] for c in curves], REFERENCE_COLOR,
           "Oracle (drop largest errors)", "--")
@@ -189,7 +205,9 @@ def _plot_test_report(curves_by_seed, path, split="test"):
     axis = axes[1, 0]
     expected = curves[0]["calibration"]["expected"]
     axis.plot([0, 1], [0, 1], color=REFERENCE_COLOR, linewidth=1, linestyle="--", label="Perfect calibration")
-    for model in ("epinet", "base_fitted"):
+    for model in calibration_models_to_plot(curves[0]):
+        if not all(model in c["calibration"] for c in curves):
+            continue
         style = MODEL_STYLES[model]
         _band(axis, expected, [c["calibration"][model] for c in curves], style["color"], style["label"],
               style["linestyle"])
@@ -198,8 +216,7 @@ def _plot_test_report(curves_by_seed, path, split="test"):
 
     axis = axes[1, 1]
     labels = {"base": "Base mean", "epinet_mean": "Epinet mean", "epinet_thompson": "Epinet Thompson"}
-    colors = [MODEL_STYLES["base_fixed"]["color"], MODEL_STYLES["epinet"]["color"],
-              MODEL_STYLES["independent"]["color"]]
+    colors = [AQUA, BLUE, ORANGE]
     means, halves = [], []
     for name in labels:
         mean, _, half, _ = _confidence_interval([c["regret"][name] for c in curves])
@@ -219,7 +236,7 @@ def _plot_test_report(curves_by_seed, path, split="test"):
 
 
 def _plot_training_curves(per_epoch, path):
-    figure, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    figure, axes = plt.subplots(2, 4, figsize=(19, 8), constrained_layout=True)
     split_styles = {"val": ("#2a78d6", "-"), "test": ("#eb6834", "--")}
     for axis, (metric, title) in zip(axes.flat, TRAINING_CURVE_METRICS):
         for split, (color, linestyle) in split_styles.items():
@@ -250,9 +267,21 @@ def summarize_rerun(rerun_directory, objective_metric="val_jnll_tau8_epinet_exce
         per_epoch_rows += [{"seed": seed, "finished": finished, **row} for row in rows]
         best_epoch = _best_epoch(rows, objective_metric)
         best_row = next(row for row in rows if row["epoch"] == best_epoch)
-        final_rows.append({"seed": seed, "best_epoch": best_epoch, "finished": finished,
-                           **{k: v for k, v in best_row.items() if k != "epoch"}})
+        final_row = {"seed": seed, "best_epoch": best_epoch, "finished": finished,
+                     **{k: v for k, v in best_row.items() if k != "epoch"}}
         curves_path = os.path.join(directory, f"epoch-{best_epoch}", "curves.json")
+        refit_metrics_path = os.path.join(directory, NOISE_FITTED_DIRECTORY, "metrics.json")
+        if os.path.exists(refit_metrics_path):
+            with open(refit_metrics_path, encoding="utf-8") as f:
+                refit = json.load(f)
+            if refit.get("epoch") == best_epoch:
+                final_row.update({k: v for k, v in refit.items() if k != "epoch"})
+                curves_path = os.path.join(directory, NOISE_FITTED_DIRECTORY, "curves.json")
+            else:
+                print(f"Seed {seed}: {refit_metrics_path} is for epoch {refit.get('epoch')}, "
+                      f"not the best epoch {best_epoch}; ignoring it.")
+        final_row["noise_fitted_eval"] = curves_path.endswith(os.path.join(NOISE_FITTED_DIRECTORY, "curves.json"))
+        final_rows.append(final_row)
         if os.path.exists(curves_path):
             with open(curves_path, encoding="utf-8") as f:
                 best_curves.append(json.load(f))

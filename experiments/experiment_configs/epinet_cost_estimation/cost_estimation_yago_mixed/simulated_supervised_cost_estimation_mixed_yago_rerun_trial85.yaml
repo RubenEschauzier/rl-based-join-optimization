@@ -71,3 +71,13 @@ rerun:
 
   write_figures: true
   tensorboard: true
+
+# Re-scoring saved checkpoints with the epinet's noise fitted on validation
+# (src/supervised_value_estimation/evaluate_epinet_checkpoints.py).
+evaluate:
+  # null = every finished seed under rerun.output_directory.
+  seeds: null
+  # null = each seed's best validation epoch (from final_summary.json).
+  epoch: null
+  # Re-evaluate even when noise_fitted_eval/metrics.json already exists for that epoch.
+  overwrite: false

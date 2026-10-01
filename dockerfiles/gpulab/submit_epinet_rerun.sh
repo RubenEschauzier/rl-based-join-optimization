@@ -5,13 +5,13 @@
 # The image's code is NOT baked in: it is read from the /project_ghent mount, so the
 # repository on project storage must contain the rerun code before submitting.
 #
-# Needs gpulab-cli and GPULAB_CERT. Examples:
+# Needs gpulab-cli and your login certificate in GPULAB_CERT. Examples:
 #   PROJECT=phdexperimentsruben CLUSTER_ID=5 dockerfiles/gpulab/submit_epinet_rerun.sh
 #       -> 10 jobs, one seed each
 #   SEEDS="3" ...
 #       -> a single job for seed 3
 #   SEEDS_PER_JOB=2 ...
-#       -> 5 jobs, each training 2 seeds AT THE SAME TIME on its one GPU
+#       -> 5 jobs, each training 2 seeds AT THE SAME TIME on its one GPU (4 CPUs, 50 GB)
 #   SEEDS_PER_JOB=2 PACKING=sequential ...
 #       -> 5 jobs, each training 2 seeds one after the other
 #   DRY_RUN=1 ...
@@ -19,6 +19,8 @@
 set -euo pipefail
 
 : "${PROJECT:?Set PROJECT to your GPULab project name}"
+# Login certificate (.pem from account.ilabt.imec.be); override with GPULAB_CERT.
+GPULAB_CERT="${GPULAB_CERT:-${HOME}/pemfiles/login_ilabt_imec_be_reschauz@ugent.be.pem}"
 IMAGE="${IMAGE:-rubeneschauzier/epinet-training-sweep:latest}"
 : "${CLUSTER_ID:?Set CLUSTER_ID (see gpulab-cli clusters); the sweep ran on 5}"
 SEEDS="${SEEDS:-0 1 2 3 4 5 6 7 8 9}"
@@ -29,10 +31,15 @@ PACKING="${PACKING:-parallel}"
 SSH_PUB_KEY="${SSH_PUB_KEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINrM6/FhK42PO98OzVO8kgVCx9ea9yfvmYhpcWmR1ja3}"
 # Same scheduling as the sweep: never halted before 7 days, cancelled after 14. One seed
 # is estimated at ~8 h on an RTX 3080, so a job should never get near either limit.
-MIN_DURATION="${MIN_DURATION:-7 days}"
-MAX_DURATION="${MAX_DURATION:-14 days}"
+MIN_DURATION="${MIN_DURATION:-3 days}"
+MAX_DURATION="${MAX_DURATION:-7 days}"
 DRY_RUN="${DRY_RUN:-0}"
 JOB_ID_LOG="${JOB_ID_LOG:-epinet_rerun_trial85_job_ids.txt}"
+
+if [[ "${DRY_RUN}" != "1" && ! -r "${GPULAB_CERT}" ]]; then
+  echo "GPULAB_CERT does not point to a readable file: ${GPULAB_CERT}" >&2
+  exit 1
+fi
 
 read -r -a seed_list <<< "${SEEDS}"
 if [[ "${PACKING}" != "parallel" && "${PACKING}" != "sequential" ]]; then
@@ -45,10 +52,11 @@ for (( start = 0; start < ${#seed_list[@]}; start += SEEDS_PER_JOB )); do
   group_name=$(IFS=-; echo "${group[*]}")
   processes=1
   [[ "${PACKING}" == "parallel" ]] && processes=${#group[@]}
-  # Peak RSS was measured at 21.6 GB per process (the full datasets are loaded up front);
-  # the sweep ran at 25 GB. 28 GB per process leaves headroom for the test split.
-  cpu_memory_gb="${CPU_MEMORY_GB:-$(( 28 * processes ))}"
-  cpus="${CPUS:-$(( 4 * processes ))}"
+  # Per seed process: peak RSS measured at 21.6 GB (the full datasets are loaded up
+  # front), and the sweep ran fine at 25 GB. Training is single-process (no DataLoader
+  # workers), so 2 CPUs per seed suffice. CPUS / CPU_MEMORY_GB override the job total.
+  cpu_memory_gb="${CPU_MEMORY_GB:-$(( 25 * processes ))}"
+  cpus="${CPUS:-$(( 2 * processes ))}"
 
   # Exec-form commands keep python as PID 1, so it receives GPULab's SIGUSR1 halt signal
   # and can answer with exit 123 (restartable then re-queues; finished seeds are skipped).
@@ -102,7 +110,7 @@ EOF
     echo "${job_json}"
     continue
   fi
-  job_id=$(gpulab-cli submit --project "${PROJECT}" <<< "${job_json}")
+  job_id=$(gpulab-cli --cert "${GPULAB_CERT}" submit --project "${PROJECT}" <<< "${job_json}")
   echo "seeds ${group[*]}: ${job_id}"
   echo "${group[*]} ${job_id}" >> "${JOB_ID_LOG}"
 done

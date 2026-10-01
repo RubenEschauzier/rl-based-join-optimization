@@ -1,0 +1,90 @@
+defaults:
+  # Dataset paths, the oracle / embedder models, the trial-85 plan-cost model and the
+  # held-out split (rerun.output_directory/split.json) all come from the rerun config.
+  - simulated_supervised_cost_estimation_mixed_yago_rerun_trial85
+  - _self_
+
+# Amortised DP prototype (src/supervised_value_estimation/amortized_dp). Offline, no epinet:
+# a value net over the contracted join graph is trained on exact DP targets computed from
+# the oracle's cardinalities, then compared with beam-search agents on the held-out split.
+amortized_dp:
+  output_directory: experiments/experiment_outputs/mixed_yago/amortized_dp
+  # Oracle labels are cached here and shared by training and the comparison.
+  label_directory: experiments/experiment_outputs/mixed_yago/amortized_dp/labels
+  # Queries labelled for training (a random subset of the train file; labelling is one
+  # batched oracle forward per query over all its connected subsets).
+  n_train_queries: 30000
+  train_query_seed: 0
+  # Model selection: greedy decoding on this many queries of the VALIDATION half.
+  n_selection_queries: 1500
+
+  model:
+    hidden_dim: 128
+    n_message_layers: 3
+    # mean: average of neighbours, no edge features (the original model).
+    # gine: GINEConv-style sum of ReLU(neighbour + edge projection), like the pretraining GNN.
+    # gat:  4-head attention over neighbours, edge features in keys and values.
+    message_layer: mean
+    # Join-position edge features (subject-subject, subject-object, ...; see
+    # labels.join_position_features). Ignored by the mean layer.
+    edge_features: true
+
+  training:
+    seed: 0
+    n_epochs: 30
+    states_per_batch: 512
+    lr: 0.001
+    weight_decay: 0.0001
+    grad_clip: 1.0
+    # Listwise DP distillation: cross-entropy between softmax(-log Q / T) of the model and
+    # of the exact DP, over the children of each state. T is in log-cost units, so 0.1
+    # means "a 10% cheaper action should clearly win".
+    rank_weight: 1.0
+    rank_temperature: 0.1
+    target_temperature: 0.05
+    early_stopping_patience: 6
+
+# Offline simulation of learning from executed plans only (amortized_dp/partial_observation.py).
+partial_observation:
+  seed: 0
+  # Training queries (a subset of the full-oracle run's labelled queries).
+  n_train_queries: 10000
+  rounds: 6
+  # Plans "executed" per query per round; the budget after R rounds is R * K.
+  plans_per_round: 4
+  # deviation: the model's greedy plan + one-step deviations; random: random connected plans.
+  plan_selection: deviation
+  # Where to deviate: closest (smallest score gap between best and second best) or random.
+  deviation_steps: closest
+  epochs_per_round: 4
+  # Weight of predicting BELOW the stitched cost-to-go (an upper bound on the truth);
+  # predicting above it always has weight 1.
+  upper_bound_under_weight: 0.1
+
+comparison:
+  num_workers: 6
+  samples_per_execution_batch: 256
+  # null = every query of the held-out test half.
+  max_test_queries: null
+  test_query_seed: 0
+  # Planning time of exact DP with the learned cardinality model is measured in-process,
+  # single-threaded, on this many test queries.
+  dp_timing_queries: 500
+  # Seed of the trial-85 rerun whose best checkpoint provides the plan-cost baseline.
+  plan_cost_seed: 0
+  # Default value net for amortized_dp agents without their own `checkpoint`:
+  # a path, null / "latest" (newest finished run), or "latest:<message_layer>".
+  value_net_checkpoint: null
+  agents:
+    - {name: learned_cardinality_beam1, kind: learned_cardinality, beam_width: 1}
+    - {name: learned_cardinality_beam8, kind: learned_cardinality, beam_width: 8}
+    - {name: plan_cost_model_beam1, kind: plan_cost_model, beam_width: 1}
+    - {name: plan_cost_model_beam8, kind: plan_cost_model, beam_width: 8}
+    - {name: amortized_dp_mean_greedy, kind: amortized_dp, beam_width: 1, checkpoint: "latest:mean"}
+    - {name: amortized_dp_mean_beam8, kind: amortized_dp, beam_width: 8, checkpoint: "latest:mean"}
+    - {name: amortized_dp_gine_greedy, kind: amortized_dp, beam_width: 1, checkpoint: "latest:gine"}
+    - {name: amortized_dp_gine_beam8, kind: amortized_dp, beam_width: 8, checkpoint: "latest:gine"}
+    - {name: amortized_dp_gat_greedy, kind: amortized_dp, beam_width: 1, checkpoint: "latest:gat"}
+    - {name: amortized_dp_gat_beam8, kind: amortized_dp, beam_width: 8, checkpoint: "latest:gat"}
+    # Myopic ranking even with PERFECT cardinalities (the oracle). Slow on CPU; optional.
+    - {name: oracle_cardinality_beam8, kind: oracle_cardinality, beam_width: 8, enabled: false}
