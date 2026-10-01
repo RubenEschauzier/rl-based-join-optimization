@@ -102,13 +102,19 @@ fetch_bundle() {   # $1 = share link, $2 = bundle name; extracts into the reposi
     echo "Set the Google Drive link for $name at the top of $0." >&2
     exit 1
   fi
-  echo "Downloading $name..."
+  # A bundle already in $HOME (e.g. copied over the LAN from a node that downloaded it) is
+  # used as is; Google Drive is slow from the Virtual Wall (~300 kB/s).
   local download="$HOME/$name"
-  "$TOOLS_VENV/bin/gdown" --fuzzy "$url" -O "$download"
+  if [ -f "$download" ] && zstd -tq "$download"; then
+    echo "Using $download."
+  else
+    echo "Downloading $name..."
+    "$TOOLS_VENV/bin/gdown" --fuzzy "$url" -O "$download"
+  fi
   echo "Extracting $name..."
   zstd -dc "$download" | tar -xf - -C "$REPO_DIR"
-  rm -f "$download"
   touch "$marker"
+  echo "Kept $download for copying to other nodes (scp $download <node>:~/); delete it when done."
 }
 
 if [ "$ROLE" = "qlever" ]; then
@@ -131,17 +137,15 @@ if [ "$ROLE" = "qlever" ]; then
 else
   fetch_bundle "$TRAINER_BUNDLE_URL" trainer_bundle.tar.zst
   # The code needs Python >= 3.10 (int.bit_count, scipy 1.13, pandas 2.2); Ubuntu 20.04
-  # ships 3.8, so take 3.10 from the deadsnakes PPA there.
-  if ! command -v python3.10 > /dev/null; then
-    echo "Installing Python 3.10..."
-    sudo apt install -y software-properties-common
-    sudo add-apt-repository -y ppa:deadsnakes/ppa
-    sudo apt update
-    sudo apt install -y python3.10 python3.10-venv python3.10-dev
-  fi
+  # ships 3.8, and the deadsnakes PPA no longer builds for 20.04. uv downloads a standalone
+  # CPython 3.10 instead; --seed puts pip in the venv, so installing works as usual.
   if [ ! -x "$REPO_DIR/.venv/bin/python" ]; then
-    echo "Creating Python environment..."
-    python3.10 -m venv "$REPO_DIR/.venv"
+    if [ ! -x "$HOME/.local/bin/uv" ]; then
+      echo "Installing uv..."
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+    fi
+    echo "Creating Python 3.10 environment..."
+    "$HOME/.local/bin/uv" venv --seed --python 3.10 "$REPO_DIR/.venv"
   fi
   "$REPO_DIR/.venv/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
   echo "Setup complete: activate with 'source $REPO_DIR/.venv/bin/activate'."
