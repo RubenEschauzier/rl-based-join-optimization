@@ -24,6 +24,11 @@ BRANCH="${BRANCH:-master}"
 TOOLS_VENV="$HOME/.venv-setup-tools"
 export DEBIAN_FRONTEND=noninteractive
 
+# Never suspend. These images run a desktop whose power settings suspend the node after a
+# while without keyboard or mouse input -- even during a long download or a training run --
+# and a suspended node no longer answers SSH (iLab.t helpdesk). Masking persists across reboots.
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
 # Enable NAT for Virtual Wall internet access
 wget -O - -nv --cipher DEFAULT@SECLEVEL=1 https://www.wall2.ilabt.iminds.be/enable-nat.sh | sudo bash
 
