@@ -66,12 +66,70 @@ def _latest_value_net_checkpoint(output_directory, message_layer=None):
     return max(candidates, key=os.path.getmtime)
 
 
-def _resolve_checkpoint(spec, output_directory):
-    """A checkpoint path, 'latest', or 'latest:<message layer>'."""
+def _selection_key(cfg):
+    """What decides the selection queries a run was scored on: runs are only comparable
+    when all of these match."""
+    return (int(cfg.amortized_dp.n_selection_queries), int(cfg.amortized_dp.train_query_seed),
+            str(cfg.rerun.output_directory), str(cfg.dataset.queries_val))
+
+
+def _saved_epoch_score(run_directory, metric):
+    """(metric, geomean ratio) of the epoch whose weights are in best_model.pt, read from
+    metrics.jsonl so runs selected on different metrics are still ranked on the same one."""
+    with open(os.path.join(run_directory, "summary.json")) as f:
+        best_epoch = json.load(f)["best_epoch"]
+    with open(os.path.join(run_directory, "metrics.jsonl")) as f:
+        for line in f:
+            record = json.loads(line)
+            if record["epoch"] == best_epoch:
+                overall = record["val_greedy"]["overall"]
+                return overall[metric], overall["geomean_ratio"]
+    raise ValueError(f"epoch {best_epoch} missing from {run_directory}/metrics.jsonl")
+
+
+def _best_value_net_checkpoint(output_directory, cfg, message_layer=None):
+    """Finished run whose saved model has the lowest amortized_dp.training.selection_metric
+    (a statistic of the greedy C_out cost ratio to the DP optimum on the selection queries;
+    p90 by default, ties broken by the geomean), among runs scored on the same selection
+    queries as `cfg`; optionally restricted to one message layer."""
+    metric = cfg.amortized_dp.training.get("selection_metric", "p90_ratio")
+    wanted = _selection_key(cfg)
+    candidates, skipped = [], []
+    for summary_path in glob.glob(os.path.join(output_directory, "run-*", "summary.json")):
+        run_directory = os.path.dirname(summary_path)
+        checkpoint = os.path.join(run_directory, "best_model.pt")
+        if not os.path.exists(checkpoint):
+            continue
+        if message_layer is not None and (torch.load(checkpoint, map_location="cpu")["model_kwargs"]
+                                          .get("message_layer", "mean") != message_layer):
+            continue
+        if _selection_key(OmegaConf.load(os.path.join(run_directory, "config.yaml"))) != wanted:
+            skipped.append(os.path.basename(run_directory))
+            continue
+        candidates.append((_saved_epoch_score(run_directory, metric), checkpoint))
+    if skipped:
+        print(f"Checkpoint selection: skipped {len(skipped)} run(s) scored on other selection queries: {skipped}")
+    if not candidates:
+        raise FileNotFoundError(f"No finished amortized_dp run{'' if message_layer is None else f' with {message_layer}'} "
+                                f"with matching selection queries under {output_directory}.")
+    (value, geomean), checkpoint = min(candidates)
+    print(f"Checkpoint selection: {checkpoint} (val greedy {metric} {value:.4f}, geomean ratio {geomean:.4f}; "
+          f"best of {len(candidates)} run(s))")
+    return checkpoint
+
+
+def _resolve_checkpoint(spec, output_directory, cfg=None):
+    """A checkpoint path, 'latest', 'latest:<message layer>', 'best' or 'best:<message layer>'.
+    'best' needs `cfg` (the selection queries the runs must have been scored on)."""
     if spec is None or spec == "latest":
         return _latest_value_net_checkpoint(output_directory)
     if str(spec).startswith("latest:"):
         return _latest_value_net_checkpoint(output_directory, str(spec).split(":", 1)[1])
+    if spec == "best" or str(spec).startswith("best:"):
+        if cfg is None:
+            raise ValueError(f"checkpoint spec {spec!r} needs the config to compare runs")
+        layer = str(spec).split(":", 1)[1] if ":" in str(spec) else None
+        return _best_value_net_checkpoint(output_directory, cfg, layer)
     return str(spec)
 
 
@@ -98,7 +156,7 @@ def _agent_spec(kind, cfg, value_net_checkpoint, plan_cost_checkpoint, agent_che
                                              "seed": cfg.comparison.plan_cost_seed}
     if kind == "amortized_dp":
         checkpoint = (value_net_checkpoint if agent_checkpoint is None
-                      else _resolve_checkpoint(agent_checkpoint, cfg.amortized_dp.output_directory))
+                      else _resolve_checkpoint(agent_checkpoint, cfg.amortized_dp.output_directory, cfg))
         return build_amortized_dp_agent, {"value_net_checkpoint": checkpoint,
                                           "embedder_config": cfg.models.embedder.config,
                                           "embedder_dir": cfg.models.embedder.dir}
@@ -198,7 +256,7 @@ def main(cfg: DictConfig):
     
     strategy = SimulatedCostExecutionStrategy(labels)
 
-    value_net_checkpoint = _resolve_checkpoint(comparison.value_net_checkpoint, settings.output_directory)
+    value_net_checkpoint = _resolve_checkpoint(comparison.value_net_checkpoint, settings.output_directory, cfg)
     plan_cost_checkpoint = _plan_cost_checkpoint(cfg, comparison.plan_cost_seed)
     print(f"Value net: {value_net_checkpoint}\nPlan-cost model: {plan_cost_checkpoint}\n"
           f"Test queries: {len(test_indices)}")

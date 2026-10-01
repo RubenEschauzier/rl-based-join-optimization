@@ -8,8 +8,11 @@ defaults:
 online:
   output_directory: experiments/experiment_outputs/mixed_yago/amortized_dp_online
   seed: 0
-  # Offline-trained value net to start from: a path, "latest", or "latest:<message layer>".
-  init_checkpoint: "latest:gine"
+  # Offline-trained value net to start from: a path, "latest[:<message layer>]" (newest
+  # finished run) or "best[:<message layer>]" (lowest amortized_dp.training.selection_metric,
+  # p90 of the validation greedy C_out ratio to the optimum, among runs scored on the same
+  # selection queries).
+  init_checkpoint: "best:gine"
 
   rounds: 200
   queries_per_round: 256

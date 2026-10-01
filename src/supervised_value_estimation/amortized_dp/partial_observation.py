@@ -144,7 +144,7 @@ def _geomean_ratio(log_costs, optimal):
 
 @hydra.main(version_base=None,
             config_path="../../../experiments/experiment_configs/epinet_cost_estimation/cost_estimation_yago_mixed",
-            config_name="amortized_dp_mixed_yago.yaml")
+            config_name="partial_observation_mixed_yago.yaml")
 def main(cfg: DictConfig):
     _resolve_model_paths(cfg)
     settings, cfg_training, sim = cfg.amortized_dp, cfg.amortized_dp.training, cfg.partial_observation

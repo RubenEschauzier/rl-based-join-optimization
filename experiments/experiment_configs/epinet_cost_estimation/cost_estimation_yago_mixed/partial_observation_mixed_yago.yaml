@@ -1,0 +1,23 @@
+defaults:
+  - amortized_dp_mixed_yago
+  - _self_
+
+# Separate experiment, not part of offline or online training: simulates learning from
+# executed plans only (the observed tables grow with the plans run), with the oracle's
+# cardinalities as the "database". Run with
+#   python -m src.supervised_value_estimation.amortized_dp.partial_observation
+partial_observation:
+  seed: 0
+  # Training queries (a subset of the full-oracle run's labelled queries).
+  n_train_queries: 10000
+  rounds: 6
+  # Plans "executed" per query per round; the budget after R rounds is R * K.
+  plans_per_round: 4
+  # deviation: the model's greedy plan + one-step deviations; random: random connected plans.
+  plan_selection: deviation
+  # Where to deviate: closest (smallest score gap between best and second best) or random.
+  deviation_steps: closest
+  epochs_per_round: 4
+  # Weight of predicting BELOW the stitched cost-to-go (an upper bound on the truth);
+  # predicting above it always has weight 1.
+  upper_bound_under_weight: 0.1

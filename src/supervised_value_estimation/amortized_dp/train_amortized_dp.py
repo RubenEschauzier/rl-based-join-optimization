@@ -309,7 +309,11 @@ def main(cfg: DictConfig):
         torch.save({"state_dict": model.state_dict(), "model_kwargs": model_kwargs, "epoch": epoch,
                     "metrics": metrics}, path)
 
-    best, best_epoch, patience = math.inf, 0, 0
+    # Model selection on one statistic of the greedy cost ratio to the optimum (lower is
+    # better), ties broken by the geomean ratio. p90 by default: in online training a round
+    # waits for its slowest plans, so the tail matters more than the average.
+    selection_metric = cfg_training.get("selection_metric", "p90_ratio")
+    best, best_epoch, patience = (math.inf, math.inf), 0, 0
     for epoch in range(1, cfg_training.n_epochs + 1):
         start = time.perf_counter()
         order = torch.randperm(tables.n_states, device=device)
@@ -334,11 +338,12 @@ def main(cfg: DictConfig):
         overall = selection["overall"]
         print(f"Epoch {epoch}: loss {metrics['loss']:.4f} (card {metrics['loss_card']:.4f}, "
               f"G {metrics['loss_g']:.4f}, rank {metrics['loss_rank']:.4f}) | val greedy geomean ratio "
-              f"{overall['geomean_ratio']:.4f}, optimal {overall['frac_optimal']:.1%}, "
+              f"{overall['geomean_ratio']:.4f}, p90 {overall['p90_ratio']:.4f}, optimal {overall['frac_optimal']:.1%}, "
               f"p95 {overall['p95_ratio']:.3f} | {train_seconds:.0f}s")
         save(run_directory / "last_model.pt", epoch, metrics)
-        if overall["geomean_ratio"] < best - 1e-5:
-            best, best_epoch, patience = overall["geomean_ratio"], epoch, 0
+        score = (overall[selection_metric], overall["geomean_ratio"])
+        if score[0] < best[0] - 1e-5 or (abs(score[0] - best[0]) <= 1e-5 and score[1] < best[1] - 1e-5):
+            best, best_epoch, best_overall, patience = score, epoch, overall, 0
             save(run_directory / "best_model.pt", epoch, metrics)
         else:
             patience += 1
@@ -347,9 +352,12 @@ def main(cfg: DictConfig):
                 break
 
     with open(run_directory / "summary.json", "w", encoding="utf-8") as f:
-        json.dump({"best_epoch": best_epoch, "best_val_greedy_geomean_ratio": best,
+        json.dump({"best_epoch": best_epoch, "selection_metric": selection_metric,
+                   "best_val_greedy_geomean_ratio": best_overall["geomean_ratio"],
+                   "best_val_greedy": best_overall,
                    "best_model": str(run_directory / "best_model.pt")}, f, indent=2)
-    print(f"Best epoch {best_epoch}: val greedy geomean ratio {best:.4f} -> {run_directory / 'best_model.pt'}")
+    print(f"Best epoch {best_epoch}: val greedy {selection_metric} {best[0]:.4f}, geomean ratio {best[1]:.4f} "
+          f"-> {run_directory / 'best_model.pt'}")
 
 
 if __name__ == "__main__":

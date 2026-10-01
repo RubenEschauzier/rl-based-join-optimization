@@ -147,6 +147,6 @@ else
     echo "Creating Python 3.10 environment..."
     "$HOME/.local/bin/uv" venv --seed --python 3.10 "$REPO_DIR/.venv"
   fi
-  "$REPO_DIR/.venv/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+  "$REPO_DIR/.venv/bin/pip" install -r "$REPO_DIR/requirements.txt"   # not -q: torch alone is ~2.4 GB, show progress
   echo "Setup complete: activate with 'source $REPO_DIR/.venv/bin/activate'."
 fi

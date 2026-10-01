@@ -135,9 +135,12 @@ def main(cfg: DictConfig):
                                          replace=False))]
     print(f"Train pool: {len(train_pool)} variable-connected queries | validation: {len(validation_pool)}")
 
-    checkpoint = _resolve_checkpoint(online.init_checkpoint, cfg.amortized_dp.output_directory)
+    checkpoint = _resolve_checkpoint(online.init_checkpoint, cfg.amortized_dp.output_directory, cfg)
     model, model_kwargs = _load_model(checkpoint, device)
     print(f"Initialised from {checkpoint} (+ new latency head)")
+    # config.yaml only holds the spec ("latest:gine"); record which offline run it resolved to.
+    with open(run_directory / "init_checkpoint.json", "w", encoding="utf-8") as f:
+        json.dump({"spec": str(online.init_checkpoint), "checkpoint": str(checkpoint)}, f, indent=2)
     embedder = load_cardinality_gnn(cfg.models.embedder.config, cfg.models.embedder.dir, device)
 
     if online.execution.mode == "ray":
@@ -160,7 +163,10 @@ def main(cfg: DictConfig):
 
     observations: dict[str, QueryObservations] = {}
     embeddings: dict[str, torch.Tensor] = {}
-    order_seen: list[str] = []            # queries in the order they were first executed
+    # Queries by their most recent execution (dict: insertion-ordered, O(1) move to the end).
+    # The replay window is the last `replay_queries` of these, so a query executed again in a
+    # later pass over the pool re-enters the window with its new observations.
+    order_seen: dict[str, None] = {}
     loss_settings = _TrainingSettings(cfg_training, online.upper_bound_under_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=online.lr, weight_decay=cfg_training.weight_decay)
     latency_statistics_set = False
@@ -222,7 +228,8 @@ def main(cfg: DictConfig):
             data = train_dataset[i]
             if data.query not in observations:
                 observations[data.query] = _observations_for(data)
-                order_seen.append(data.query)
+            order_seen.pop(data.query, None)
+            order_seen[data.query] = None
             obs = observations[data.query]
             timeout_s = _timeout(obs, online.timeouts)
             plans = deviation_plans(agent, Batch.from_data_list([data]), obs.labels, online.plans_per_query,
@@ -244,7 +251,7 @@ def main(cfg: DictConfig):
                                                result["timeout_s"], cached=parsed["any_cached"])
 
         # Train on the most recently executed queries.
-        window = order_seen[-online.replay_queries:]
+        window = list(order_seen)[-online.replay_queries:]
         window_obs = [observations[q] for q in window]
         tables = StateTables([o.labels for o in window_obs], [embeddings[q] for q in window], device,
                              patterns_list=[o.triple_patterns for o in window_obs],
@@ -280,9 +287,11 @@ def main(cfg: DictConfig):
         }
         with open(run_directory / "rounds.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
+        heads = ", ".join(f"{key[5:]} {summary[key]:.3f}" for key in ("loss_card", "loss_g", "loss_rank", "loss_latency")
+                          if key in summary)
         print(f"Round {round_index}: {len(requests)} plans ({summary['timeout_rate']:.1%} timeouts, "
               f"{summary['aligned_rate']:.1%} aligned, {summary['cached_rate']:.1%} cached), loss {summary['loss']:.3f} "
-              f"| plan {planning_seconds:.0f}s, execute {execution_seconds:.0f}s, train {train_seconds:.0f}s")
+              f"({heads}) | plan {planning_seconds:.0f}s, execute {execution_seconds:.0f}s, train {train_seconds:.0f}s")
         if round_index % online.validation.every_rounds == 0 or round_index == online.rounds:
             validate(round_index)
     executor.close()
