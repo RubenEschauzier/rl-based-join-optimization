@@ -16,8 +16,8 @@ if [[ "$ROLE" != "qlever" && "$ROLE" != "trainer" ]]; then
   exit 1
 fi
 
-QLEVER_BUNDLE_URL="https://drive.google.com/file/d/REPLACE_WITH_QLEVER_BUNDLE_ID/view?usp=sharing"
-TRAINER_BUNDLE_URL="https://drive.google.com/file/d/REPLACE_WITH_TRAINER_BUNDLE_ID/view?usp=sharing"
+QLEVER_BUNDLE_URL="https://drive.google.com/file/d/1Y6OCSyGr3KCkfStUZRb_hLLK5QKfEYe4/view?usp=drive_link"
+TRAINER_BUNDLE_URL="https://drive.google.com/file/d/1iJc9nJdx-icsumf8cRPR8WnXGgWFkuIM/view?usp=drive_link"
 REPO_URL="https://github.com/RubenEschauzier/rl-based-join-optimization.git"
 REPO_DIR="${REPO_DIR:-/users/reschauz/rl-based-join-optimization}"
 BRANCH="${BRANCH:-master}"
@@ -103,9 +103,18 @@ if [ "$ROLE" = "qlever" ]; then
   echo "Setup complete: QLever endpoints listed in $REPO_DIR/data/qlever/qlever_yago/endpoints_$LAN_IP.json"
 else
   fetch_bundle "$TRAINER_BUNDLE_URL" trainer_bundle.tar.zst
+  # The code needs Python >= 3.10 (int.bit_count, scipy 1.13, pandas 2.2); Ubuntu 20.04
+  # ships 3.8, so take 3.10 from the deadsnakes PPA there.
+  if ! command -v python3.10 > /dev/null; then
+    echo "Installing Python 3.10..."
+    sudo apt install -y software-properties-common
+    sudo add-apt-repository -y ppa:deadsnakes/ppa
+    sudo apt update
+    sudo apt install -y python3.10 python3.10-venv python3.10-dev
+  fi
   if [ ! -x "$REPO_DIR/.venv/bin/python" ]; then
     echo "Creating Python environment..."
-    python3 -m venv "$REPO_DIR/.venv"
+    python3.10 -m venv "$REPO_DIR/.venv"
   fi
   "$REPO_DIR/.venv/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
   echo "Setup complete: activate with 'source $REPO_DIR/.venv/bin/activate'."
