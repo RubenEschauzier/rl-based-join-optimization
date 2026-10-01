@@ -38,6 +38,33 @@ echo "Installing required dependencies..."
 sudo apt update
 sudo apt install -y ca-certificates curl gnupg git zstd python3 python3-venv python3-pip
 
+# Bring up the experiment LAN. The testbed assigns the address (visible through tmcc) but
+# does not always configure the interface at boot; match it to a NIC by MAC address.
+bring_up_lan() {
+  local config line inet mask mac iface prefix
+  config="$(sudo /usr/local/etc/emulab/tmcc ifconfig 2>/dev/null || cat /var/emulab/boot/tmcc/ifconfig 2>/dev/null || true)"
+  while read -r line; do
+    inet="$(sed -n 's/.*INET=\([0-9.]*\).*/\1/p' <<< "$line")"
+    mask="$(sed -n 's/.*MASK=\([0-9.]*\).*/\1/p' <<< "$line")"
+    mac="$(sed -n 's/.*MAC=\([0-9a-fA-F]*\).*/\1/p' <<< "$line" | tr 'A-F' 'a-f' | sed 's/../&:/g; s/:$//')"
+    [ -n "$inet" ] && [ -n "$mask" ] && [ -n "$mac" ] || continue
+    iface="$(grep -l -i "^$mac$" /sys/class/net/*/address 2>/dev/null | head -1 | cut -d/ -f5 || true)"
+    if [ -z "$iface" ]; then
+      echo "No interface with MAC $mac for $inet." >&2
+      continue
+    fi
+    if ip -4 -o addr show dev "$iface" | grep -q " $inet/"; then
+      echo "LAN: $iface already has $inet."
+      continue
+    fi
+    prefix="$(python3 -c "import ipaddress, sys; print(ipaddress.IPv4Network('0.0.0.0/' + sys.argv[1]).prefixlen)" "$mask")"
+    echo "LAN: configuring $iface with $inet/$prefix."
+    sudo ip addr add "$inet/$prefix" dev "$iface"
+    sudo ip link set "$iface" up
+  done < <(grep '^INTERFACE' <<< "$config" || true)
+}
+bring_up_lan
+
 if ! command -v docker > /dev/null; then
   echo "Installing Docker..."
   sudo install -m 0755 -d /etc/apt/keyrings
@@ -93,7 +120,7 @@ if [ "$ROLE" = "qlever" ]; then
 
   LAN_IP="${LAN_IP:-$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep '^192\.168\.' | head -1 || true)}"
   if [ -z "$LAN_IP" ]; then
-    echo "No 192.168.x.y address found: is the node on an experiment LAN with automatic IPv4?" >&2
+    echo "No 192.168.x.y address found: is the node on an experiment LAN (check: sudo /usr/local/etc/emulab/tmcc ifconfig)?" >&2
     exit 1
   fi
   echo "Starting QLever instances on $LAN_IP..."
