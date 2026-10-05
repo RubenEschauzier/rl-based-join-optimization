@@ -15,13 +15,19 @@ online:
   init_checkpoint: "best:gine"
 
   rounds: 200
-  queries_per_round: 256
+  queries_per_round: 2048
   # Greedy plan + (K - 1) one-step deviations at the closest calls.
   plans_per_query: 4
   deviation_steps: closest
   # Train on the most recently executed queries, this many.
   replay_queries: 5000
-  gradient_steps_per_round: 200
+  # Training per round, as passes over the replay window: steps = passes * window states /
+  # states_per_batch (states sampled with replacement, so a pass is one visit per state on
+  # average). Each state then gets the same training per round however full the window
+  # is. A query stays in the window ~replay_queries / queries_per_round rounds.
+  gradient_passes_per_round: 2
+  # A fixed number of steps instead (overrides the passes when not null; e.g. short tests).
+  gradient_steps_per_round: null
   lr: 0.0003
   # Weight of predicting below a stitched (upper-bound) target; above always weighs 1.
   upper_bound_under_weight: 0.1
@@ -55,7 +61,14 @@ online:
     # 16 physical cores, one left to the OS -> 15. setup_node.sh prints each node's address.
     # Addresses change with every reservation. A non-empty `endpoints` list (full URLs)
     # overrides this.
-    endpoint_hosts: []
+    endpoint_hosts: [
+      "http://10.2.32.224",
+      "http://10.2.32.214",
+      "http://10.2.32.225",
+      "http://10.2.32.216",
+      "http://10.2.32.226",
+      "http://10.2.32.227",
+    ]
     ports_per_host: 15
     base_port: 7000
     endpoints: []

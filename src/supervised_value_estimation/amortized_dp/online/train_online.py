@@ -14,7 +14,8 @@ Starts from an offline-trained value net and adds a latency cost-to-go head. Eac
      cardinalities of every intermediate and scan, and per-step times;
   5. train on the most recent `replay_queries` observed queries: card, stitched C_out
      cost-to-go and stitched latency cost-to-go (both upper bounds: one-sided losses), and the
-     listwise loss over observed children.
+     listwise loss over observed children; `gradient_passes_per_round` passes over the
+     window's states (or a fixed `gradient_steps_per_round`).
 Every `validation.every_rounds`, the greedy plan of each validation query is executed once,
 back to back with QLever's own plan (join order left to QLever), and the
 latency, timeout rate and speedup are logged. Plans are chosen by C_out in this version; the
@@ -96,7 +97,8 @@ def _endpoints(execution):
     starts one instance per port, from 7000 up)."""
     if execution.get("endpoints"):
         return list(execution.endpoints)
-    hosts = list(execution.get("endpoint_hosts") or [])
+    # Bare addresses; a scheme or trailing slash ("http://10.2.32.224/") is tolerated.
+    hosts = [str(host).split("://", 1)[-1].rstrip("/") for host in (execution.get("endpoint_hosts") or [])]
     if not hosts:
         raise ValueError("Set online.execution.endpoint_hosts (the QLever nodes' addresses) or endpoints.")
     return [f"http://{host}:{port}" for host in hosts
@@ -277,7 +279,12 @@ def main(cfg: DictConfig):
             latency_statistics_set = True
         model.train()
         running = []
-        for _ in range(online.gradient_steps_per_round):
+        if online.get("gradient_steps_per_round") is not None:
+            gradient_steps = int(online.gradient_steps_per_round)
+        else:
+            gradient_steps = max(1, math.ceil(online.gradient_passes_per_round * tables.n_states
+                                              / cfg_training.states_per_batch))
+        for _ in range(gradient_steps):
             state_ids = torch.randint(0, tables.n_states, (cfg_training.states_per_batch,), device=device)
             loss, parts = training_step(model, tables, state_ids, loss_settings)
             optimizer.zero_grad()
@@ -298,7 +305,7 @@ def main(cfg: DictConfig):
             "all_plans_mean_latency_s": float(np.mean([r["latency_s"] for r in results])),
             **{key: float(np.mean([p[key] for p in running if key in p])) for key in running[0]},
             "planning_seconds": planning_seconds, "execution_seconds": execution_seconds,
-            "train_seconds": train_seconds, "window_states": tables.n_states,
+            "train_seconds": train_seconds, "window_states": tables.n_states, "gradient_steps": gradient_steps,
         }
         with open(run_directory / "rounds.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
@@ -306,7 +313,8 @@ def main(cfg: DictConfig):
                           if key in summary)
         print(f"Round {round_index}: {len(requests)} plans ({summary['timeout_rate']:.1%} timeouts, "
               f"{summary['aligned_rate']:.1%} aligned, {summary['cached_rate']:.1%} cached), loss {summary['loss']:.3f} "
-              f"({heads}) | plan {planning_seconds:.0f}s, execute {execution_seconds:.0f}s, train {train_seconds:.0f}s")
+              f"({heads}) | plan {planning_seconds:.0f}s, execute {execution_seconds:.0f}s, "
+              f"train {train_seconds:.0f}s ({gradient_steps} steps over {tables.n_states} states)")
         if round_index % online.validation.every_rounds == 0 or round_index == online.rounds:
             validate(round_index)
     executor.close()
