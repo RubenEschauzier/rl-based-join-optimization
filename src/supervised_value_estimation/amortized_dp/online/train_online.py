@@ -90,6 +90,19 @@ def _load_model(checkpoint, device):
     return model.to(device), {**saved["model_kwargs"], "latency_head": True}
 
 
+def _endpoints(execution):
+    """Endpoint URLs: `endpoints` if given, otherwise every host in `endpoint_hosts` with
+    `ports_per_host` consecutive ports from `base_port` (deploy_isolated_qlever_instances.py
+    starts one instance per port, from 7000 up)."""
+    if execution.get("endpoints"):
+        return list(execution.endpoints)
+    hosts = list(execution.get("endpoint_hosts") or [])
+    if not hosts:
+        raise ValueError("Set online.execution.endpoint_hosts (the QLever nodes' addresses) or endpoints.")
+    return [f"http://{host}:{port}" for host in hosts
+            for port in range(int(execution.base_port), int(execution.base_port) + int(execution.ports_per_host))]
+
+
 def _summarise_latencies(latencies, censored, native=None):
     # QLever reports whole milliseconds, so ratios of sub-millisecond latencies are noise.
     latencies = np.maximum(np.asarray(latencies, dtype=float), 0.001)
@@ -144,7 +157,9 @@ def main(cfg: DictConfig):
     embedder = load_cardinality_gnn(cfg.models.embedder.config, cfg.models.embedder.dir, device)
 
     if online.execution.mode == "ray":
-        executor = RayPlanExecutor(list(online.execution.endpoints), n_actors=online.execution.n_actors,
+        endpoints = _endpoints(online.execution)
+        print(f"{len(endpoints)} QLever endpoints: {endpoints[0]} ... {endpoints[-1]}")
+        executor = RayPlanExecutor(endpoints, n_actors=online.execution.n_actors,
                                    in_flight_per_endpoint=online.execution.in_flight_per_endpoint,
                                    ray_address=online.execution.get("ray_address"))
     elif online.execution.mode == "simulated":

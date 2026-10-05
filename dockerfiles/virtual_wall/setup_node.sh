@@ -7,7 +7,8 @@
 #
 # The bundles are made with make_data_bundles.sh and downloaded from Google Drive (share
 # links set to "Anyone with the link"). Re-running is safe: finished steps are skipped.
-# Optional overrides: LAN_IP (default: this node's 192.168.x.y address), REPO_DIR, BRANCH.
+# Optional overrides: LAN_IP (default: this node's 192.168.x.y experiment-LAN address if it
+# has one, otherwise its control-network address), REPO_DIR, BRANCH.
 set -euo pipefail
 
 ROLE="${1:-}"
@@ -129,9 +130,18 @@ if [ "$ROLE" = "qlever" ]; then
   # would put disk reads back into the measured latencies.
   sudo swapoff -a
 
-  LAN_IP="${LAN_IP:-$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep '^192\.168\.' | head -1 || true)}"
+  # Experiment LAN if there is one; otherwise the control network (the address of the
+  # default route), which every node of the testbed can reach. The containers listen on
+  # every interface either way; this address only goes into endpoints_<ip>.json.
+  if [ -z "${LAN_IP:-}" ]; then
+    LAN_IP="$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep '^192\.168\.' | head -1 || true)"
+  fi
   if [ -z "$LAN_IP" ]; then
-    echo "No 192.168.x.y address found: is the node on an experiment LAN (check: sudo /usr/local/etc/emulab/tmcc ifconfig)?" >&2
+    LAN_IP="$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
+    echo "No experiment LAN: using the control-network address $LAN_IP."
+  fi
+  if [ -z "$LAN_IP" ]; then
+    echo "Could not determine this node's address; set LAN_IP." >&2
     exit 1
   fi
   echo "Starting QLever instances on $LAN_IP..."
@@ -139,6 +149,7 @@ if [ "$ROLE" = "qlever" ]; then
   sg docker -c "python3 '$REPO_DIR/data/qlever/deploy_isolated_qlever_instances.py' \
     '$REPO_DIR/data/qlever/qlever_yago' qleverfile_default '$LAN_IP' qlever_yago.env --no-index"
   echo "Setup complete: QLever endpoints listed in $REPO_DIR/data/qlever/qlever_yago/endpoints_$LAN_IP.json"
+  echo "Add $LAN_IP to online.execution.endpoint_hosts in the online config."
 else
   fetch_bundle "$TRAINER_BUNDLE_URL" trainer_bundle.tar.zst
   # The code needs Python >= 3.10 (int.bit_count, scipy 1.13, pandas 2.2); Ubuntu 20.04
