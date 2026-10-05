@@ -20,12 +20,12 @@ online:
   plans_per_query: 4
   deviation_steps: closest
   # Train on the most recently executed queries, this many.
-  replay_queries: 10000
+  replay_queries: 5000
   # Training per round, as passes over the replay window: steps = passes * window states /
   # states_per_batch (states sampled with replacement, so a pass is one visit per state on
   # average). Each state then gets the same training per round however full the window
   # is. A query stays in the window ~replay_queries / queries_per_round rounds.
-  gradient_passes_per_round: 2
+  gradient_passes_per_round: 1
   # A fixed number of steps instead (overrides the passes when not null; e.g. short tests).
   gradient_steps_per_round: null
   lr: 0.0003
@@ -43,8 +43,20 @@ online:
     every_rounds: 10
     at_start: true
     n_queries: 500
-    # Also execute each validation query once with QLever's own join order (cached).
+    # Every validation executes, per query and in rotating order: our greedy plan, QLever's
+    # own plan, and exact DP over the learned cardinality model (models.embedder). The two
+    # baselines' plans never change; their latency is also reported as a per-query average
+    # over all validations so far ("rolling"), which is less noisy.
     include_native: true
+    include_dp_learned_cardinality: true
+    # True row counts of every connected subset of the validation queries (COUNT(*) per subset
+    # on the QLever endpoints, once, cached) give the optimal plan for the p-error:
+    # C_out(plan) / C_out(optimal left-deep plan), C_out = sum of join output sizes.
+    true_cardinalities:
+      enabled: true
+      timeout_s: 60
+      # null: <amortized_dp.label_directory>/validation_true_cardinalities.pkl
+      path: null
 
   execution:
     # ray: real QLever endpoints through Ray actors. simulated: no database, oracle

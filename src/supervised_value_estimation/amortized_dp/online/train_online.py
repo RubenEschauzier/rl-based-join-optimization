@@ -30,6 +30,7 @@ import json
 import math
 import pickle
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -44,10 +45,16 @@ from src.supervised_value_estimation.amortized_dp.compare_agents import _resolve
 from src.supervised_value_estimation.amortized_dp.data import (
     compute_embeddings, load_datasets, load_split, query_index,
 )
-from src.supervised_value_estimation.amortized_dp.labels import connected_subset_masks, family_of
+from src.supervised_value_estimation.amortized_dp.labels import (
+    QueryLabels, connected_subset_masks, family_of, model_log_cardinalities, optimal_left_deep_plan,
+)
 from src.supervised_value_estimation.amortized_dp.model import ContractedJoinGraphValueNet
 from src.supervised_value_estimation.amortized_dp.online.executor import RayPlanExecutor, SimulatedExecutor
 from src.supervised_value_estimation.amortized_dp.online.observations import QueryObservations
+from src.supervised_value_estimation.amortized_dp.online.plan_quality import (
+    join_cout, optimal_join_cout, p_error, ratio_summary, tree_join_cout,
+)
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import load_or_count
 from src.supervised_value_estimation.amortized_dp.online.runtime_tree import parse_execution
 from src.supervised_value_estimation.amortized_dp.partial_observation import _TrainingSettings, deviation_plans
 from src.supervised_value_estimation.amortized_dp.train_amortized_dp import StateTables, training_step
@@ -103,6 +110,34 @@ def _endpoints(execution):
         raise ValueError("Set online.execution.endpoint_hosts (the QLever nodes' addresses) or endpoints.")
     return [f"http://{host}:{port}" for host in hosts
             for port in range(int(execution.base_port), int(execution.base_port) + int(execution.ports_per_host))]
+
+
+def _geomean_speedup(baseline, ours):
+    """Geometric mean over queries of baseline latency / our latency (1 ms floor)."""
+    if not ours:
+        return None
+    ratio = np.maximum(np.asarray(baseline, dtype=float), 0.001) / np.maximum(np.asarray(ours, dtype=float), 0.001)
+    return float(np.exp(np.mean(np.log(ratio))))
+
+
+def _time_summary(milliseconds):
+    values = np.asarray(milliseconds, dtype=float)
+    if not len(values):
+        return {"n": 0}
+    return {"n": int(len(values)), "mean_ms": float(values.mean()), "median_ms": float(np.median(values)),
+            "p90_ms": float(np.percentile(values, 90)), "p99_ms": float(np.percentile(values, 99)),
+            "max_ms": float(values.max())}
+
+
+def _plan_cout(plan, rows, result, triple_patterns):
+    """C_out (sum of join outputs) of an executed left-deep plan: from the true table, or else
+    from the prefix row counts its own runtime tree revealed."""
+    cost = join_cout(plan, rows) if rows else None
+    if cost is None:
+        parsed = parse_execution(result["tree"], plan, triple_patterns)
+        if parsed["aligned"] and len(parsed["prefix_rows"]) == len(plan) - 1:
+            cost = sum(parsed["prefix_rows"].values())
+    return cost
 
 
 def _summarise_latencies(latencies, censored, native=None):
@@ -178,6 +213,53 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(f"online.execution.mode must be ray or simulated, got {online.execution.mode}")
 
+    # --- Validation baselines and ground truth, fixed for the whole run ---------------------
+    validation = online.validation
+    val_by_query = {val_dataset[i].query: i for i in validation_pool}
+    skeletons = {}                      # query -> (QueryLabels with its join graph, connected subsets)
+    for query, i in val_by_query.items():
+        data = val_dataset[i]
+        masks, neighbour_masks = connected_subset_masks(data)
+        skeletons[query] = (QueryLabels(query=query, family=family_of(data.type), n_tp=len(data.triple_patterns),
+                                        neighbour_masks=neighbour_masks, logcard={m: 0.0 for m in masks}), masks)
+
+    # Exact DP over the learned cardinality model (the cardinality GNN, models.embedder): its
+    # plans never change, so they are planned once; the planning time covers estimating every
+    # connected subset plus the DP, on this process's device.
+    dp_plans, dp_planning_ms = {}, []
+    if validation.get("include_dp_learned_cardinality", True):
+        for query, i in val_by_query.items():
+            data = val_dataset[i]
+            skeleton, masks = skeletons[query]
+            start = time.perf_counter()
+            estimates = model_log_cardinalities(embedder, data, masks, device)
+            estimated = QueryLabels(query=query, family=skeleton.family, n_tp=skeleton.n_tp,
+                                    neighbour_masks=skeleton.neighbour_masks, logcard=dict(zip(masks, estimates)))
+            dp_plans[query] = optimal_left_deep_plan(estimated)[0]
+            dp_planning_ms.append(1000 * (time.perf_counter() - start))
+        print(f"DP over learned cardinalities: planned {len(dp_plans)} validation queries, "
+              f"median {np.median(dp_planning_ms):.1f} ms per query")
+
+    # True row counts of every connected subset -> the optimal plan for the p-error.
+    true_rows = {}
+    if validation.true_cardinalities.enabled:
+        if online.execution.mode == "ray":
+            path = (validation.true_cardinalities.get("path")
+                    or Path(cfg.amortized_dp.label_directory) / "validation_true_cardinalities.pkl")
+            true_rows = load_or_count(path, {q: (list(val_dataset[i].triple_patterns), skeletons[q][1])
+                                             for q, i in val_by_query.items()},
+                                      endpoints, float(validation.true_cardinalities.timeout_s))
+        else:                           # simulated: the oracle's cardinalities are the truth
+            true_rows = {q: {m: int(round(math.exp(labels[q].logcard[m]))) for m in skeletons[q][1]}
+                         for q in val_by_query}
+    optimum = {q: optimal_join_cout(skeletons[q][0], rows)[0] for q, rows in true_rows.items()}
+    print(f"Optimal C_out known for {sum(v is not None for v in optimum.values())}/{len(val_by_query)} "
+          f"validation queries")
+    native_cout = {}                    # QLever's own plan never changes: its C_out, once known
+    # Baselines whose plans are fixed are re-executed at every validation; their latency is
+    # reported both for this validation and as a per-query average over all validations so far.
+    history = {"native": defaultdict(list), "dp": defaultdict(list)}
+
     observations: dict[str, QueryObservations] = {}
     embeddings: dict[str, torch.Tensor] = {}
     # Queries by their most recent execution (dict: insertion-ordered, O(1) move to the end).
@@ -197,32 +279,111 @@ def main(cfg: DictConfig):
         ensure_embedded(val_dataset, validation_pool)
         model.eval()
         agent = AmortizedDPAgent(model, embed_fn=None, device=device, embedding_cache=embeddings)
-        # Our plan and QLever's own plan are executed back to back for every query, in
-        # alternating order, at EVERY validation. Measuring QLever's plans once and reusing
-        # them would compare a cold first run against later warm (page-cached) runs.
-        requests, kinds = [], []
+        # Every planner's plan for a query is executed back to back, with the order rotated per
+        # query, at EVERY validation: reusing old measurements of the fixed baselines would
+        # compare cold first runs against later warm (page-cached) ones.
+        kinds = (["ours"] + (["native"] if validation.include_native else [])
+                 + (["dp"] if dp_plans else []))
+        requests, tags, our_planning_ms = [], [], []
         for k, i in enumerate(validation_pool):
             data = val_dataset[i]
+            start = time.perf_counter()
             plan = beam_search(Batch.from_data_list([data]), agent, 1)[0]["plan"]
-            pair = [("ours", plan)] + ([("native", None)] if online.validation.include_native else [])
-            if k % 2:
-                pair.reverse()
-            for kind, chosen in pair:
-                requests.append({"query": data.query, "triple_patterns": list(data.triple_patterns), "plan": chosen,
-                                 "timeout_s": float(online.timeouts.default_s)})
-                kinds.append(kind)
+            our_planning_ms.append(1000 * (time.perf_counter() - start))
+            plans = {"ours": [int(p) for p in plan], "native": None, "dp": dp_plans.get(data.query)}
+            rotation = k % len(kinds)
+            for kind in kinds[rotation:] + kinds[:rotation]:
+                requests.append({"query": data.query, "triple_patterns": list(data.triple_patterns),
+                                 "plan": plans[kind], "timeout_s": float(online.timeouts.default_s)})
+                tags.append((kind, data.query, plans[kind]))
         results = executor.execute(requests)
-        ours = [r for r, kind in zip(results, kinds) if kind == "ours"]
-        native = ([r["latency_s"] for r, kind in zip(results, kinds) if kind == "native"]
-                  if online.validation.include_native else None)
-        summary = {"round": round_index, "executed_plans_total": sum(len(o.executions) for o in observations.values()),
-                   **_summarise_latencies([r["latency_s"] for r in ours], [r["censored"] for r in ours], native)}
+        by_kind = {kind: {} for kind in kinds}
+        for (kind, query, plan), result in zip(tags, results):
+            by_kind[kind][query] = (plan, result)
+        queries = list(by_kind["ours"])
+
+        def latencies(kind):
+            return [by_kind[kind][q][1]["latency_s"] for q in queries]
+
+        def censored(kind):
+            return [by_kind[kind][q][1]["censored"] for q in queries]
+
+        def cout(kind, query):
+            plan, result = by_kind[kind][query]
+            if kind == "native":
+                if query not in native_cout:
+                    value = tree_join_cout(result["tree"]) if not result["censored"] else None
+                    if value is not None:
+                        native_cout[query] = value
+                return native_cout.get(query)
+            return _plan_cout(plan, true_rows.get(query), result,
+                              list(val_dataset[val_by_query[query]].triple_patterns))
+
+        costs = {kind: {q: cout(kind, q) for q in queries} for kind in kinds}
+        planners = {}
+        for kind in kinds:
+            planners[kind] = {
+                "latency": _summarise_latencies(latencies(kind), censored(kind)),
+                "p_error": ratio_summary([p_error(costs[kind][q], optimum.get(q)) for q in queries]),
+            }
+            if kind in history:
+                for q in queries:
+                    history[kind][q].append((by_kind[kind][q][1]["latency_s"], by_kind[kind][q][1]["censored"]))
+                rolling = [np.mean([lat for lat, _ in history[kind][q]]) for q in queries]
+                planners[kind]["latency_rolling"] = {
+                    **_summarise_latencies(rolling, [np.mean([c for _, c in history[kind][q]]) for q in queries]),
+                    "validations_averaged": len(history[kind][queries[0]]) if queries else 0}
+        planners["ours"]["planning"] = _time_summary(our_planning_ms)
+        if "dp" in planners:
+            planners["dp"]["planning"] = _time_summary(dp_planning_ms)
+
+        ours_latency = latencies("ours")
+        speedup, cout_ratio = {}, {}
+        for kind, name in (("native", "qlever"), ("dp", "dp_learned_cardinality")):
+            if kind not in kinds:
+                continue
+            rolling = [np.mean([lat for lat, _ in history[kind][q]]) for q in queries]
+            speedup[f"vs_{name}"] = _geomean_speedup(latencies(kind), ours_latency)
+            speedup[f"vs_{name}_rolling"] = _geomean_speedup(rolling, ours_latency)
+            cout_ratio[f"ours_vs_{name}"] = ratio_summary(
+                [max(costs["ours"][q], 1) / max(costs[kind][q], 1)
+                 if costs["ours"][q] is not None and costs[kind][q] is not None else None for q in queries])
+
+        summary = {"round": round_index,
+                   "executed_plans_total": sum(len(o.executions) for o in observations.values()),
+                   # Flat fields as before (our plan vs QLever's plan in this validation).
+                   **_summarise_latencies(ours_latency, censored("ours"),
+                                          latencies("native") if "native" in kinds else None),
+                   "planners": planners, "speedup": speedup, "cout_ratio": cout_ratio,
+                   "optimum_known": sum(optimum.get(q) is not None for q in queries)}
         with open(run_directory / "validation.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
-        speed = (f", geomean speedup vs QLever {summary['geomean_speedup_vs_native']:.3f}, faster on "
-                 f"{summary['frac_faster_than_native']:.1%}") if native is not None else ""
-        print(f"[validation round {round_index}] mean {summary['mean_s']:.3f}s, median {summary['median_s']:.3f}s, "
-              f"p90 {summary['p90_s']:.3f}s, timeouts {summary['timeout_rate']:.1%}{speed}")
+
+        def fmt(value, spec=".3f"):
+            return "n/a" if value is None else format(value, spec)
+
+        print(f"[validation round {round_index}] {len(queries)} queries, optimum known for "
+              f"{summary['optimum_known']}")
+        for kind, label in (("ours", "ours  "), ("native", "QLever"), ("dp", "DP-LC ")):
+            if kind not in planners:
+                continue
+            latency, perror = planners[kind]["latency"], planners[kind]["p_error"]
+            rolling = planners[kind].get("latency_rolling")
+            line = (f"  {label} latency mean {latency['mean_s']*1000:.1f} ms, median {latency['median_s']*1000:.1f} ms, "
+                    f"p90 {latency['p90_s']*1000:.1f} ms, timeouts {latency['timeout_rate']:.1%}")
+            if rolling:
+                line += f" (rolling over {rolling['validations_averaged']}: mean {rolling['mean_s']*1000:.1f} ms)"
+            line += (f" | p-error median {fmt(perror.get('median'))}, p90 {fmt(perror.get('p90'))}, "
+                     f"geomean {fmt(perror.get('geomean'))}")
+            if "planning" in planners[kind]:
+                line += f" | planning median {planners[kind]['planning']['median_ms']:.1f} ms"
+            print(line)
+        for name in ("qlever", "dp_learned_cardinality"):
+            if f"vs_{name}" in speedup:
+                ratio = cout_ratio[f"ours_vs_{name}"]
+                print(f"  vs {name}: speedup {fmt(speedup[f'vs_{name}'])} "
+                      f"(rolling {fmt(speedup[f'vs_{name}_rolling'])}), C_out ours/{name} geomean "
+                      f"{fmt(ratio.get('geomean'))}, ours <= on {fmt(ratio.get('frac_at_most_1'), '.1%')}")
         torch.save({"state_dict": model.state_dict(), "model_kwargs": model_kwargs, "round": round_index},
                    run_directory / f"model-{round_index}.pt")
         with open(run_directory / "state.pkl", "wb") as f:
