@@ -20,7 +20,7 @@ online:
   plans_per_query: 4
   deviation_steps: closest
   # Train on the most recently executed queries, this many.
-  replay_queries: 5000
+  replay_queries: 10000
   # Training per round, as passes over the replay window: steps = passes * window states /
   # states_per_batch (states sampled with replacement, so a pass is one visit per state on
   # average). Each state then gets the same training per round however full the window
