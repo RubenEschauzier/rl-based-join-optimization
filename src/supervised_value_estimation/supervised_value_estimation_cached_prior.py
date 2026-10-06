@@ -17,6 +17,7 @@ from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.models.epistemic_neural_network import MultiHeadEpistemicNetwork, prepare_epinet_model
 from src.pretrain_procedure import DualMetricScheduler
 from src.utils.epinet_utils.epinet_evaluation import SplitAccumulator, metric_names, query_statistics
+from src.utils.epinet_utils.epinet_loss import anchor_vectors, epinet_term_loss
 from src.utils.epinet_utils.epinet_report import RunReporter, write_json
 from src.utils.epinet_utils.simulated_plan_cost_dataset import prepare_simulated_dataset, preprocess_plans
 from src.utils.training_utils.early_stopping import ConvergenceEarlyStopping
@@ -342,18 +343,26 @@ def loss_epinet(unweighted_ensemble_priors,
                 device,
                 head_name = "plan_cost",
                 epistemic_seed=None,
-                anchor_seed=0):
-    last_feature_detached = last_feature.detach()
+                anchor_seed=0,
+                anchor_keys=None):
+    """Base loss + epinet term (src/utils/epinet_utils/epinet_loss.epinet_term_loss).
+
+    `anchor_keys`: optional integer key per plan. Without it, the anchors are drawn from
+    `generator` seeded per query (plans[0][2]), in plan order, exactly as before.
+    """
     n_plans = estimated_cost.shape[0]
 
     # The anchor vectors c_i are the per-plan target perturbations; they are fixed per plan
     # so they stay consistent across epochs. `anchor_seed` gives each training seed its own
     # draw, so seed-to-seed variance includes this source of randomness. 0 keeps the
     # original per-plan seeds.
-    generator.manual_seed(plans[0][2] + anchor_seed * 2 ** 32)
-    # (n_plans, epi_index_dim)
-    c_vectors = torch.randn((n_plans, epinet_cost_estimation.epi_index_dim), generator=generator, device=device)
-    c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
+    if anchor_keys is None:
+        generator.manual_seed(plans[0][2] + anchor_seed * 2 ** 32)
+        # (n_plans, epi_index_dim)
+        c_vectors = torch.randn((n_plans, epinet_cost_estimation.epi_index_dim), generator=generator, device=device)
+        c_vectors = torch.nn.functional.normalize(c_vectors, dim=-1)
+    else:
+        c_vectors = anchor_vectors(anchor_keys, epinet_cost_estimation.epi_index_dim, anchor_seed, device)
 
     # (n_epi_indexes, epi_index_dim)
     epistemic_generator = None
@@ -364,40 +373,9 @@ def loss_epinet(unweighted_ensemble_priors,
         n_epi_indexes,
         generator=epistemic_generator,
     )
-    # (n_epi_indexes, n_plans)
-    ensemble_prior = torch.matmul(epinet_indexes, unweighted_ensemble_priors)
-    # Shape: (n_epi_indexes * n_plans, 1)
-    # Layout: Row-major contiguous flattening.
-    # Elements are grouped by epistemic index (ei), iterating through all plans for a given index before moving to the next:
-    # (plan_1_ei_1, plan_2_ei_1, ..., plan_n_ei_1,  plan_1_ei_2, plan_2_ei_2, ..., plan_n_ei_2,  ..., plan_n_ei_k)
-    # where ei = epistemic index sampled during training.
-    ensemble_prior_flat = ensemble_prior.view(-1, 1)
-
-    # Shape: (n_epi_indexes * n_plans, 1)
-    # Layout: Row-major contiguous block. Grouped by epistemic index: evaluates all plans
-    # using the first sampled index, then all plans using the second index, etc.
-    mlp_prior = epinet_cost_estimation.compute_mlp_prior_batched(last_feature_detached, epinet_indexes)
-    mlp_prior = mlp_prior[head_name]
-
-    # Shape: (n_epi_indexes * n_plans, 1)
-    # Layout: Matches the row-major, index-grouped layout of the priors.
-    learnable_mlp_prior = epinet_cost_estimation.compute_learnable_mlp_batched(last_feature_detached, epinet_indexes)
-    learnable_mlp_prior = learnable_mlp_prior[head_name]
-
-    # Shape: (n_epi_indexes * n_plans, 1)
-    # Layout: repeat(n_epi_indexes, 1) copies the full block of base plan costs K times.
-    # This aligns the base costs identically with the row-major, index-grouped layout of the Epinet.
-    estimated_cost_exp = estimated_cost.repeat(n_epi_indexes, 1)
-    
-
-    # Shape: (n_epi_indexes * n_plans)
-    # Layout: Row-major contiguous flattening.
-    # Grouped by epistemic index: calculates the perturbation (z * c) for all plans using
-    # the first sampled index, then all plans using the second index, etc.
-    
-    # TODO: Maybe this c_vectors should be correlated within a query. Not completely but a little
-    anchor_matrix = torch.matmul(epinet_indexes, c_vectors.T)
-    anchor_term_flat = anchor_matrix.view(-1)
+    # (n_epi_indexes, n_plans), flattened to (n_epi_indexes * n_plans, 1) grouped by index:
+    # all plans for the first sampled index, then all plans for the second, etc.
+    ensemble_prior_flat = torch.matmul(epinet_indexes, unweighted_ensemble_priors).view(-1, 1)
 
     raw_targets = torch.tensor([plan[1] for plan in plans], device=device)
 
@@ -405,19 +383,10 @@ def loss_epinet(unweighted_ensemble_priors,
     loss_base = loss(estimated_cost.squeeze(-1), raw_targets.float())
 
     # Epinet loss (we detach the base model so it doesn't receive z-variance gradients)
-    epinet_estimated_cost_detached = estimated_cost_exp.detach() + (
-            learnable_mlp_prior + alpha_mlp * mlp_prior + alpha_ensemble * ensemble_prior_flat
+    loss_epinet_only, unperturbed_target, epinet_estimated_cost_detached = epinet_term_loss(
+        epinet_cost_estimation, head_name, estimated_cost, last_feature, raw_targets, epinet_indexes,
+        c_vectors, sigma, alpha_mlp, loss, alpha_ensemble=alpha_ensemble, ensemble_prior_flat=ensemble_prior_flat,
     )
-
-    # (n_epi_indexes * n_plans)
-    raw_targets_exp = raw_targets.repeat(n_epi_indexes)
-
-    perturbed_targets = raw_targets_exp + sigma * anchor_term_flat
-
-    unperturbed_target = raw_targets_exp
-
-    
-    loss_epinet_only = loss(epinet_estimated_cost_detached.squeeze(-1), perturbed_targets)
     loss_total = loss_base + loss_epinet_only
 
     return loss_total, unperturbed_target, epinet_estimated_cost_detached

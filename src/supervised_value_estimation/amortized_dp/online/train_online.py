@@ -40,7 +40,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch_geometric.data import Batch
 
-from src.supervised_value_estimation.amortized_dp.agents import AmortizedDPAgent, load_cardinality_gnn
+from src.supervised_value_estimation.amortized_dp.agents import (
+    AmortizedDPAgent, EpinetAmortizedDPAgent, load_cardinality_gnn,
+)
 from src.supervised_value_estimation.amortized_dp.compare_agents import _resolve_checkpoint
 from src.supervised_value_estimation.amortized_dp.data import (
     compute_embeddings, load_datasets, load_split, query_index,
@@ -50,6 +52,7 @@ from src.supervised_value_estimation.amortized_dp.labels import (
 )
 from src.supervised_value_estimation.amortized_dp.model import ContractedJoinGraphValueNet
 from src.supervised_value_estimation.amortized_dp.online.executor import RayPlanExecutor, SimulatedExecutor
+from src.supervised_value_estimation.amortized_dp.online.exploration import thompson_plans
 from src.supervised_value_estimation.amortized_dp.online.observations import QueryObservations
 from src.supervised_value_estimation.amortized_dp.online.plan_quality import (
     join_cout, optimal_join_cout, p_error, ratio_summary, tree_join_cout,
@@ -57,7 +60,9 @@ from src.supervised_value_estimation.amortized_dp.online.plan_quality import (
 from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import load_or_count
 from src.supervised_value_estimation.amortized_dp.online.runtime_tree import parse_execution
 from src.supervised_value_estimation.amortized_dp.partial_observation import _TrainingSettings, deviation_plans
-from src.supervised_value_estimation.amortized_dp.train_amortized_dp import StateTables, training_step
+from src.supervised_value_estimation.amortized_dp.train_amortized_dp import (
+    StateTables, calibrate_epinet_prior, training_step,
+)
 from src.supervised_value_estimation.optuna_epinet_sweep import _resolve_model_paths
 from src.supervised_value_estimation.search_algorithms.beam_search_left_deep import beam_search
 
@@ -88,14 +93,21 @@ def _timeout(observations, timeouts):
     return float(min(timeouts.default_s, max(timeouts.min_s, timeouts.multiplier * best)))
 
 
-def _load_model(checkpoint, device):
+def _load_model(checkpoint, device, epinet_config=None):
+    """The offline value net plus the online heads (latency-to-go, step latency), which start
+    fresh. The epinet comes from the checkpoint if it has one (trained offline on card and G;
+    its latency/step heads start fresh), otherwise from `epinet_config` (None: no epinet)."""
     saved = torch.load(checkpoint, map_location=device)
-    model = ContractedJoinGraphValueNet(**{**saved["model_kwargs"], "latency_head": True})
+    kwargs = {**saved["model_kwargs"], "latency_head": True, "step_latency_head": True}
+    kwargs["epinet"] = saved["model_kwargs"].get("epinet") or epinet_config
+    model = ContractedJoinGraphValueNet(**kwargs)
     missing, unexpected = model.load_state_dict(saved["state_dict"], strict=False)
-    new = sorted(k for k in missing if not k.startswith("latency"))
+    fresh = ("latency", "step", "first_join_node", "epinet_step")
+    new = sorted(k for k in missing if not k.startswith(fresh) and ".latency." not in k
+                 and not (k.startswith("epinet_") and not saved["model_kwargs"].get("epinet")))
     if new or unexpected:
         raise RuntimeError(f"Checkpoint does not match the model: missing {new}, unexpected {unexpected}")
-    return model.to(device), {**saved["model_kwargs"], "latency_head": True}
+    return model.to(device), kwargs
 
 
 def _endpoints(execution):
@@ -138,6 +150,35 @@ def _plan_cout(plan, rows, result, triple_patterns):
         if parsed["aligned"] and len(parsed["prefix_rows"]) == len(plan) - 1:
             cost = sum(parsed["prefix_rows"].values())
     return cost
+
+
+def _epinet_card_diagnostics(model, val_dataset, val_by_query, true_rows, embeddings, indexes, device):
+    """Does the epinet's uncertainty point at its errors? Over every connected subset of the
+    validation queries with a known true count: the spread (std over the sampled indices) of
+    the predicted log cardinality against the base prediction's absolute error in log1p rows
+    (Spearman rank correlation), and how often the truth lies inside the samples' 5-95% range."""
+    from scipy.stats import spearmanr
+    spreads, errors, covered = [], [], []
+    for query, rows in true_rows.items():
+        known = [mask for mask, value in rows.items() if value is not None]
+        if not known:
+            continue
+        agent = EpinetAmortizedDPAgent(model, embed_fn=None, epistemic_indexes=indexes, device=device,
+                                       embedding_cache=embeddings)
+        episode = agent.setup_episode(Batch.from_data_list([val_dataset[val_by_query[query]]]))
+        agent._evaluate_states(episode, known)
+        base = model.unstandardise_head("card", torch.stack([episode["base"]["state"][m]["card"] for m in known]))
+        for mask, prediction in zip(known, base.tolist()):
+            samples, truth = episode["values"]["card"][mask], math.log1p(rows[mask])
+            spreads.append(float(np.std(samples)))
+            errors.append(abs(prediction - truth))
+            low, high = np.percentile(samples, [5, 95])
+            covered.append(low <= truth <= high)
+    if len(spreads) < 3:
+        return {"n": len(spreads)}
+    return {"n": len(spreads), "spearman_std_vs_error": float(spearmanr(spreads, errors).statistic),
+            "mean_std": float(np.mean(spreads)), "mean_abs_error": float(np.mean(errors)),
+            "coverage_90": float(np.mean(covered))}
 
 
 def _summarise_latencies(latencies, censored, native=None):
@@ -186,7 +227,19 @@ def main(cfg: DictConfig):
     print(f"Train pool: {len(train_pool)} variable-connected queries | validation: {len(validation_pool)}")
 
     checkpoint = _resolve_checkpoint(online.init_checkpoint, cfg.amortized_dp.output_directory, cfg)
-    model, model_kwargs = _load_model(checkpoint, device)
+    epinet_cfg = cfg.amortized_dp.get("epinet")
+    epinet_config = (OmegaConf.to_container(epinet_cfg.model, resolve=True)
+                     if epinet_cfg is not None and epinet_cfg.enabled else None)
+    model, model_kwargs = _load_model(checkpoint, device, epinet_config)
+    # Epinet training settings (sigma, indices per step); None trains no epinet term.
+    epinet_settings = epinet_cfg if model.has_epinet and epinet_cfg is not None else None
+    plan_selection = online.get("plan_selection", "deviation")
+    if plan_selection == "thompson" and not model.has_epinet:
+        raise ValueError("online.plan_selection=thompson needs an epinet (amortized_dp.epinet.enabled).")
+    print(f"Epinet: {model.epinet_config if model.has_epinet else 'none'} | plan selection: {plan_selection}, "
+          f"objective {online.get('decision_objective', 'cout')}")
+    thompson_generator = torch.Generator(device=device)
+    thompson_generator.manual_seed(int(online.seed))
     print(f"Initialised from {checkpoint} (+ new latency head)")
     # config.yaml only holds the spec ("latest:gine"); record which offline run it resolved to.
     with open(run_directory / "init_checkpoint.json", "w", encoding="utf-8") as f:
@@ -255,6 +308,14 @@ def main(cfg: DictConfig):
     optimum = {q: optimal_join_cout(skeletons[q][0], rows)[0] for q, rows in true_rows.items()}
     print(f"Optimal C_out known for {sum(v is not None for v in optimum.values())}/{len(val_by_query)} "
           f"validation queries")
+    # Robust planner: CVaR over a FIXED set of sampled indices, so validations stay comparable.
+    robust = validation.get("robust")
+    robust_indexes = None
+    if robust is not None and robust.enabled and model.has_epinet:
+        robust_generator = torch.Generator(device=device)
+        robust_generator.manual_seed(int(robust.seed))
+        robust_indexes = model.epinet_state.sample_epistemic_indexes_batched(int(robust.n_samples),
+                                                                             generator=robust_generator)
     native_cout = {}                    # QLever's own plan never changes: its C_out, once known
     # Baselines whose plans are fixed are re-executed at every validation; their latency is
     # reported both for this validation and as a per-query average over all validations so far.
@@ -282,15 +343,24 @@ def main(cfg: DictConfig):
         # Every planner's plan for a query is executed back to back, with the order rotated per
         # query, at EVERY validation: reusing old measurements of the fixed baselines would
         # compare cold first runs against later warm (page-cached) ones.
-        kinds = (["ours"] + (["native"] if validation.include_native else [])
-                 + (["dp"] if dp_plans else []))
-        requests, tags, our_planning_ms = [], [], []
+        kinds = (["ours"] + (["robust"] if robust_indexes is not None else [])
+                 + (["native"] if validation.include_native else []) + (["dp"] if dp_plans else []))
+        requests, tags, our_planning_ms, robust_planning_ms = [], [], [], []
+        shared = {}
         for k, i in enumerate(validation_pool):
             data = val_dataset[i]
             start = time.perf_counter()
             plan = beam_search(Batch.from_data_list([data]), agent, 1)[0]["plan"]
             our_planning_ms.append(1000 * (time.perf_counter() - start))
             plans = {"ours": [int(p) for p in plan], "native": None, "dp": dp_plans.get(data.query)}
+            if robust_indexes is not None:
+                start = time.perf_counter()
+                robust_agent = EpinetAmortizedDPAgent(model, embed_fn=None, epistemic_indexes=robust_indexes,
+                                                      device=device, embedding_cache=embeddings,
+                                                      objective=robust.objective, alpha_cvar=float(robust.alpha_cvar),
+                                                      shared=shared)
+                plans["robust"] = [int(p) for p in beam_search(Batch.from_data_list([data]), robust_agent, 1)[0]["plan"]]
+                robust_planning_ms.append(1000 * (time.perf_counter() - start))
             rotation = k % len(kinds)
             for kind in kinds[rotation:] + kinds[:rotation]:
                 requests.append({"query": data.query, "triple_patterns": list(data.triple_patterns),
@@ -334,20 +404,26 @@ def main(cfg: DictConfig):
                     **_summarise_latencies(rolling, [np.mean([c for _, c in history[kind][q]]) for q in queries]),
                     "validations_averaged": len(history[kind][queries[0]]) if queries else 0}
         planners["ours"]["planning"] = _time_summary(our_planning_ms)
+        if "robust" in planners:
+            planners["robust"]["planning"] = _time_summary(robust_planning_ms)
         if "dp" in planners:
             planners["dp"]["planning"] = _time_summary(dp_planning_ms)
 
         ours_latency = latencies("ours")
         speedup, cout_ratio = {}, {}
-        for kind, name in (("native", "qlever"), ("dp", "dp_learned_cardinality")):
-            if kind not in kinds:
+        for mine in ("ours", "robust"):
+            if mine not in kinds:
                 continue
-            rolling = [np.mean([lat for lat, _ in history[kind][q]]) for q in queries]
-            speedup[f"vs_{name}"] = _geomean_speedup(latencies(kind), ours_latency)
-            speedup[f"vs_{name}_rolling"] = _geomean_speedup(rolling, ours_latency)
-            cout_ratio[f"ours_vs_{name}"] = ratio_summary(
-                [max(costs["ours"][q], 1) / max(costs[kind][q], 1)
-                 if costs["ours"][q] is not None and costs[kind][q] is not None else None for q in queries])
+            prefix = "" if mine == "ours" else "robust_"
+            for kind, name in (("native", "qlever"), ("dp", "dp_learned_cardinality")):
+                if kind not in kinds:
+                    continue
+                rolling = [np.mean([lat for lat, _ in history[kind][q]]) for q in queries]
+                speedup[f"{prefix}vs_{name}"] = _geomean_speedup(latencies(kind), latencies(mine))
+                speedup[f"{prefix}vs_{name}_rolling"] = _geomean_speedup(rolling, latencies(mine))
+                cout_ratio[f"{mine}_vs_{name}"] = ratio_summary(
+                    [max(costs[mine][q], 1) / max(costs[kind][q], 1)
+                     if costs[mine][q] is not None and costs[kind][q] is not None else None for q in queries])
 
         summary = {"round": round_index,
                    "executed_plans_total": sum(len(o.executions) for o in observations.values()),
@@ -356,6 +432,9 @@ def main(cfg: DictConfig):
                                           latencies("native") if "native" in kinds else None),
                    "planners": planners, "speedup": speedup, "cout_ratio": cout_ratio,
                    "optimum_known": sum(optimum.get(q) is not None for q in queries)}
+        if robust_indexes is not None and true_rows:
+            summary["epinet_card"] = _epinet_card_diagnostics(model, val_dataset, val_by_query, true_rows,
+                                                              embeddings, robust_indexes, device)
         with open(run_directory / "validation.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
 
@@ -364,7 +443,7 @@ def main(cfg: DictConfig):
 
         print(f"[validation round {round_index}] {len(queries)} queries, optimum known for "
               f"{summary['optimum_known']}")
-        for kind, label in (("ours", "ours  "), ("native", "QLever"), ("dp", "DP-LC ")):
+        for kind, label in (("ours", "ours  "), ("robust", "robust"), ("native", "QLever"), ("dp", "DP-LC ")):
             if kind not in planners:
                 continue
             latency, perror = planners[kind]["latency"], planners[kind]["p_error"]
@@ -378,12 +457,18 @@ def main(cfg: DictConfig):
             if "planning" in planners[kind]:
                 line += f" | planning median {planners[kind]['planning']['median_ms']:.1f} ms"
             print(line)
-        for name in ("qlever", "dp_learned_cardinality"):
-            if f"vs_{name}" in speedup:
-                ratio = cout_ratio[f"ours_vs_{name}"]
-                print(f"  vs {name}: speedup {fmt(speedup[f'vs_{name}'])} "
-                      f"(rolling {fmt(speedup[f'vs_{name}_rolling'])}), C_out ours/{name} geomean "
-                      f"{fmt(ratio.get('geomean'))}, ours <= on {fmt(ratio.get('frac_at_most_1'), '.1%')}")
+        for mine, prefix in (("ours", ""), ("robust", "robust_")):
+            for name in ("qlever", "dp_learned_cardinality"):
+                if f"{prefix}vs_{name}" in speedup:
+                    ratio = cout_ratio[f"{mine}_vs_{name}"]
+                    print(f"  {mine} vs {name}: speedup {fmt(speedup[f'{prefix}vs_{name}'])} "
+                          f"(rolling {fmt(speedup[f'{prefix}vs_{name}_rolling'])}), C_out {mine}/{name} geomean "
+                          f"{fmt(ratio.get('geomean'))}, {mine} <= on {fmt(ratio.get('frac_at_most_1'), '.1%')}")
+        if "epinet_card" in summary and summary["epinet_card"].get("n", 0) >= 3:
+            diag = summary["epinet_card"]
+            print(f"  epinet card uncertainty: Spearman(std, |error|) {diag['spearman_std_vs_error']:.3f}, "
+                  f"mean std {diag['mean_std']:.3f} vs mean |error| {diag['mean_abs_error']:.3f}, "
+                  f"90% coverage {diag['coverage_90']:.1%} ({diag['n']} subsets)")
         torch.save({"state_dict": model.state_dict(), "model_kwargs": model_kwargs, "round": round_index},
                    run_directory / f"model-{round_index}.pt")
         with open(run_directory / "state.pkl", "wb") as f:
@@ -401,6 +486,7 @@ def main(cfg: DictConfig):
         ensure_embedded(train_dataset, batch)
         model.eval()
         agent = AmortizedDPAgent(model, embed_fn=None, device=device, embedding_cache=embeddings)
+        shared = {}                     # value-net outputs shared by the Thompson samples of a query
         requests, is_greedy = [], []
         for i in batch:
             data = train_dataset[i]
@@ -410,8 +496,12 @@ def main(cfg: DictConfig):
             order_seen[data.query] = None
             obs = observations[data.query]
             timeout_s = _timeout(obs, online.timeouts)
-            plans = deviation_plans(agent, Batch.from_data_list([data]), obs.labels, online.plans_per_query,
-                                    online.deviation_steps, rng)
+            if plan_selection == "thompson":
+                plans = thompson_plans(model, data, online.plans_per_query, embeddings, device, thompson_generator,
+                                       objective=online.get("decision_objective", "cout"), shared=shared)
+            else:
+                plans = deviation_plans(agent, Batch.from_data_list([data]), obs.labels, online.plans_per_query,
+                                        online.deviation_steps, rng)
             for k, plan in enumerate(plans):
                 requests.append({"query": data.query, "triple_patterns": list(data.triple_patterns),
                                  "plan": plan, "timeout_s": timeout_s})
@@ -434,10 +524,20 @@ def main(cfg: DictConfig):
         tables = StateTables([o.labels for o in window_obs], [embeddings[q] for q in window], device,
                              patterns_list=[o.triple_patterns for o in window_obs],
                              observed_logcards=[o.logcard for o in window_obs], cost_to_go_upper_bound=True,
-                             latency_to_go=[o.latency_to_go() for o in window_obs])
+                             latency_to_go=[o.latency_to_go() for o in window_obs],
+                             step_ms=[o.step_ms for o in window_obs])
         if not latency_statistics_set:
             model.set_latency_statistics(*tables.latency_statistics())
+            model.set_step_statistics(*tables.step_statistics())
             latency_statistics_set = True
+            if epinet_settings is not None:
+                # Prior weights for the heads the offline run did not calibrate (latency, step).
+                calibrated = calibrate_epinet_prior(model, tables, ["card", "cost_to_go", "latency", "step"],
+                                                    epinet_settings)
+                for head, (scale, alpha) in calibrated.items():
+                    print(f"Epinet prior {head}: std {scale:.3f} -> alpha {alpha:.4f} "
+                          f"(target {epinet_settings.prior_scale_target})")
+                model_kwargs["epinet"] = model.epinet_config     # saved with every checkpoint
         model.train()
         running = []
         if online.get("gradient_steps_per_round") is not None:
@@ -447,7 +547,7 @@ def main(cfg: DictConfig):
                                               / cfg_training.states_per_batch))
         for _ in range(gradient_steps):
             state_ids = torch.randint(0, tables.n_states, (cfg_training.states_per_batch,), device=device)
-            loss, parts = training_step(model, tables, state_ids, loss_settings)
+            loss, parts = training_step(model, tables, state_ids, loss_settings, epinet_settings=epinet_settings)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_training.grad_clip)
@@ -464,14 +564,18 @@ def main(cfg: DictConfig):
             "greedy_mean_latency_s": float(np.mean([r["latency_s"] for r in greedy])),
             "greedy_timeout_rate": float(np.mean([r["censored"] for r in greedy])),
             "all_plans_mean_latency_s": float(np.mean([r["latency_s"] for r in results])),
-            **{key: float(np.mean([p[key] for p in running if key in p])) for key in running[0]},
+            **{key: float(np.mean([p[key] for p in running if key in p])) for key in sorted(set().union(*running))},
+            "plan_selection": plan_selection,
             "planning_seconds": planning_seconds, "execution_seconds": execution_seconds,
             "train_seconds": train_seconds, "window_states": tables.n_states, "gradient_steps": gradient_steps,
         }
         with open(run_directory / "rounds.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
-        heads = ", ".join(f"{key[5:]} {summary[key]:.3f}" for key in ("loss_card", "loss_g", "loss_rank", "loss_latency")
-                          if key in summary)
+        heads = ", ".join(f"{key[5:]} {summary[key]:.3f}" for key in ("loss_card", "loss_g", "loss_rank", "loss_latency",
+                                                                      "loss_step") if key in summary)
+        epinet_terms = sum(value for key, value in summary.items() if key.startswith("loss_epinet_"))
+        if any(key.startswith("loss_epinet_") for key in summary):
+            heads += f", epinet {epinet_terms:.3f}"
         print(f"Round {round_index}: {len(requests)} plans ({summary['timeout_rate']:.1%} timeouts, "
               f"{summary['aligned_rate']:.1%} aligned, {summary['cached_rate']:.1%} cached), loss {summary['loss']:.3f} "
               f"({heads}) | plan {planning_seconds:.0f}s, execute {execution_seconds:.0f}s, "

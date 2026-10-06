@@ -48,6 +48,28 @@ amortized_dp:
     # Ties are broken by geomean_ratio. p90: online rounds wait for their slowest plans.
     selection_metric: p90_ratio
 
+  # Epinet on the value net (src/models/mlp_epinet.py): a learnable MLP plus a frozen MLP prior
+  # over the (stop-gradient) context features, one shared epistemic index z for all heads.
+  # Offline it is trained on the card and G heads; online also on latency-to-go and step
+  # latency. Architecture as the trial-85 epinet (index 16, hidden 64, prior hidden 128,
+  # MLP prior only); sigma is the target perturbation, in standardised target units.
+  epinet:
+    enabled: true
+    model:
+      index_dim: 16
+      hidden_dim: 64
+      prior_hidden_dim: 128
+      alpha_mlp: 1.0
+    sigma: 0.0339
+    # Prior width, as prior_scale_target in the plan-cost epinet: per head, alpha is set so the
+    # prior's std over z on the training rows equals this (standardised target units). Without
+    # it the prior is ~5 std wide here (the context features are large), far too broad to plan
+    # with. null keeps alpha_mlp as is.
+    prior_scale_target: 1.0
+    prior_scale_indexes: 64
+    # Sampled indices per gradient step (each row is fit under all of them).
+    n_indexes_train: 16
+
 comparison:
   num_workers: 6
   samples_per_execution_batch: 256

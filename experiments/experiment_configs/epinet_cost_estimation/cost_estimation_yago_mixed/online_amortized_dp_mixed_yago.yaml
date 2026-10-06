@@ -18,7 +18,13 @@ online:
   queries_per_round: 2048
   # Greedy plan + (K - 1) one-step deviations at the closest calls.
   plans_per_query: 4
+  # thompson: each plan greedy under its own sampled epinet index (needs amortized_dp.epinet);
+  # deviation: greedy plan + one-step deviations at the closest decisions (deviation_steps).
+  plan_selection: thompson
   deviation_steps: closest
+  # What the Thompson samples minimise: cout (sum of cards + G) or latency (sum of step
+  # latencies + latency-to-go, from the online heads).
+  decision_objective: cout
   # Train on the most recently executed queries, this many.
   replay_queries: 5000
   # Training per round, as passes over the replay window: steps = passes * window states /
@@ -49,6 +55,15 @@ online:
     # over all validations so far ("rolling"), which is less noisy.
     include_native: true
     include_dp_learned_cardinality: true
+    # Robust planner, a 4th planner in every validation (needs the epinet): greedy on the
+    # CVaR_alpha (mean of the worst 1 - alpha share) of the plan scores under n_samples FIXED
+    # sampled indices, objective latency (tail latency) or cout.
+    robust:
+      enabled: true
+      n_samples: 32
+      alpha_cvar: 0.9
+      objective: latency
+      seed: 0
     # True row counts of every connected subset of the validation queries (COUNT(*) per subset
     # on the QLever endpoints, once, cached) give the optimal plan for the p-error:
     # C_out(plan) / C_out(optimal left-deep plan), C_out = sum of join output sizes.

@@ -27,6 +27,8 @@ from src.models.query_plan_prediction_model import QueryPlansPredictionModel, Pl
 import torch
 import torch.nn as nn
 
+from src.models.mlp_epinet import MLPEpinetMixin, glorot_init
+
 def instantiate_heads_config(heads_config):
     """Return a heads config holding a *fresh* module per head.
 
@@ -53,7 +55,7 @@ def instantiate_heads_config(heads_config):
     return instantiated
 
 
-class MultiHeadEpistemicNetwork(nn.Module):
+class MultiHeadEpistemicNetwork(MLPEpinetMixin, nn.Module):
     def __init__(self,
                  epi_index_dim, prior_config,
                  cost_estimation_model: QueryPlansPredictionModel,
@@ -82,11 +84,7 @@ class MultiHeadEpistemicNetwork(nn.Module):
         self.prior_epinet_hidden_dim = prior_epinet_hidden_dim or self.epinet_hidden_dim
 
         # Glorot initialization as described in Epistemic Neural Networks paper
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        init_weights = glorot_init
 
         # We use an ensemble of tiny gine_conv as priors
         model_factory_gine_conv = ModelFactory(prior_config)
@@ -132,48 +130,10 @@ class MultiHeadEpistemicNetwork(nn.Module):
         # after load_state_dict, which calls refresh_batched_ensemble().
         self.refresh_batched_ensemble()
 
-        # Initialize learnable epinet with bae feature extractor and multiple heads
-        self.learnable_epinet_features = nn.Sequential(
-            nn.Linear(self.epinet_feature_dim + epi_index_dim, self.epinet_hidden_dim),
-            nn.ReLU(),
-        ).to(device)
-        self.learnable_epinet_features.apply(init_weights)
-
-        self.learnable_epinet_heads = nn.ModuleDict()
-        for head_name in self.head_names:
-            head_layer = nn.Linear(self.epinet_hidden_dim, epi_index_dim)
-            nn.init.zeros_(head_layer.weight)
-            nn.init.zeros_(head_layer.bias)
-            self.learnable_epinet_heads[head_name] = head_layer.to(device)
-        # # Initialize the last layer to always output zero from learnable.
-        # last_layer = nn.Linear(self.mlp_output_dim_cost_model//2, epi_index_dim)
-        # nn.init.zeros_(last_layer.weight)
-        # nn.init.zeros_(last_layer.bias)
-        # self.learnable_epinet.apply(init_weights)
-        # self.learnable_epinet.add_module("last_layer", last_layer)
-
-        # Prior MLP mirrors the learnable one (same architecture, different parameters),
-        # as in deepmind/enn's MLPEpinetWithPrior.
-        self.prior_epinet_features = nn.Sequential(
-            nn.Linear(self.epinet_feature_dim + epi_index_dim, self.prior_epinet_hidden_dim),
-            nn.ReLU(),
-        ).to(device)
-        self.prior_epinet_features.apply(init_weights)
-
-        # Freeze prior features
-        for param in self.prior_epinet_features.parameters():
-            param.requires_grad = False
-
-        self.prior_epinet_heads = nn.ModuleDict()
-        for head_name in self.head_names:
-            prior_head = nn.Linear(self.prior_epinet_hidden_dim, epi_index_dim)
-            prior_head.apply(init_weights)
-
-            # Freeze prior head
-            for param in prior_head.parameters():
-                param.requires_grad = False
-
-            self.prior_epinet_heads[head_name] = prior_head.to(device)
+        # Learnable epinet + frozen MLP prior (src/models/mlp_epinet.py), created here, after
+        # the ensemble, so seeded constructions draw the same random numbers as before.
+        self._build_mlp_epinet(self.epinet_feature_dim, epi_index_dim, self.head_names,
+                               self.epinet_hidden_dim, self.prior_epinet_hidden_dim, device)
 
     def embed_query_batched(self, queries):
         return self.cost_estimation_model.embed_query_batched(queries)
@@ -299,104 +259,8 @@ class MultiHeadEpistemicNetwork(nn.Module):
 
         pass
 
-    def compute_mlp_prior(self, last_feature, epi_index):
-        concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
-        shared_features = self.prior_epinet_features(concat_input)
-
-        epinet_outputs = {}
-        for head_name, head_layer in self.prior_epinet_heads.items():
-            mlp_output = head_layer(shared_features)
-            epinet_outputs[head_name] = mlp_output @ epi_index.T
-
-        return epinet_outputs
-
-    def compute_learnable_mlp(self, last_feature, epi_index):
-        concat_input = torch.cat([last_feature, epi_index.expand(last_feature.shape[0], -1)], dim=1)
-        shared_features = self.learnable_epinet_features(concat_input)
-
-        epinet_outputs = {}
-        for head_name, head_layer in self.learnable_epinet_heads.items():
-            mlp_output = head_layer(shared_features)
-            epinet_outputs[head_name] = mlp_output @ epi_index.T
-
-        return epinet_outputs
-
-    def compute_mlp_prior_batched(self, last_feature, epi_indexes):
-        n = last_feature.shape[0]
-        k = epi_indexes.shape[0]
-
-        # Repeat features K times: [N, F] -> [K*N, F]
-        # Stacks last features on top of each other. So
-        #            lf_1_1, ..., lf_1_F
-        # ep_index_1:  ...
-        #            lf_N_1, ..., lf_N_F
-        #            lf_1_1, ..., lf_1_F
-        # epi_index_2: ...
-        #            lf_N_1, ..., lf_N_F
-        last_feature_exp = last_feature.repeat(k, 1)
-
-        # Interleave indexes N times: [K, D] -> [K*N, D]
-        # Repeat interleave repeats the first row n times then second row n times
-        # so:
-        # epi_index_1_1,
-        # ...
-        # epi_index_1_n,
-        # epi_index_2_1,
-        # ...
-        # epi_index_2_n,
-        # ...
-        # With epi_index_ an epi_index_dim row_vector
-        epi_indexes_exp = epi_indexes.repeat_interleave(n, dim=0)
-
-        # Concatenate features and indexes along the feature dimension (dim=1).
-        # Each row becomes [last_feature, epi_index].
-        # The layout groups by sampled epistemic index (e), iterating through all plans:
-        # [e_0_plan_0, ..., e_0_plan_{N-1}, e_1_plan_0, ..., e_1_plan_{N-1}, ...]
-        # Total shape: [N * K, F + D]
-        concat_input = torch.cat([last_feature_exp, epi_indexes_exp], dim=1)
-        # [N * K, out_dim]
-        shared_features = self.prior_epinet_features(concat_input)
-
-        epinet_outputs = {}
-        for head_name, head_layer in self.prior_epinet_heads.items():
-            mlp_output = head_layer(shared_features)
-            epinet_outputs[head_name] = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
-        # Output is blockwise so All plans for sampled index one, then two etc
-        return epinet_outputs
-
-    def compute_learnable_mlp_batched(self, last_feature, epi_indexes):
-        n = last_feature.shape[0]
-        k = epi_indexes.shape[0]
-
-        last_feature_exp = last_feature.repeat(k, 1)
-        epi_indexes_exp = epi_indexes.repeat_interleave(n, dim=0)
-
-        concat_input = torch.cat([last_feature_exp, epi_indexes_exp], dim=1)
-        shared_features = self.learnable_epinet_features(concat_input)
-
-        epinet_outputs = {}
-        for head_name, head_layer in self.learnable_epinet_heads.items():
-            mlp_output = head_layer(shared_features)
-            epinet_outputs[head_name] = (mlp_output * epi_indexes_exp).sum(dim=1, keepdim=True)
-
-        return epinet_outputs
-
-    def sample_epistemic_indexes(self):
-        return torch.normal(0, 1, size=(1, self.epi_index_dim), device=self.device)
-
-    def sample_epistemic_indexes_batched(self, n_epi_indexes, generator=None):
-        return torch.randn(
-            (n_epi_indexes, self.epi_index_dim),
-            device=self.device,
-            generator=generator,
-        )
-
-    def get_learnable_epinet_params(self):
-        """Returns parameters for the learnable MLP features and heads of the Epinet."""
-        params = list(self.learnable_epinet_features.parameters())
-        for head in self.learnable_epinet_heads.values():
-            params.extend(list(head.parameters()))
-        return params
+    # compute_mlp_prior[_batched], compute_learnable_mlp[_batched],
+    # sample_epistemic_indexes[_batched] and get_learnable_epinet_params: see MLPEpinetMixin.
 
     def get_query_embedding_model_params(self):
         """Returns parameters for the base GNN query embedding model."""

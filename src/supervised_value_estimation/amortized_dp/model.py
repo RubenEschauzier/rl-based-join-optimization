@@ -24,7 +24,20 @@ Message passing (`message_layer`), all dense over the <= n+1 contracted nodes:
 Edge features e_uv are the join-position counts of labels.join_position_features; the
 super-node's edge to a pattern sums them over the members of S. mean ignores them.
 
-Both heads predict standardised targets; `unstandardise` maps them back to log space.
+Optional heads, for online training on real executions (log1p of milliseconds):
+    latency head  remaining latency from S (latency-to-go), the latency analogue of G;
+    step head     latency of the join step that adds pattern a to S \ {a} (or, for a pair,
+                  of the first join including both scans), from the context of S and a's node.
+    Plan latency is then the sum of step latencies along a prefix plus its latency-to-go,
+    as C_out is the sum of cards plus G.
+
+Optional epinet (src/models/mlp_epinet.py), one shared epistemic index z for all heads:
+    epinet_state  card, G and latency-to-go heads, on the context of S (so a sampled card of S
+                  does not depend on the order S was built in);
+    epinet_step   the step head, on the context of S plus the added pattern's node.
+    A sample is base(S) + learnable(sg[features], z) + alpha_mlp * prior(sg[features], z).
+
+All heads predict standardised targets; `unstandardise` maps them back to log space.
 Inputs are dense and padded to the largest query in the batch (queries have <= ~20
 patterns), which keeps every step a handful of batched matmuls.
 """
@@ -32,6 +45,8 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+
+from src.models.mlp_epinet import MLPEpinet
 
 
 def _mlp(in_dim, hidden, out_dim, layers=2):
@@ -92,7 +107,8 @@ class _GATLayer(nn.Module):
 
 class ContractedJoinGraphValueNet(nn.Module):
     def __init__(self, embedding_dim=200, hidden_dim=128, n_message_layers=3, max_triple_patterns=32,
-                 message_layer="mean", edge_feature_dim=0, latency_head=False):
+                 message_layer="mean", edge_feature_dim=0, latency_head=False, step_latency_head=False,
+                 epinet=None):
         super().__init__()
         if message_layer not in MESSAGE_LAYERS:
             raise ValueError(f"message_layer must be one of {MESSAGE_LAYERS}, got {message_layer!r}")
@@ -129,6 +145,24 @@ class ContractedJoinGraphValueNet(nn.Module):
         if latency_head:
             self.latency_head = _mlp(3 * hidden_dim + 3, hidden_dim, 1)
             self.register_buffer("latency_statistics", torch.tensor([0.0, 1.0]))
+        # Optional step-latency head: the first join (both scans, no "added" pattern) gets a
+        # learned stand-in for the added pattern's node.
+        self.has_step_head = step_latency_head
+        if step_latency_head:
+            self.first_join_node = nn.Parameter(torch.zeros(hidden_dim))
+            self.step_head = _mlp(4 * hidden_dim + 2, hidden_dim, 1)
+            self.register_buffer("step_statistics", torch.tensor([0.0, 1.0]))
+        # Optional epinet: {index_dim, hidden_dim, prior_hidden_dim, alpha_mlp, and after
+        # calibration alpha: {head: prior weight}}.
+        self.epinet_config = dict(epinet) if epinet else None
+        if self.epinet_config:
+            config = self.epinet_config
+            state_heads = ["card", "cost_to_go"] + (["latency"] if latency_head else [])
+            self.epinet_state = MLPEpinet(3 * hidden_dim + 1, config["index_dim"], state_heads,
+                                          config["hidden_dim"], config.get("prior_hidden_dim"))
+            if step_latency_head:
+                self.epinet_step = MLPEpinet(4 * hidden_dim + 1, config["index_dim"], ["step"],
+                                             config["hidden_dim"], config.get("prior_hidden_dim"))
 
     def set_target_statistics(self, card_mean, card_std, cost_to_go_mean, cost_to_go_std):
         self.target_statistics.copy_(torch.tensor(
@@ -153,6 +187,52 @@ class ContractedJoinGraphValueNet(nn.Module):
         mean, std = self.latency_statistics
         return latency * std + mean
 
+    def set_step_statistics(self, mean, std):
+        self.step_statistics.copy_(torch.tensor([mean, max(std, 1e-6)]))
+
+    def standardise_step(self, step):
+        mean, std = self.step_statistics
+        return (step - mean) / std
+
+    def unstandardise_step(self, step):
+        mean, std = self.step_statistics
+        return step * std + mean
+
+    def unstandardise_head(self, head, value):
+        """Standardised output of `head` -> log space (log card, log G, log1p ms)."""
+        if head == "card":
+            return value * self.target_statistics[1] + self.target_statistics[0]
+        if head == "cost_to_go":
+            return value * self.target_statistics[3] + self.target_statistics[2]
+        if head == "latency":
+            return self.unstandardise_latency(value)
+        return self.unstandardise_step(value)
+
+    @property
+    def has_epinet(self):
+        return self.epinet_config is not None
+
+    @property
+    def epi_index_dim(self):
+        return self.epinet_config["index_dim"] if self.epinet_config else 0
+
+    def epinet_for(self, head):
+        return self.epinet_step if head == "step" else self.epinet_state
+
+    def epinet_alpha(self, head):
+        """Prior weight of one head: calibrated per head (epinet_config["alpha"]) when available,
+        else the global alpha_mlp."""
+        return self.epinet_config.get("alpha", {}).get(head, self.epinet_config.get("alpha_mlp", 1.0))
+
+    def epinet_samples(self, outputs, epi_indexes, heads):
+        """{head: (K, B)} standardised samples base + epinet correction, for indices (K, D)."""
+        samples = {}
+        for head in heads:
+            features = outputs["features_step" if head == "step" else "features_state"].detach()
+            samples[head] = self.epinet_for(head).sample(outputs[head].detach(), features, epi_indexes, head,
+                                                         self.epinet_alpha(head))
+        return samples
+
     def forward(self, embeddings, pattern_mask, adjacency, state, edge_features=None, return_latency=False):
         """
         embeddings:    (B, n, E) frozen triple-pattern embeddings, zero-padded
@@ -163,6 +243,18 @@ class ContractedJoinGraphValueNet(nn.Module):
         returns standardised (log card(S), log G(S)), each (B,); with return_latency also the
         standardised log remaining latency (requires latency_head=True)
         """
+        heads = ("card", "cost_to_go", "latency") if return_latency else ("card", "cost_to_go")
+        if return_latency and not self.has_latency_head:
+            raise ValueError("This model has no latency head; build it with latency_head=True.")
+        outputs = self.forward_heads(embeddings, pattern_mask, adjacency, state, edge_features, heads=heads)
+        return tuple(outputs[head] for head in heads)
+
+    def forward_heads(self, embeddings, pattern_mask, adjacency, state, edge_features=None, added=None,
+                      heads=("card", "cost_to_go")):
+        """Standardised outputs {head: (B,)} for the requested heads, plus the epinet features
+        "features_state" (B, 3H+1) and, with the step head, "features_step" (B, 4H+1).
+        added: (B,) long, the pattern whose join produced S (-1 for a pair's first join);
+        required for the step head."""
         state = state & pattern_mask
         remaining = pattern_mask & ~state
         nodes = self.input_projection(embeddings)                               # (B, n, H)
@@ -218,11 +310,20 @@ class ContractedJoinGraphValueNet(nn.Module):
         card = self.card_head(set_encoding).squeeze(-1)
         context = torch.cat([features[:, 0], remaining_pool, set_encoding, fraction_left], dim=-1)
         cost_to_go = self.cost_to_go_head(context).squeeze(-1)
-        if return_latency:
-            if not self.has_latency_head:
-                raise ValueError("This model has no latency head; build it with latency_head=True.")
-            latency = self.latency_head(
+        outputs = {"card": card, "cost_to_go": cost_to_go, "features_state": context}
+        if "latency" in heads:
+            outputs["latency"] = self.latency_head(
                 torch.cat([context, card.unsqueeze(-1), cost_to_go.unsqueeze(-1)], dim=-1)
             ).squeeze(-1)
-            return card, cost_to_go, latency
-        return card, cost_to_go
+        if "step" in heads:
+            if not self.has_step_head:
+                raise ValueError("This model has no step head; build it with step_latency_head=True.")
+            added = added.to(nodes.device)
+            picked = nodes[torch.arange(batch_size, device=nodes.device), added.clamp(min=0)]
+            added_node = torch.where((added >= 0).unsqueeze(-1), picked,
+                                     self.first_join_node.expand(batch_size, -1))
+            outputs["features_step"] = torch.cat([context, added_node], dim=-1)
+            outputs["step"] = self.step_head(
+                torch.cat([outputs["features_step"], card.unsqueeze(-1)], dim=-1)
+            ).squeeze(-1)
+        return outputs

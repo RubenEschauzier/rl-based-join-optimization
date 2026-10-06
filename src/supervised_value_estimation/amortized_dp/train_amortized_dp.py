@@ -45,6 +45,7 @@ from src.supervised_value_estimation.amortized_dp.simulated_execution import (
 )
 from src.supervised_value_estimation.optuna_epinet_sweep import _resolve_model_paths
 from src.supervised_value_estimation.search_algorithms.beam_search_left_deep import beam_search
+from src.utils.epinet_utils.epinet_loss import anchor_vectors, epinet_term_loss, stable_key
 
 
 class StateTables:
@@ -58,10 +59,14 @@ class StateTables:
     """
 
     def __init__(self, labels_list, embeddings_list, device, patterns_list=None, observed_logcards=None,
-                 cost_to_go_upper_bound=False, latency_to_go=None):
-        """`latency_to_go`: optional per-query {set: log1p(remaining ms)} for the latency head."""
+                 cost_to_go_upper_bound=False, latency_to_go=None, step_ms=None):
+        """`latency_to_go`: optional per-query {set: log1p(remaining ms)} for the latency head.
+        `step_ms`: optional per-query {(parent set, child set): ms} for the step head (parent 0 =
+        a pair's first join). Every row also carries stable keys for the epinet anchors:
+        key_state for (query, child set) and key_step for (query, parent set, child set)."""
         self.cost_to_go_upper_bound = cost_to_go_upper_bound
         self.has_latency = latency_to_go is not None
+        self.has_step = step_ms is not None
         n_max = max(labels.n_tp for labels in labels_list)
         embedding_dim = embeddings_list[0].shape[1]
         n_queries = len(labels_list)
@@ -77,7 +82,8 @@ class StateTables:
 
         rows = {key: [] for key in ("query", "state", "mask", "card", "g", "full", "root",
                                     "single_a", "single_b", "card_a", "card_b", "true_logq",
-                                    "latency", "latency_valid")}
+                                    "latency", "latency_valid", "parent", "added", "step", "step_valid",
+                                    "key_state", "key_step")}
         n_states = 0
         for query_id, (labels, embeddings) in enumerate(zip(labels_list, embeddings_list)):
             n = labels.n_tp
@@ -89,8 +95,10 @@ class StateTables:
             logcard = labels.logcard if observed_logcards is None else observed_logcards[query_id]
             log_g = cost_to_go(labels, logcard)
             latency = {} if latency_to_go is None else latency_to_go[query_id]
+            steps = {} if step_ms is None else step_ms[query_id]
+            query_key = stable_key(labels.query)
 
-            def add_row(child, root=False, a=0, b=0):
+            def add_row(child, root=False, a=0, b=0, parent=0):
                 full = child == labels.full_mask
                 extra = min(logcard[1 << a], logcard[1 << b]) if root else -math.inf
                 rows["query"].append(query_id)
@@ -107,6 +115,12 @@ class StateTables:
                 rows["true_logq"].append(logsumexp([logcard[child], -math.inf if full else log_g[child], extra]))
                 rows["latency"].append(latency.get(child, 0.0))
                 rows["latency_valid"].append(child in latency)
+                rows["parent"].append(parent)
+                rows["added"].append(-1 if root else (child ^ parent).bit_length() - 1)
+                rows["step"].append(math.log1p(steps[(parent, child)]) if (parent, child) in steps else 0.0)
+                rows["step_valid"].append((parent, child) in steps)
+                rows["key_state"].append(stable_key(query_key, child))
+                rows["key_step"].append(stable_key(query_key, parent, child))
 
             root_pairs = [(i, j) for i, j in labels.connected_pairs()
                           if {(1 << i) | (1 << j), 1 << i, 1 << j} <= logcard.keys()
@@ -124,7 +138,7 @@ class StateTables:
                 if len(children) < 1:
                     continue
                 for child in children:
-                    add_row(child)
+                    add_row(child, parent=mask)
                 n_states += 1
 
         self.rows = {key: torch.tensor(value) for key, value in rows.items()}
@@ -140,6 +154,10 @@ class StateTables:
 
     def latency_statistics(self):
         values = self.rows["latency"][self.rows["latency_valid"]]
+        return (float(values.mean()), float(values.std())) if len(values) > 1 else (0.0, 1.0)
+
+    def step_statistics(self):
+        values = self.rows["step"][self.rows["step_valid"]]
         return (float(values.mean()), float(values.std())) if len(values) > 1 else (0.0, 1.0)
 
     def statistics(self):
@@ -175,12 +193,85 @@ def _group_log_softmax(logits, groups, n_groups):
     return logits - peak[groups] - torch.log(normaliser[groups])
 
 
-def training_step(model, tables, state_ids, cfg_training):
+def _one_sided_mse(under_weight):
+    """Squared error, weighted under_weight when the prediction is below the target: the
+    target is an upper bound (the cheapest KNOWN completion), so the truth can only be lower."""
+    def loss(prediction, target):
+        error = prediction - target
+        error = error * torch.where(error > 0, torch.ones_like(error), torch.full_like(error, under_weight ** 0.5))
+        return torch.mean(error ** 2)
+    return loss
+
+
+def _mse(prediction, target):
+    return torch.mean((prediction - target) ** 2)
+
+
+# Distinct anchor draws per head (anchor_vectors' seed), so a set's card and G perturbations
+# are independent.
+EPINET_HEAD_SEEDS = {"card": 1, "cost_to_go": 2, "latency": 3, "step": 4}
+
+
+def _epinet_losses(model, outputs, r, targets, epinet_settings):
+    """The epinet term (src/utils/epinet_utils/epinet_loss.py) for every head with targets.
+    targets: {head: (valid row mask, standardised target, loss_fn)}."""
+    epinet_indexes = model.epinet_state.sample_epistemic_indexes_batched(int(epinet_settings.n_indexes_train))
+    losses = {}
+    for head, (valid, target, loss_fn) in targets.items():
+        if not valid.any():
+            continue
+        keys = r["key_step" if head == "step" else "key_state"][valid].cpu().numpy()
+        anchors = anchor_vectors(keys, model.epi_index_dim, EPINET_HEAD_SEEDS[head], target.device)
+        features = outputs["features_step" if head == "step" else "features_state"][valid]
+        losses[head], _, _ = epinet_term_loss(
+            model.epinet_for(head), head, outputs[head][valid].unsqueeze(-1), features, target[valid],
+            epinet_indexes, anchors, float(epinet_settings.sigma), model.epinet_alpha(head), loss_fn)
+    return losses
+
+
+@torch.no_grad()
+def calibrate_epinet_prior(model, tables, heads, epinet_settings, max_rows=4096):
+    """prior_scale_target (as in the plan-cost epinet): per head, set the prior weight so the
+    prior's std over sampled indices, on (up to max_rows of) this table's rows, equals the
+    target in standardised target units. Heads already calibrated keep their weight. Returns
+    {head: (measured prior std, alpha)}; nothing if prior_scale_target is null."""
+    target = epinet_settings.get("prior_scale_target")
+    alphas = model.epinet_config.setdefault("alpha", {})
+    heads = [head for head in heads if head not in alphas]
+    if target is None or not heads:
+        return {}
+    rows = torch.randperm(len(tables.rows["query"]), device=tables.device)[:max_rows]
+    r = {key: value[rows] for key, value in tables.rows.items()}
+    was_training = model.training
+    model.eval()
+    outputs = model.forward_heads(tables.embeddings[r["query"]], tables.pattern_mask[r["query"]],
+                                  tables.adjacency[r["query"]], _bits(r["mask"], tables.n_max),
+                                  tables.edge_features[r["query"]] if model.edge_feature_dim else None,
+                                  added=r["added"], heads=("card", "step") if "step" in heads else ("card",))
+    model.train(was_training)
+    calibrated = {}
+    for head in heads:
+        features = outputs["features_step" if head == "step" else "features_state"]
+        scale = model.epinet_for(head).prior_scale(features, int(epinet_settings.get("prior_scale_indexes", 64)),
+                                                    head_name=head)
+        alphas[head] = float(target) / max(scale, 1e-8)
+        calibrated[head] = (scale, alphas[head])
+    return calibrated
+
+
+def training_step(model, tables, state_ids, cfg_training, epinet_settings=None):
+    """One gradient step's loss. `epinet_settings` ({sigma, n_indexes_train}) adds the epinet
+    term for every head of a model built with an epinet."""
     rows, local_state = tables.batch_rows(state_ids)
     r = {key: value[rows] for key, value in tables.rows.items()}
     train_latency = tables.has_latency and getattr(model, "has_latency_head", False)
-    outputs = _evaluate_sets(model, tables, r["query"], r["mask"], return_latency=train_latency)
-    card_std, g_std = outputs[0], outputs[1]
+    train_step = tables.has_step and getattr(model, "has_step_head", False)
+    heads = ("card", "cost_to_go") + (("latency",) if train_latency else ()) + (("step",) if train_step else ())
+    outputs = model.forward_heads(tables.embeddings[r["query"]], tables.pattern_mask[r["query"]],
+                                  tables.adjacency[r["query"]], _bits(r["mask"], tables.n_max),
+                                  tables.edge_features[r["query"]] if model.edge_feature_dim else None,
+                                  added=r["added"], heads=heads)
+    card_std, g_std = outputs["card"], outputs["cost_to_go"]
     target_card_std, target_g_std = model.standardise(r["card"], r["g"])
     loss_card = torch.mean((card_std - target_card_std) ** 2)
     not_full = ~r["full"]
@@ -217,7 +308,7 @@ def training_step(model, tables, state_ids, cfg_training):
     parts = {"loss_card": loss_card.item(), "loss_g": loss_g.item(), "loss_rank": loss_rank.item()}
     if train_latency and r["latency_valid"].any():
         valid = r["latency_valid"]
-        latency_error = outputs[2][valid] - model.standardise_latency(r["latency"][valid])
+        latency_error = outputs["latency"][valid] - model.standardise_latency(r["latency"][valid])
         if tables.cost_to_go_upper_bound:
             # Stitched latency is the fastest KNOWN completion, so again an upper bound.
             under_weight = cfg_training.get("upper_bound_under_weight", 0.1)
@@ -226,6 +317,24 @@ def training_step(model, tables, state_ids, cfg_training):
         loss_latency = torch.mean(latency_error ** 2)
         total = total + cfg_training.get("latency_weight", 1.0) * loss_latency
         parts["loss_latency"] = loss_latency.item()
+    if train_step and r["step_valid"].any():
+        # Observed step times (the fastest of each (parent, child) step): plain squared error.
+        valid = r["step_valid"]
+        loss_step = torch.mean((outputs["step"][valid] - model.standardise_step(r["step"][valid])) ** 2)
+        total = total + cfg_training.get("step_weight", 1.0) * loss_step
+        parts["loss_step"] = loss_step.item()
+    if epinet_settings is not None and getattr(model, "has_epinet", False):
+        under_weight = cfg_training.get("upper_bound_under_weight", 0.1)
+        bound_loss = _one_sided_mse(under_weight) if tables.cost_to_go_upper_bound else _mse
+        targets = {"card": (torch.ones_like(r["full"]), target_card_std, _mse),
+                   "cost_to_go": (not_full, target_g_std, bound_loss)}
+        if train_latency:
+            targets["latency"] = (r["latency_valid"], model.standardise_latency(r["latency"]), bound_loss)
+        if train_step:
+            targets["step"] = (r["step_valid"], model.standardise_step(r["step"]), _mse)
+        for head, value in _epinet_losses(model, outputs, r, targets, epinet_settings).items():
+            total = total + value
+            parts[f"loss_epinet_{head}"] = value.item()
     parts["loss"] = total.item()
     return total, parts
 
@@ -300,8 +409,18 @@ def main(cfg: DictConfig):
                     "n_message_layers": settings.model.n_message_layers,
                     "message_layer": settings.model.message_layer,
                     "edge_feature_dim": JOIN_FEATURE_DIM if settings.model.edge_features else 0}
+    # Optional epinet on the card and G heads (amortized_dp.epinet); online training adds the
+    # latency and step heads to it.
+    epinet_cfg = settings.get("epinet")
+    epinet_settings = epinet_cfg if epinet_cfg is not None and epinet_cfg.enabled else None
+    if epinet_settings is not None:
+        model_kwargs["epinet"] = OmegaConf.to_container(epinet_cfg.model, resolve=True)
     model = ContractedJoinGraphValueNet(**model_kwargs).to(device)
     model.set_target_statistics(*tables.statistics())
+    if epinet_settings is not None:
+        for head, (scale, alpha) in calibrate_epinet_prior(model, tables, ["card", "cost_to_go"], epinet_settings).items():
+            print(f"Epinet prior {head}: std {scale:.3f} -> alpha {alpha:.4f} (target {epinet_settings.prior_scale_target})")
+        model_kwargs["epinet"] = model.epinet_config        # the calibrated weights go into the checkpoint
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg_training.lr, weight_decay=cfg_training.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg_training.n_epochs)
 
@@ -320,7 +439,7 @@ def main(cfg: DictConfig):
         running = []
         for batch_start in range(0, tables.n_states, cfg_training.states_per_batch):
             loss, parts = training_step(model, tables, order[batch_start:batch_start + cfg_training.states_per_batch],
-                                        cfg_training)
+                                        cfg_training, epinet_settings=epinet_settings)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_training.grad_clip)
@@ -337,7 +456,10 @@ def main(cfg: DictConfig):
             f.write(json.dumps(metrics) + "\n")
         overall = selection["overall"]
         print(f"Epoch {epoch}: loss {metrics['loss']:.4f} (card {metrics['loss_card']:.4f}, "
-              f"G {metrics['loss_g']:.4f}, rank {metrics['loss_rank']:.4f}) | val greedy geomean ratio "
+              f"G {metrics['loss_g']:.4f}, rank {metrics['loss_rank']:.4f}"
+              + "".join(f", epinet {key[12:]} {value:.4f}" for key, value in metrics.items()
+                        if key.startswith("loss_epinet_"))
+              + f") | val greedy geomean ratio "
               f"{overall['geomean_ratio']:.4f}, p90 {overall['p90_ratio']:.4f}, optimal {overall['frac_optimal']:.1%}, "
               f"p95 {overall['p95_ratio']:.3f} | {train_seconds:.0f}s")
         save(run_directory / "last_model.pt", epoch, metrics)

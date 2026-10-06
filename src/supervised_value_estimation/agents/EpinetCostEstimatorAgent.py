@@ -5,6 +5,7 @@ import torch
 from typing import List
 from src.supervised_value_estimation.agents.AbstractAgent import AbstractCostAgent
 from src.supervised_value_estimation.typings.typings import EnvState
+from src.utils.epinet_utils.risk import cvar_upper_tail
 
 
 class EpinetCostEstimatorAgent(AbstractCostAgent):
@@ -82,14 +83,6 @@ class EpinetCostEstimatorAgent(AbstractCostAgent):
             # Turn back into a distribution prediction shape
             estimated_distribution = epinet_estimated_cost.view((self.n_epinet_samples, -1)).T
 
-            # Calculate the number of samples in the worst-case tail
-            tail_length = max(1, int((1 - self.alpha_cvar) * self.n_epinet_samples))
-
-            # Sort costs in ascending order
-            sorted_dist, _ = torch.sort(estimated_distribution, dim=1)
-
-            # Isolate the highest costs (worst outcomes) and compute their expectation
-            worst_cases = sorted_dist[:, -tail_length:]
-
-            return worst_cases.mean(dim=1), [None for _ in range(len(possible_next))]
+            # Expectation of the worst (1 - alpha_cvar) share of the sampled costs.
+            return cvar_upper_tail(estimated_distribution, self.alpha_cvar), [None for _ in range(len(possible_next))]
 
