@@ -1,0 +1,89 @@
+# Statistics-based generation of join-ordering-hard queries on the anonymised YAGO
+# (src/random_query_generation/statistics_based_generation/generate.py).
+#   pilot:     certify generation.pilot.candidates_per_shape candidates per shape WITHOUT
+#              acceptance, write all of them with their certificates, and summarise the
+#              distributions; used to calibrate generation.acceptance.
+#   generate:  fill queries_per_shape per shape, balanced over (size, choke point), with
+#              zero_share hard zeros, keeping only certified queries.
+generation:
+  mode: pilot
+  seed: 0
+  ntriples: data/qlever/qlever_yago/yago.nt
+  cache_directory: data/statistics_based_generation/yago      # graph.npz, statistics.npz
+  output_directory: data/generated_queries/statistics_based_yago
+  workers: 8
+  shapes: [star, path, tree, snowflake, cycle, diamond, flower, path_star]
+  sizes: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  queries_per_shape: 20000
+  zero_share: 0.2
+
+  instantiation:
+    # Guardrail: no single pattern may match more triples than this (queries must be hard
+    # because of join ORDER, not because one pattern is huge).
+    max_pattern_matches: 1000000
+    max_candidates: 2000
+    max_restarts: 30
+    # Embedding is cheap (milliseconds per attempt); long cycles and multi-petal flowers need
+    # many attempts to close.
+    max_restarts_by_shape: {cycle: 1000, diamond: 300, flower: 1000}
+
+  # Choke points: how predicates, join entities and constants are chosen (instantiate.py).
+  # Every shape uses every choke point; weights set their share of the non-zero queries.
+  choke_points:
+    - {name: random, weight: 1.0}
+    - {name: correlated, weight: 1.0, predicate_mode: correlated, predicate_gamma: 2.0}
+    - {name: anticorrelated, weight: 1.0, predicate_mode: anticorrelated, predicate_gamma: 1.0}
+    - {name: hub, weight: 1.0, hub_gamma: 1.0}
+    - {name: anchors, weight: 1.0, n_constants: [2, 3], strata_weights: [0.3, 1.0, 0.3], spread_constants: true}
+
+  # Result budget: after embedding, more nodes are bound (with their witness entities, so the
+  # query stays non-empty) until the result is at most max_result rows -- exact counts in
+  # memory (an upper bound via a spanning tree for cyclic queries). JOB-style selective
+  # constants instead of queries that are expensive only because their result is huge.
+  # null: no budget.
+  result_budget:
+    max_result: 1000000
+
+  hard_zero:
+    anticorrelation_gamma: 1.0
+    # A hard zero has an empty result while every pattern, and all but at most this many
+    # connected pattern pairs, are non-empty (recorded per query as certificate.empty_pairs).
+    max_empty_pairs: 1
+    # Base instances are drawn with these choke points before the perturbation.
+    base_choke_points: [random, anticorrelated, anchors]
+
+  certificate:
+    random_plans: 5
+    timeout_s: 10
+    # Cyclic subsets are counted in memory by conditioning on a cycle-breaking variable, if it
+    # has at most this many possible values; larger ones are COUNTed on QLever.
+    max_conditioning_values: 2000
+    batch_size: 256                 # candidates certified together (their counts in one go)
+
+  # Applied in generate mode (null = no constraint). max_result caps the output (no queries that
+  # are hard only because the result is huge; together with max_pattern_matches this is the
+  # guardrail); max_min_cost lets costly queries through but not the billions range. The best
+  # plan's C_out is at least the result size, so it must stay well above max_result.
+  acceptance:
+    # median sampled plan C_out / cheapest sampled plan C_out. No hard minimum: a hard filter
+    # would keep only queries with large, easy-to-see gaps; spread_strata balances instead.
+    min_spread: null
+    max_min_cost: 100000000         # cheapest sampled plan C_out
+    max_result: 1000000             # result size cap for non-zero queries (= the budget)
+    max_candidate_factor: 10        # stop a shape after this many candidates per wanted query
+
+  # Non-zero queries per spread class: < 2 (subtle), 2-10, >= 10 (the order is decisive).
+  # null: no balancing on spread.
+  spread_strata:
+    edges: [2, 10]
+    shares: [0.25, 0.35, 0.40]
+
+  pilot:
+    candidates_per_shape: 2000
+
+  # QLever endpoints, only used to COUNT (ground truth); same format as the online config.
+  endpoints:
+    endpoint_hosts: [localhost]
+    ports_per_host: 4
+    base_port: 7000
+    endpoints: []
