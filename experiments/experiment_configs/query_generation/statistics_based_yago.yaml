@@ -12,6 +12,7 @@ generation:
   cache_directory: data/statistics_based_generation/yago      # graph.npz, statistics.npz
   output_directory: data/generated_queries/statistics_based_yago
   workers: 8
+  progress_every: 256               # print a progress line every this many finished jobs
   shapes: [star, path, tree, snowflake, cycle, diamond, flower, path_star]
   sizes: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
   queries_per_shape: 20000
@@ -43,6 +44,10 @@ generation:
   # null: no budget.
   result_budget:
     max_result: 1000000
+    # Cyclic queries: the spanning-tree count bounds the result. Only when that bound is over
+    # max_result is the exact count tried, if it needs at most this many acyclic counts
+    # (conditioning); otherwise the bound decides, making the query a bit more selective.
+    max_conditioning: 200
 
   hard_zero:
     anticorrelation_gamma: 1.0
@@ -58,7 +63,6 @@ generation:
     # Cyclic subsets are counted in memory by conditioning on a cycle-breaking variable, if it
     # has at most this many possible values; larger ones are COUNTed on QLever.
     max_conditioning_values: 2000
-    batch_size: 256                 # candidates certified together (their counts in one go)
 
   # Applied in generate mode (null = no constraint). max_result caps the output (no queries that
   # are hard only because the result is huge; together with max_pattern_matches this is the

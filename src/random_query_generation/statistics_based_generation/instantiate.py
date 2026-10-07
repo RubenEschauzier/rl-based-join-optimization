@@ -367,10 +367,12 @@ class Instantiator:
 
 # --- result budget ------------------------------------------------------------------------
 
-def _spanning_subset(structured):
+def _spanning_subset(structured, predicate_sizes=None):
     """Pattern indices of a spanning tree of the variable graph plus every pattern with a
     constant: dropping the closing patterns of cycles only loosens the query, so its count is
-    an upper bound on the full query's count (exact for acyclic queries)."""
+    an upper bound on the full query's count (exact for acyclic queries). With
+    `predicate_sizes` (triples per predicate) the tree is built from the smallest predicates
+    first, so the dropped closing patterns are the least selective ones and the bound is tight."""
     parent = {}
 
     def find(x):
@@ -379,38 +381,46 @@ def _spanning_subset(structured):
             x = parent[x]
         return x
 
+    order = range(len(structured))
+    if predicate_sizes is not None:
+        order = sorted(order, key=lambda i: predicate_sizes[structured[i][1]])
     keep = []
-    for i, (s, _, o) in enumerate(structured):
+    for i in order:
+        s, _, o = structured[i]
         if s[0] == "v" and o[0] == "v":
             a, b = find(s[1]), find(o[1])
             if a == b:
                 continue
             parent[a] = b
         keep.append(i)
-    return keep
+    return sorted(keep)
 
 
-def result_upper_bound(instance, counter):
-    """The exact result size if the counter can give it (counting.ExactCounter conditions
-    cyclic queries); otherwise the count of a spanning tree, an upper bound."""
+def result_upper_bound(instance, counter, budget=None, max_conditioning=200):
+    """An upper bound on the result size, as cheap as the budget check allows: the count of a
+    spanning tree (exact for acyclic queries, one acyclic count). For a cyclic query whose
+    spanning-tree bound exceeds `budget`, the exact count (counting.ExactCounter) if it needs
+    at most `max_conditioning` acyclic counts in all, else the bound -- so a cyclic query is
+    only made more selective than the budget needs when its exact count is expensive."""
     structured = instance.structured_patterns()
+    bound = counter.count(structured, _spanning_subset(structured, np.diff(counter.index.ptr)))
+    if budget is None or bound <= budget or counter.is_acyclic(structured, range(len(structured))):
+        return bound
     exact = getattr(counter, "count_exact", None)
-    if exact is not None:
-        value = exact(structured, range(len(structured)))
-        if value is not None:
-            return value
-    return counter.count(structured, _spanning_subset(structured))
+    value = exact(structured, range(len(structured)), max_total=max_conditioning) if exact else None
+    return bound if value is None else value
 
 
-def tighten_to_budget(instance, graph, statistics, counter, budget, rng, tries_per_step=3):
+def tighten_to_budget(instance, graph, statistics, counter, budget, rng, tries_per_step=3, max_conditioning=200):
     """Bind more nodes (with their witness entities, so the query stays non-empty) until the
     result is at most `budget`; returns the tightened Instance or None if no bindable node is
     left. Each step tries a few random bindable nodes (leaves first) and keeps the one whose
     result lands closest to the budget, so constants do not all come from the rarest values.
-    Pure data: exact counts in memory (counting.AcyclicCounter), no optimizer, no model."""
+    Pure data: in-memory counts (counting.AcyclicCounter; for cyclic queries the cheap upper
+    bound of result_upper_bound), no optimizer, no model."""
     on_cycle = cycle_nodes(instance.shape)
     degree = instance.shape.degree()
-    bound = result_upper_bound(instance, counter)
+    bound = result_upper_bound(instance, counter, budget, max_conditioning)
     while bound > budget:
         free = [node for node in range(instance.shape.n_nodes)
                 if node not in instance.plan.constants and node not in on_cycle
@@ -424,7 +434,7 @@ def tighten_to_budget(instance, graph, statistics, counter, budget, rng, tries_p
             node = int(node)
             plan = BindingPlan({**instance.plan.constants, node: _natural_stratum(instance, graph, statistics, node)})
             variant = Instance(instance.shape, instance.entities, instance.predicates, plan, instance.oriented)
-            tried.append((result_upper_bound(variant, counter), variant))
+            tried.append((result_upper_bound(variant, counter, budget, max_conditioning), variant))
         under = [t for t in tried if t[0] <= budget]
         # closest from above if none fits, else the least selective one that fits
         bound, instance = max(under, key=lambda t: t[0]) if under else min(tried, key=lambda t: t[0])

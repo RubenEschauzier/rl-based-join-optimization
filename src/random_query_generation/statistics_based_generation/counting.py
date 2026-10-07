@@ -298,8 +298,10 @@ class ExactCounter(AcyclicCounter):
             keep.append(i)
         return bound, keep
 
-    def count_exact(self, patterns, subset, depth=0):
-        """Exact count of any connected sub-BGP, or None if conditioning would be too large."""
+    def count_exact(self, patterns, subset, depth=0, max_total=None):
+        """Exact count of any connected sub-BGP, or None if conditioning would be too large:
+        more than max_assignments values for one variable, or, with `max_total`, more than
+        that many acyclic counts in all (the product over nested conditionings)."""
         subset = list(subset)
         if not subset:
             return 1.0
@@ -314,12 +316,15 @@ class ExactCounter(AcyclicCounter):
                 domain = self._domain(patterns, group, variable)
                 if domain is None or len(domain) > self.max_assignments:
                     return None
+                if max_total is not None and len(domain) > max_total:
+                    return None
+                inner_total = None if max_total is None else max_total // max(len(domain), 1)
                 value = 0.0
                 for entity in domain:
                     bound, keep = self._bind(patterns, group, variable, int(entity))
                     if bound is None:
                         continue
-                    part = self.count_exact(bound, keep, depth + 1)
+                    part = self.count_exact(bound, keep, depth + 1, inner_total)
                     if part is None:
                         return None
                     value += part

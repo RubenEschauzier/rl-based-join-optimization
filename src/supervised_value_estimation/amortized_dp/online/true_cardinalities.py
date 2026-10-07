@@ -30,7 +30,7 @@ def count_query(triple_patterns, mask):
     return f"SELECT (COUNT(*) AS ?count) WHERE {{ {body} }}"
 
 
-def _count(session, endpoint, query, timeout_s):
+def count_on_endpoint(session, endpoint, query, timeout_s):
     response = session.post(endpoint, params={"timeout": f"{int(timeout_s)}s"}, data=query,
                             headers={"Accept": "application/sparql-results+json",
                                      "Content-Type": "application/sparql-query"},
@@ -58,7 +58,7 @@ def count_subsets(tasks, endpoints, timeout_s):
             except queue.Empty:
                 return
             try:
-                value = _count(session, endpoint, query, timeout_s)
+                value = count_on_endpoint(session, endpoint, query, timeout_s)
             except (requests.RequestException, ValueError, KeyError):
                 value = None
             with lock:

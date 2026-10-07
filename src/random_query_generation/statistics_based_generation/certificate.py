@@ -27,10 +27,15 @@ plans needing it are left out of the estimate (`n_unknown_plans`).
 """
 from __future__ import annotations
 
+import queue
+import threading
+import time
+
 import numpy as np
+import requests
 
 from src.supervised_value_estimation.amortized_dp.labels import mask_of
-from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_query, count_subsets
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_on_endpoint
 
 
 def pattern_adjacency(triple_patterns):
@@ -181,15 +186,63 @@ def certify_in_memory(candidate, structured, counter, n_random_plans, rng, max_e
     return True
 
 
-def certify(candidates, endpoints, timeout_s):
-    """In the parent: COUNT the cyclic subsets on QLever, then summarise every candidate."""
-    tasks = {(index, mask): forced_count_query(c["triple_patterns"], mask, c["pattern_sizes"])
-             for index, c in enumerate(candidates) for mask in c["qlever_masks"]}
-    counted = count_subsets(list(tasks.items()), endpoints, timeout_s) if tasks else {}
-    for index, candidate in enumerate(candidates):
-        values = {**candidate["counts"], **{mask: counted.get((index, mask)) for mask in candidate["qlever_masks"]}}
-        candidate["certificate"] = summarise(candidate["triple_patterns"], candidate["orders"], values,
-                                             candidate.get("hard_zero", False))
-        candidate["certificate"]["qlever_counts"] = len(candidate["qlever_masks"])
-        del candidate["counts"], candidate["qlever_masks"]
-    return candidates
+def finish_certificate(candidate, qlever_counts=None):
+    """In the parent: summarise a candidate from its in-memory counts plus the QLever counts
+    of its `qlever_masks` ({mask: rows or None}), and drop the raw counts."""
+    qlever_counts = qlever_counts or {}
+    values = {**candidate["counts"], **{mask: qlever_counts.get(mask) for mask in candidate["qlever_masks"]}}
+    candidate["certificate"] = summarise(candidate["triple_patterns"], candidate["orders"], values,
+                                         candidate.get("hard_zero", False))
+    candidate["certificate"]["qlever_counts"] = len(candidate["qlever_masks"])
+    del candidate["counts"], candidate["qlever_masks"]
+    return candidate
+
+
+class BackgroundCounter:
+    """COUNTs candidates' `qlever_masks` on QLever in background threads while the workers keep
+    generating: one thread per endpoint with one request in flight, so each single-core
+    instance runs one count at a time. When all masks of a candidate are counted it is put on
+    `done` as ("counted", candidate, {mask: rows or None}); a failed or timed-out count is None."""
+
+    def __init__(self, endpoints, timeout_s, done):
+        self.timeout_s, self.done = timeout_s, done
+        self.work, self.lock = queue.Queue(), threading.Lock()
+        self.pending, self.counted, self.seconds = 0, 0, 0.0
+        self.threads = [threading.Thread(target=self._worker, args=(endpoint,), daemon=True)
+                        for endpoint in dict.fromkeys(endpoints)]
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, candidate):
+        state = {"candidate": candidate, "left": len(candidate["qlever_masks"]), "counts": {}}
+        with self.lock:
+            self.pending += state["left"]
+        for mask in candidate["qlever_masks"]:
+            query = forced_count_query(candidate["triple_patterns"], mask, candidate["pattern_sizes"])
+            self.work.put((state, mask, query))
+
+    def _worker(self, endpoint):
+        session = requests.Session()
+        while True:
+            item = self.work.get()
+            if item is None:
+                return
+            state, mask, query = item
+            start = time.perf_counter()
+            try:
+                value = count_on_endpoint(session, endpoint, query, self.timeout_s)
+            except (requests.RequestException, ValueError, KeyError):
+                value = None
+            with self.lock:
+                self.pending -= 1
+                self.counted += 1
+                self.seconds += time.perf_counter() - start
+                state["counts"][mask] = value
+                state["left"] -= 1
+                finished = state["left"] == 0
+            if finished:
+                self.done.put(("counted", state["candidate"], state["counts"]))
+
+    def close(self):
+        for _ in self.threads:
+            self.work.put(None)

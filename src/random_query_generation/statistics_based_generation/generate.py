@@ -21,6 +21,7 @@ import json
 import math
 import multiprocessing
 import os
+import queue
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -29,7 +30,9 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-from src.random_query_generation.statistics_based_generation.certificate import certify, certify_in_memory
+from src.random_query_generation.statistics_based_generation.certificate import (
+    BackgroundCounter, certify_in_memory, finish_certificate,
+)
 from src.random_query_generation.statistics_based_generation.counting import ExactCounter, PredicateIndex
 from src.random_query_generation.statistics_based_generation.graph import load_graph
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
@@ -77,7 +80,8 @@ def _make_candidate(job):
         return None
     planned_constants = len(instance.plan.constants)
     if _STATE["max_result"] is not None:
-        instance = tighten_to_budget(instance, graph, statistics, _STATE["counter"], _STATE["max_result"], rng)
+        instance = tighten_to_budget(instance, graph, statistics, _STATE["counter"], _STATE["max_result"], rng,
+                                     max_conditioning=_STATE["budget_conditioning"])
         if instance is None:
             return None
     perturbation = None
@@ -128,18 +132,23 @@ def _canonical(patterns):
     return " . ".join(sorted(patterns))
 
 
-def _jobs(kind, cells, counts_needed, seed_counter, oversample):
-    """Candidate jobs for the unfilled cells. A cell is (size, choke point, hard zero, spread
-    class); the spread class is only known after certification, so jobs are made per
-    (size, choke point, hard zero) for the sum of what its classes still need."""
-    per_job_key = Counter()
-    for (n, choke_name, hard_zero, _), needed in counts_needed.items():
-        per_job_key[(n, choke_name, hard_zero)] += needed
-    jobs = []
-    for (n, choke_name, hard_zero), needed in per_job_key.items():
-        for _ in range(int(math.ceil(needed * oversample))):
-            jobs.append((kind, n, choke_name, hard_zero, next(seed_counter)))
-    return jobs
+def _timed_candidate(job):
+    start = time.perf_counter()
+    return _make_candidate(job), time.perf_counter() - start
+
+
+def _job_keys(cells):
+    """A cell is (size, choke point, hard zero, spread class); the spread class is only known
+    after certification, so jobs are drawn per (size, choke point, hard zero), for the sum of
+    what its classes need."""
+    keys = Counter()
+    for (n, choke_name, hard_zero, _), count in cells.items():
+        keys[(n, choke_name, hard_zero)] += count
+    return keys
+
+
+def _job_key(candidate):
+    return candidate["n_patterns"], candidate["choke_point"], candidate["hard_zero"]
 
 
 def spread_class(spread, edges):
@@ -197,49 +206,104 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             wanted[(n, name, True, None)] += n_zero / (len(sizes) * len(bases))
     wanted = Counter({cell: int(math.ceil(v)) for cell, v in wanted.items()})
 
+    # Continuous: a fixed number of jobs is in flight in the pool; each finished job is replaced
+    # at once by a job for a (size, choke point, hard zero) drawn by what its cells still need,
+    # and candidates with subsets to COUNT on QLever are counted in background threads. Workers
+    # never wait for QLever or for the slowest job of a batch. Which candidate fills a cell
+    # depends on finishing order, so a run is not exactly reproducible from the seed.
     accepted, kept, reasons, seen = defaultdict(list), [], Counter(), set()
-    generated, start = 0, time.perf_counter()
-    budget = float(gen.acceptance.max_candidate_factor) * total
-    oversample = 1.0 if pilot else 1.5
-    while generated < budget:
-        needed = Counter({cell: count - len(accepted[cell]) for cell, count in wanted.items()
-                          if count - len(accepted[cell]) > 0})
-        if not needed:
-            break
-        jobs = _jobs(kind, wanted, needed, seed_counter, oversample)
-        rng.shuffle(jobs)
-        for batch_start in range(0, len(jobs), int(gen.certificate.batch_size)):
-            batch = jobs[batch_start:batch_start + int(gen.certificate.batch_size)]
-            candidates = [c for c in pool.map(_make_candidate, batch, chunksize=4) if c is not None]
-            generated += len(batch)
-            fresh = []
-            for c in candidates:
-                key = _canonical(c["triple_patterns"])
-                if key not in seen:
-                    seen.add(key)
-                    fresh.append(c)
-            certify(fresh, endpoints, float(gen.certificate.timeout_s))
-            for c in fresh:
-                spread = c["certificate"].get("spread")
-                k = (spread_class(spread, strata.edges) if stratify and not c["hard_zero"] and spread is not None
-                     else None)
-                c["spread_class"] = k
-                cell = (c["n_patterns"], c["choke_point"], c["hard_zero"], k)
-                if pilot:
-                    kept.append(c)
-                    accepted[cell].append(c)
-                    continue
-                ok, reason = _accept(c, gen.acceptance, int(gen.hard_zero.max_empty_pairs))
-                reasons[reason] += 1
-                if ok and len(accepted[cell]) < wanted[cell]:
-                    accepted[cell].append(c)
-            done = sum(min(len(accepted[cell]), count) for cell, count in wanted.items())
-            print(f"[{kind}] candidates {generated:,} | kept {done:,}/{sum(wanted.values()):,} | "
-                  f"{time.perf_counter() - start:.0f}s | {dict(reasons) if reasons else ''}", flush=True)
-            if pilot and done >= sum(wanted.values()):
-                break
+    budget = total if pilot else int(float(gen.acceptance.max_candidate_factor) * total)
+    in_pool_limit = 2 * int(gen.workers)
+    progress_every = int(gen.get("progress_every", 256))
+    events = queue.Queue()        # ("made", job key, candidate, seconds) | ("counted", candidate, counts) | ("error", e)
+    counter = BackgroundCounter(endpoints, float(gen.certificate.timeout_s), events)
+    submitted, outstanding = Counter(), Counter()     # per job key; outstanding = not yet resolved
+    status = {"submitted": 0, "finished": 0, "in_pool": 0, "at_qlever": 0, "busy": 0.0}
+    start = time.perf_counter()
+
+    def draw_weights():
+        if pilot:                 # exactly the wanted number of jobs per key, like a fixed sample
+            return {key: count - submitted[key] for key, count in _job_keys(wanted).items() if count > submitted[key]}
+        need = Counter({cell: count - len(accepted[cell]) for cell, count in wanted.items()
+                        if count > len(accepted[cell])})
+        # damped by the jobs already under way for a key, so the last few places of a cell
+        # do not pull in a flood of jobs
+        return {key: count / (1 + outstanding[key]) for key, count in _job_keys(need).items()}
+
+    def submit():
+        weights = draw_weights()
+        if not weights or status["submitted"] >= budget:
+            return False
+        keys = list(weights)
+        p = np.array([weights[key] for key in keys], dtype=float)
+        key = keys[int(rng.choice(len(keys), p=p / p.sum()))]
+        submitted[key] += 1
+        outstanding[key] += 1
+        status["submitted"] += 1
+        status["in_pool"] += 1
+        pool.apply_async(_timed_candidate, ((kind, *key, next(seed_counter)),),
+                         callback=lambda result, key=key: events.put(("made", key, *result)),
+                         error_callback=lambda error: events.put(("error", error)))
+        return True
+
+    def resolve(c):
+        outstanding[_job_key(c)] -= 1
+        spread = c["certificate"].get("spread")
+        k = (spread_class(spread, strata.edges) if stratify and not c["hard_zero"] and spread is not None
+             else None)
+        c["spread_class"] = k
+        cell = (c["n_patterns"], c["choke_point"], c["hard_zero"], k)
         if pilot:
-            break
+            kept.append(c)
+            accepted[cell].append(c)
+            return
+        ok, reason = _accept(c, gen.acceptance, int(gen.hard_zero.max_empty_pairs))
+        reasons[reason] += 1
+        if ok and len(accepted[cell]) < wanted[cell]:
+            accepted[cell].append(c)
+
+    def progress():
+        elapsed = time.perf_counter() - start
+        done = sum(min(len(accepted[cell]), count) for cell, count in wanted.items())
+        with counter.lock:
+            counted, seconds, queued = counter.counted, counter.seconds, counter.pending
+        print(f"[{kind}] candidates {status['finished']:,} | kept {done:,}/{sum(wanted.values()):,} | "
+              f"{elapsed:.0f}s | {status['finished'] / max(elapsed, 1e-9):.1f} candidates/s | "
+              f"workers {100 * status['busy'] / max(elapsed * int(gen.workers), 1e-9):.0f}% busy | "
+              f"qlever {counted:,} counts ({seconds / max(counted, 1):.1f}s mean), {queued} queued | "
+              f"{dict(reasons) if reasons else ''}", flush=True)
+
+    while status["in_pool"] < in_pool_limit and submit():
+        pass
+    while status["in_pool"] or status["at_qlever"]:
+        event = events.get()
+        if event[0] == "error":
+            counter.close()
+            raise event[1]
+        if event[0] == "made":
+            _, key, c, seconds = event
+            status["in_pool"] -= 1
+            status["finished"] += 1
+            status["busy"] += seconds
+            if c is None or _canonical(c["triple_patterns"]) in seen:
+                outstanding[key] -= 1
+            else:
+                seen.add(_canonical(c["triple_patterns"]))
+                if c["qlever_masks"] and counter.threads:
+                    status["at_qlever"] += 1
+                    counter.submit(c)
+                else:
+                    resolve(finish_certificate(c))
+            if status["finished"] % progress_every == 0:
+                progress()
+        else:
+            _, c, counts = event
+            status["at_qlever"] -= 1
+            resolve(finish_certificate(c, counts))
+        while status["in_pool"] < in_pool_limit and submit():
+            pass
+    counter.close()
+    progress()
     queries = [c for cell in accepted.values() for c in cell]
     if pilot:
         with open(output_directory / f"pilot_{kind}.jsonl", "w") as f:
@@ -297,6 +361,7 @@ def main(cfg: DictConfig):
         random_plans=int(gen.certificate.random_plans),
         max_empty_pairs=int(gen.hard_zero.max_empty_pairs),
         max_result=gen.result_budget.max_result,
+        budget_conditioning=int(gen.result_budget.get("max_conditioning", 200)),
     )
     _STATE["hard_zero"] = HardZeroMaker(graph, statistics, int(settings.max_pattern_matches),
                                         float(gen.hard_zero.anticorrelation_gamma), counter=_STATE["counter"],
