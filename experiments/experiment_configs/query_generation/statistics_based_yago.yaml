@@ -64,6 +64,12 @@ generation:
     # has at most this many possible values; larger ones are COUNTed on QLever.
     max_conditioning_values: 2000
 
+  # Generate mode: every kept query's `y` is QLever's plain COUNT(*) of the whole query (its own
+  # plan); a query whose QLever count differs from the in-memory count is dropped and written to
+  # count_mismatches_<shape>.jsonl, a failed or timed-out count frees its place for another.
+  final_count:
+    timeout_s: 60
+
   # Applied in generate mode (null = no constraint). max_result caps the output (no queries that
   # are hard only because the result is huge; together with max_pattern_matches this is the
   # guardrail); max_min_cost lets costly queries through but not the billions range. The best

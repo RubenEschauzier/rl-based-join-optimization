@@ -31,7 +31,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from src.random_query_generation.statistics_based_generation.certificate import (
-    BackgroundCounter, certify_in_memory, finish_certificate,
+    BackgroundCounter, certificate_tasks, certify_in_memory, final_count_task, finish_certificate,
 )
 from src.random_query_generation.statistics_based_generation.counting import ExactCounter, PredicateIndex
 from src.random_query_generation.statistics_based_generation.graph import load_graph
@@ -211,12 +211,20 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     # and candidates with subsets to COUNT on QLever are counted in background threads. Workers
     # never wait for QLever or for the slowest job of a batch. Which candidate fills a cell
     # depends on finishing order, so a run is not exactly reproducible from the seed.
+    # A candidate that passes acceptance reserves a place in its cell and gets a plain COUNT(*)
+    # of the whole query on QLever (QLever's own plan); it fills the place only if QLever's
+    # count equals the in-memory one, and that QLever count is its `y`. Disagreements are
+    # dropped and written to count_mismatches_<shape>.jsonl; a failed count frees the place.
     accepted, kept, reasons, seen = defaultdict(list), [], Counter(), set()
+    reserved, mismatches = Counter(), []
     budget = total if pilot else int(float(gen.acceptance.max_candidate_factor) * total)
     in_pool_limit = 2 * int(gen.workers)
     progress_every = int(gen.get("progress_every", 256))
-    events = queue.Queue()        # ("made", job key, candidate, seconds) | ("counted", candidate, counts) | ("error", e)
-    counter = BackgroundCounter(endpoints, float(gen.certificate.timeout_s), events)
+    # ("made", job key, candidate, seconds) | ("counted" / "final", candidate, counts) | ("error", e)
+    events = queue.Queue()
+    counter = BackgroundCounter(endpoints, events)
+    certificate_timeout = float(gen.certificate.timeout_s)
+    final_timeout = float(gen.final_count.timeout_s)
     submitted, outstanding = Counter(), Counter()     # per job key; outstanding = not yet resolved
     status = {"submitted": 0, "finished": 0, "in_pool": 0, "at_qlever": 0, "busy": 0.0}
     start = time.perf_counter()
@@ -224,8 +232,8 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     def draw_weights():
         if pilot:                 # exactly the wanted number of jobs per key, like a fixed sample
             return {key: count - submitted[key] for key, count in _job_keys(wanted).items() if count > submitted[key]}
-        need = Counter({cell: count - len(accepted[cell]) for cell, count in wanted.items()
-                        if count > len(accepted[cell])})
+        need = Counter({cell: count - len(accepted[cell]) - reserved[cell] for cell, count in wanted.items()
+                        if count > len(accepted[cell]) + reserved[cell]})
         # damped by the jobs already under way for a key, so the last few places of a cell
         # do not pull in a flood of jobs
         return {key: count / (1 + outstanding[key]) for key, count in _job_keys(need).items()}
@@ -246,20 +254,41 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
                          error_callback=lambda error: events.put(("error", error)))
         return True
 
+    def cell_of(c):
+        return c["n_patterns"], c["choke_point"], c["hard_zero"], c["spread_class"]
+
     def resolve(c):
-        outstanding[_job_key(c)] -= 1
         spread = c["certificate"].get("spread")
-        k = (spread_class(spread, strata.edges) if stratify and not c["hard_zero"] and spread is not None
-             else None)
-        c["spread_class"] = k
-        cell = (c["n_patterns"], c["choke_point"], c["hard_zero"], k)
+        c["spread_class"] = (spread_class(spread, strata.edges)
+                             if stratify and not c["hard_zero"] and spread is not None else None)
+        cell = cell_of(c)
         if pilot:
+            outstanding[_job_key(c)] -= 1
             kept.append(c)
             accepted[cell].append(c)
             return
         ok, reason = _accept(c, gen.acceptance, int(gen.hard_zero.max_empty_pairs))
         reasons[reason] += 1
-        if ok and len(accepted[cell]) < wanted[cell]:
+        if ok and len(accepted[cell]) + reserved[cell] < wanted[cell] and counter.threads:
+            reserved[cell] += 1
+            status["at_qlever"] += 1
+            counter.submit(c, final_count_task(c, final_timeout), "final")
+        else:
+            outstanding[_job_key(c)] -= 1
+
+    def finalise(c, counts):
+        cell = cell_of(c)
+        reserved[cell] -= 1
+        outstanding[_job_key(c)] -= 1
+        value, in_memory = counts.get("result"), c["certificate"]["result"]
+        if value is None:
+            reasons["final_count_failed"] += 1
+        elif value != in_memory:
+            reasons["count_mismatch"] += 1
+            mismatches.append({"triple_patterns": c["triple_patterns"], "qlever": value, "in_memory": in_memory,
+                               "template": c["template"], "seed": c["seed"]})
+        else:
+            c["y"] = int(value)
             accepted[cell].append(c)
 
     def progress():
@@ -291,15 +320,19 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
                 seen.add(_canonical(c["triple_patterns"]))
                 if c["qlever_masks"] and counter.threads:
                     status["at_qlever"] += 1
-                    counter.submit(c)
+                    counter.submit(c, certificate_tasks(c, certificate_timeout), "counted")
                 else:
                     resolve(finish_certificate(c))
             if status["finished"] % progress_every == 0:
                 progress()
-        else:
+        elif event[0] == "counted":
             _, c, counts = event
             status["at_qlever"] -= 1
             resolve(finish_certificate(c, counts))
+        else:
+            _, c, counts = event
+            status["at_qlever"] -= 1
+            finalise(c, counts)
         while status["in_pool"] < in_pool_limit and submit():
             pass
     counter.close()
@@ -310,7 +343,13 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             for c in kept:
                 f.write(json.dumps(c) + "\n")
         return _summary(kept), {}
-    return _summary(queries), _write_shape(kind, queries, output_directory)
+    with open(output_directory / f"count_mismatches_{kind}.jsonl", "w") as f:
+        for m in mismatches:
+            f.write(json.dumps(m) + "\n")
+    if mismatches:
+        print(f"[{kind}] {len(mismatches)} QLever / in-memory count mismatches -> "
+              f"{output_directory / f'count_mismatches_{kind}.jsonl'}", flush=True)
+    return _summary(queries), {**_write_shape(kind, queries, output_directory), "count_mismatches": len(mismatches)}
 
 
 def _write_shape(kind, queries, output_directory):
@@ -320,7 +359,7 @@ def _write_shape(kind, queries, output_directory):
         body = " ".join(f"{p} ." for p in c["triple_patterns"])
         records.append({
             "x": c["entities"],
-            "y": int(c["certificate"]["result"]),
+            "y": c["y"],                     # QLever's COUNT(*) of the query (equal to the in-memory count)
             "query": f"SELECT * WHERE {{ {body} }}",
             "triples": [p.split() + ["."] for p in c["triple_patterns"]],
             "type": f"statistics_based_{kind}",
