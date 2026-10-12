@@ -103,7 +103,8 @@ def _endpoints(args):
     if args.endpoints:
         return [e.strip() for e in args.endpoints.split(",") if e.strip()]
     from omegaconf import OmegaConf
-    execution = OmegaConf.load(args.config).execution
+    config = OmegaConf.load(args.config)
+    execution = config.online.execution if "online" in config else config.execution    # online config: online.execution
     hosts = [str(h).split("://", 1)[-1].rstrip("/") for h in execution.endpoint_hosts]
     return [f"http://{h}:{p}" for h in hosts
             for p in range(int(execution.base_port), int(execution.base_port) + int(execution.ports_per_host))]
