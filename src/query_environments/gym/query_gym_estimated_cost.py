@@ -106,12 +106,18 @@ class QueryGymEstimatedCost(QueryGymBase):
 
     @staticmethod
     def sub_sample_term_features(term_features, triple_patterns, term_to_id, indexes_to_include):
+        # Every node of the selected patterns exactly once (first occurrence): a term shared by several
+        # patterns must not be repeated, since the model's sum readout would count each copy (the
+        # sub-query graph would differ from the same query featurised directly; up to 10^13x inflated
+        # estimates on 16-pattern queries before this was fixed).
         x_index_to_include = []
         for index in indexes_to_include:
             tp = triple_patterns[index].split(' ')
             if tp[0] not in term_to_id or tp[2] not in term_to_id:
                 raise ValueError("Term {} or {} not in {}".format(tp[0], tp[2], term_to_id))
-            x_index_to_include.append(int(term_to_id[tp[0]]))
-            x_index_to_include.append(int(term_to_id[tp[2]]))
+            for term in (tp[0], tp[2]):
+                node = int(term_to_id[term])
+                if node not in x_index_to_include:
+                    x_index_to_include.append(node)
         old_to_new_id = {x: i for i, x in enumerate(x_index_to_include)}
         return term_features[x_index_to_include, :], old_to_new_id

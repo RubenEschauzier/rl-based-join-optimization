@@ -371,14 +371,16 @@ def featurise(queries, dataset_dir, stats_dir, embedding_dir, features="hll", co
                               if isinstance(v, rdflib.term.Variable)} - set(sketches) - {None}
     if any(missing.values()):
         raise SystemExit(f"[featurise] statistics missing: { {k: len(v) for k, v in missing.items()} }")
+    # gnce: the GNCE-style features (rdf2vec + term occurrences + predicate multiplicities), no HLL.
+    feature_type = "predicate_edge" if features == "gnce" else f"predicate_edge_{features}"
     load_queries_into_dataset(str(splits[0]), str(splits[1]), None, str(embedding_dir / "model.json"),
-                              _NoFallback(), f"predicate_edge_{features}", load_mappings=False,
+                              _NoFallback(), feature_type, load_mappings=False,
                               minhash_location=minhash_location,
                               contextualizer_location=contextualizer if features == "hll_contextual" else None,
                               occurrences_location=str(stats_dir / "occurrences.json"),
                               tp_cardinality_location=str(stats_dir / "tp_cardinalities.json"),
                               multiplicity_location=str(stats_dir / "multiplicities.json"),
-                              hll_location=str(stats_dir / "hll_sketches.json"),
+                              hll_location=None if features == "gnce" else str(stats_dir / "hll_sketches.json"),
                               shuffle_train=False)
 
 
@@ -450,11 +452,12 @@ def main():
     parser.add_argument("--w2v-workers", type=int, default=5)
     parser.add_argument("--steps", default="split,stats,embed,featurise,check,config",
                         help="Comma-separated subset of split,stats,minhash,embed,featurise,check,config.")
-    parser.add_argument("--features", choices=["hll", "hll_minhash", "hll_contextual"], default="hll",
+    parser.add_argument("--features", choices=["hll", "hll_minhash", "hll_contextual", "gnce"], default="hll",
                         help="hll: the mixed_yago_hll features. hll_minhash: + 4 MinHash set-intersection "
                              "features per variable (needs the minhash step), processed into <dataset>/hll_minhash. "
                              "hll_contextual: the rdf2vec part replaced by a frozen contextualizer (--contextualizer), "
-                             "processed into <dataset>/hll_contextual.")
+                             "processed into <dataset>/hll_contextual. gnce: GNCE-style features (rdf2vec, term "
+                             "occurrences, predicate multiplicities; no HLL), processed into <dataset>/gnce.")
     parser.add_argument("--feature-root", default=None,
                         help="Directory name under the dataset for the processed splits (default: the feature name); "
                              "e.g. to keep features of different contextualizers apart.")
@@ -486,7 +489,7 @@ def main():
         if args.features == "hll_contextual" and not args.contextualizer:
             raise SystemExit("--features hll_contextual needs --contextualizer")
         featurise(queries, dataset_dir, stats_dir, embedding_dir, args.features, args.contextualizer, args.feature_root)
-    if "check" in steps:
+    if "check" in steps and args.features != "gnce":    # gnce has other dimensions than the reference
         n_multiplicities = len(next(iter(_load(stats_dir / "multiplicities.json").values())))
         check(feature_root(dataset_dir, args.features, args.feature_root), ROOT / args.compare, 2 + n_multiplicities + 1 + 2,
               4 if args.features == "hll_minhash" else 0)

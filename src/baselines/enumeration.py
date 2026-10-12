@@ -88,6 +88,87 @@ class JoinPlan:
         return result
 
 
+def _bits(mask: int) -> List[int]:
+    out = []
+    while mask:
+        low = mask & -mask
+        out.append(low.bit_length() - 1)
+        mask ^= low
+    return out
+
+
+def neighbour_masks(adjacency_list: Dict[int, List[int]], n: int) -> List[int]:
+    """Per vertex, the bitmask of its neighbours."""
+    masks = []
+    for v in range(n):
+        mask = 0
+        for u in adjacency_list.get(v, ()):
+            mask |= 1 << u
+        masks.append(mask & ~(1 << v))
+    return masks
+
+
+def connected_subgraphs(n: int, nbr: List[int]) -> Dict[int, int]:
+    """Every connected subgraph (csg, as a bitmask) -> its neighbourhood, by EnumerateCsg
+    (Moerkotte & Neumann, VLDB 2006): from each vertex v (descending), grow connected sets with
+    vertices > v only (B_v = {0..v} excluded), extending by non-empty subsets of the neighbourhood.
+    Each csg is produced exactly once."""
+    hood: Dict[int, int] = {}
+
+    def neighbourhood(mask):
+        reach = 0
+        for v in _bits(mask):
+            reach |= nbr[v]
+        return reach & ~mask
+
+    stack = []
+    for v in range(n - 1, -1, -1):
+        vb = 1 << v
+        hood[vb] = nbr[v] & ~vb
+        stack.append((vb, (vb << 1) - 1))
+        while stack:
+            s, x = stack.pop()
+            frontier = hood[s] & ~x
+            sub = 0
+            while True:                                  # all non-empty subsets of the frontier
+                sub = (sub - frontier) & frontier
+                if not sub:
+                    break
+                grown = s | sub
+                hood[grown] = neighbourhood(grown)
+                stack.append((grown, x | frontier))
+    return hood
+
+
+def csg_cmp_pairs(n: int, nbr: List[int], hood: Optional[Dict[int, int]] = None):
+    """All csg-cmp pairs (S1, S2): S1, S2 connected, disjoint and adjacent, each unordered pair
+    once (min(S1) < min(S2)), by EnumerateCmp (Moerkotte & Neumann 2006) -- only valid splits are
+    ever generated. The csgs S1 are visited by descending minimum vertex, then ascending size, so
+    when a pair is yielded all pairs that build S1 or S2 were yielded before (a valid DP order):
+    the pairs building S2 have a csg with minimum min(S2) > min(S1), those building S1 a proper
+    sub-csg of S1 with the same minimum."""
+    hood = connected_subgraphs(n, nbr) if hood is None else hood
+    for s1 in sorted(hood, key=lambda m: (-(m & -m), m.bit_count())):
+        low = s1 & -s1
+        x = ((low << 1) - 1) | s1                        # B_min(S1) and S1 itself
+        frontier = hood[s1] & ~x
+        stack = []
+        for v in reversed(_bits(frontier)):
+            vb = 1 << v
+            yield s1, vb
+            stack.append((vb, x | (frontier & ((vb << 1) - 1))))
+            while stack:                                 # EnumerateCsgRec from {v}
+                s, xs = stack.pop()
+                grow = hood[s] & ~xs
+                sub = 0
+                while True:
+                    sub = (sub - grow) & grow
+                    if not sub:
+                        break
+                    yield s1, s | sub
+                    stack.append((s | sub, xs | grow))
+
+
 class JoinOrderEnumerator:
     """
     Enumerates join orders using dynamic programming with connected complement pairs (DPccp).
@@ -105,52 +186,56 @@ class JoinOrderEnumerator:
         self.cardinality_is_log_scale = cardinality_is_log_scale
 
     def search(self) -> tuple[JoinPlan, JoinPlan]:
-        """Main search method that finds the optimal join plan"""
-        best_plan: Dict[tuple, JoinPlan] = {}
-        best_plan_left_deep: Dict[tuple, JoinPlan] = {}
+        """Optimal bushy and left-deep plans (DPccp over bitmasks; one cardinality estimate per
+        connected subgraph). Costs as JoinPlan computes them; ties may pick a different plan of
+        equal cost than the earlier set-based version."""
+        n = self.n_entries
+        nbr = neighbour_masks(self.adjacency_list, n)
+        hood = connected_subgraphs(n, nbr)
+        raw = {m: self.estimated_cardinality(tuple(_bits(m))) for m in hood}
+        size = {m: math.exp(v) for m, v in raw.items()} if self.cardinality_is_log_scale else dict(raw)
+        cost = {1 << i: size[1 << i] for i in range(n)}  # bushy, per subset: cost and (left, right)
+        cost_ld = dict(cost)                             # left-deep
+        split, split_ld = {}, {}
 
-        # Initialize singleton plans
-        for i in range(self.n_entries):
-            singleton = {i}
-            singleton_key = (i,)
-            estimated_cardinality = self.estimated_cardinality(singleton_key)
-            best_plan[singleton_key] = JoinPlan(left=None, right=None,
-                                                entries=singleton,
-                                                estimated_size=estimated_cardinality,
-                                                left_deep=False,
-                                                cardinality_is_log_scale=self.cardinality_is_log_scale)
-            best_plan_left_deep[singleton_key] = JoinPlan(left=None, right=None,
-                                                          entries=singleton,
-                                                          estimated_size=estimated_cardinality,
-                                                          left_deep=True,
-                                                          cardinality_is_log_scale=self.cardinality_is_log_scale
-                                                          )
+        for s1, s2 in csg_cmp_pairs(n, nbr, hood):
+            union = s1 | s2
+            card = size[union]
+            leaf1, leaf2 = not s1 & (s1 - 1), not s2 & (s2 - 1)
+            if leaf1 and leaf2:
+                # Two scans: bushy counts the right one, left-deep the left one; the cheaper side wins.
+                a, b = size[s2] + card, size[s1] + card
+                value, children = (b, (s2, s1)) if a > b else (a, (s1, s2))
+                a, b = size[s1] + card, size[s2] + card
+                value_ld, children_ld = (b, (s2, s1)) if a > b else (a, (s1, s2))
+            elif leaf1:
+                value, children = cost[s2] + card, (s1, s2)
+                value_ld, children_ld = cost_ld[s2] + card, (s2, s1)
+            elif leaf2:
+                value, children = cost[s1] + card, (s1, s2)
+                value_ld, children_ld = cost_ld[s1] + card, (s1, s2)
+            else:
+                value, children = cost[s1] + cost[s2] + card, (s1, s2)
+                value_ld = None
+            if union not in cost or cost[union] > value:
+                cost[union], split[union] = value, children
+            if value_ld is not None and (union not in cost_ld or cost_ld[union] > value_ld):
+                cost_ld[union], split_ld[union] = value_ld, children_ld
 
-        # Enumerate all connected subgraph-complement pairs
-        csg_cmp_pairs = self.enumerate_csg_cmp_pairs(self.n_entries)
-        for csg_cmp_pair in csg_cmp_pairs:
-            csg, cmp = csg_cmp_pair[0], csg_cmp_pair[1]
-            tree1_key = tuple(self.sort_array_asc(list(csg)))
-            tree2_key = tuple(self.sort_array_asc(list(cmp)))
+        full = (1 << n) - 1
+        if full not in cost:
+            raise KeyError(tuple(range(n)))              # no plan without a cartesian product
+        return self._plan(full, split, raw, False), self._plan(full, split_ld, raw, True)
 
-            tree1 = best_plan[tree1_key]
-            tree2 = best_plan[tree2_key]
-            new_entries = tree1.entries | tree2.entries
-
-            estimate_key = tuple(self.sort_array_asc(list(new_entries)))
-            estimate = self.estimated_cardinality(estimate_key)
-
-            self.update_best_plan(tree1, tree2, new_entries, estimate, best_plan, best_plan_left_deep, False)
-
-            # If tree2 key is size 1 we are working with left-deep plan
-            if len(tree2_key) == 1 or len(tree1_key) == 1:
-                tree1_left_deep = best_plan_left_deep[tree1_key]
-                tree2_left_deep = best_plan_left_deep[tree2_key]
-                self.update_best_plan(tree1_left_deep, tree2_left_deep,
-                                      new_entries, estimate, best_plan, best_plan_left_deep, True)
-
-        all_entries_key = tuple(list(range(self.n_entries)))
-        return best_plan[all_entries_key], best_plan_left_deep[all_entries_key]
+    def _plan(self, mask, split, raw, left_deep) -> JoinPlan:
+        if mask & (mask - 1):
+            left, right = split[mask]
+            return JoinPlan(left=self._plan(left, split, raw, left_deep),
+                            right=self._plan(right, split, raw, left_deep),
+                            entries=set(_bits(mask)), estimated_size=raw[mask], left_deep=left_deep,
+                            cardinality_is_log_scale=self.cardinality_is_log_scale)
+        return JoinPlan(left=None, right=None, entries=set(_bits(mask)), estimated_size=raw[mask],
+                        left_deep=left_deep, cardinality_is_log_scale=self.cardinality_is_log_scale)
 
     def enumerate_left_deep_plans(self):
         cardinality_cache = {}
@@ -291,133 +376,12 @@ class JoinOrderEnumerator:
 
     def enumerate_csg_cmp_pairs(self, n_tps: int) -> List[Tuple[Set[int], Set[int]]]:
         """Enumerate all connected subgraph-complement pairs"""
-        all_tps = set(range(n_tps))
-        csgs = self.enumerate_csg(n_tps)
-        csg_cmp_pairs: List[Tuple[Set[int], Set[int]]] = []
-
-        for csg in csgs:
-            cmps = self.enumerate_cmp(csg, all_tps)
-            for cmp in cmps:
-                csg_cmp_pairs.append((csg, cmp))
-
-        return csg_cmp_pairs
+        return [(set(_bits(a)), set(_bits(b)))
+                for a, b in csg_cmp_pairs(n_tps, neighbour_masks(self.adjacency_list, n_tps))]
 
     def enumerate_csg(self, n_tps: int) -> List[Set[int]]:
         """Enumerate all connected sub graphs"""
-        csgs: List[Set[int]] = []
-        for i in range(n_tps - 1, -1, -1):
-            v_i = {i}
-            csgs.append(v_i)
-            self._enumerate_csg_recursive(csgs, v_i, set(range(i + 1)))
-        return csgs
-
-    def enumerate_cmp(self, tps_subset: Set[int], all_tps: Set[int]) -> List[Set[int]]:
-        """Enumerate complements for a given connected sub graph"""
-        cmps: List[Set[int]] = []
-        min_vertex = self._set_minimum(tps_subset)
-        x = self._reduce_set(min_vertex, all_tps) | tps_subset
-        neighbours = self._get_neighbours(tps_subset)
-
-        # Remove vertices that are in X from neighbours
-        for vertex in x:
-            neighbours.discard(vertex)
-
-        for vertex in self.sort_set_desc(neighbours):
-            cmps.append({vertex})
-            reduced_neighbours = self._reduce_set(vertex, neighbours)
-            self._enumerate_csg_recursive(
-                cmps,
-                {vertex},
-                x | reduced_neighbours
-            )
-        return cmps
-
-    def _enumerate_csg_recursive(self, csgs: List[Set[int]], s: Set[int], x: Set[int]):
-        """Recursively enumerate connected subgraphs"""
-        neighbours = self._get_neighbours(s)
-        # Remove vertices that are in X from neighbours
-        for vertex in x:
-            neighbours.discard(vertex)
-
-        subsets = self._get_all_subsets(neighbours)
-        for subset in subsets:
-            csgs.append(s | subset)
-
-        for subset in subsets:
-            self._enumerate_csg_recursive(csgs, s | subset, x | neighbours)
-
-    def update_best_plan(self, tree1, tree2, new_entries, estimate_size,
-                         best_plan, best_plan_left_deep,
-                         left_deep: bool):
-        if left_deep:
-            curr_plan_left = JoinPlan(left=tree1,
-                                      right=tree2,
-                                      entries=new_entries,
-                                      estimated_size=estimate_size,
-                                      left_deep=True,
-                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
-            curr_plan_right = JoinPlan(left=tree2,
-                                       right=tree1,
-                                       entries=new_entries,
-                                       estimated_size=estimate_size,
-                                       left_deep=True,
-                                       cardinality_is_log_scale=self.cardinality_is_log_scale)
-            if len(tree1.entries) == 1 and len(tree2.entries) == 1:
-                curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
-                             else curr_plan_left)
-            elif len(tree1.entries) == 1:
-                curr_plan = curr_plan_right
-            elif len(tree2.entries) == 1:
-                curr_plan = curr_plan_left
-            else:
-                raise ValueError("Bushy plan passed to left-deep update")
-            curr_plan_key = tuple(self.sort_array_asc(list(curr_plan.entries)))
-            if (curr_plan_key not in best_plan_left_deep or
-                    best_plan_left_deep[curr_plan_key].cost > curr_plan.cost):
-                best_plan_left_deep[curr_plan_key] = curr_plan
-
-        else:
-            curr_plan_left = JoinPlan(left=tree1,
-                                      right=tree2,
-                                      entries=new_entries,
-                                      estimated_size=estimate_size,
-                                      left_deep=False,
-                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
-            curr_plan_right = JoinPlan(left=tree2,
-                                       right=tree1,
-                                       entries=new_entries,
-                                       estimated_size=estimate_size,
-                                       left_deep=False,
-                                       cardinality_is_log_scale=self.cardinality_is_log_scale)
-            curr_plan = (curr_plan_right if curr_plan_left.cost > curr_plan_right.cost
-                         else curr_plan_left)
-
-            curr_plan_key = tuple(self.sort_array_asc(list(curr_plan.entries)))
-
-            if (curr_plan_key not in best_plan or
-                    best_plan[curr_plan_key].cost > curr_plan.cost):
-                best_plan[curr_plan_key] = curr_plan
-        return curr_plan, curr_plan_key
-
-    def store_plan(self, trees1, trees2, new_entries, plan_key, estimate_size, stored_plans):
-        for tree1 in trees1:
-            for tree2 in trees2:
-                left_plan = JoinPlan(left=tree1,
-                                     right=tree2,
-                                     entries=new_entries,
-                                     estimated_size=estimate_size,
-                                     left_deep=False,
-                                     cardinality_is_log_scale=self.cardinality_is_log_scale)
-                right_plan = JoinPlan(left=tree2,
-                                      right=tree1,
-                                      entries=new_entries,
-                                      estimated_size=estimate_size,
-                                      left_deep=False,
-                                      cardinality_is_log_scale=self.cardinality_is_log_scale)
-                if plan_key not in stored_plans:
-                    stored_plans[plan_key] = []
-                stored_plans[plan_key].append(left_plan)
-                stored_plans[plan_key].append(right_plan)
+        return [set(_bits(m)) for m in connected_subgraphs(n_tps, neighbour_masks(self.adjacency_list, n_tps))]
 
     def _get_neighbours(self, s: Set[int]) -> Set[int]:
         """Get all neighbours of vertices in set S"""
@@ -426,32 +390,6 @@ class JoinOrderEnumerator:
             if vertex in self.adjacency_list:
                 neighbours.update(self.adjacency_list[vertex])
         return neighbours
-
-    @staticmethod
-    def _get_all_subsets(s: Set[int]) -> List[Set[int]]:
-        """Get all non-empty subsets of a set"""
-        subsets: List[Set[int]] = [set()]
-        for el in s:
-            last = len(subsets) - 1
-            for i in range(last + 1):
-                subsets.append(subsets[i] | {el})
-        # Remove empty set
-        return subsets[1:]
-
-    @staticmethod
-    def _reduce_set(i: int, s: Set[int]) -> Set[int]:
-        """Reduce set to elements <= i"""
-        return {vertex for vertex in s if vertex <= i}
-
-    @staticmethod
-    def _set_minimum(s: Set[int]) -> int:
-        """Get minimum element from set"""
-        return min(s)
-
-    @staticmethod
-    def sort_set_desc(s: Set[int]) -> List[int]:
-        """Sort set in descending order"""
-        return sorted(s, reverse=True)
 
     @staticmethod
     def sort_array_asc(arr: List[int]) -> List[int]:

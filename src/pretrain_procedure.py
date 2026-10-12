@@ -7,6 +7,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.loader import DataLoader
 
+from src.datastructures.subquery_training import (CardinalityExamples, EpochSampler, SUBQUERY_FIELDS,
+                                                  censored_l1, subquery_metrics)
 from src.models.model_instantiator import ModelFactory
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.utils.training_utils.query_loading_utils import load_queries_into_dataset
@@ -224,8 +226,24 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
     return mean_loss, mean_mae, global_q_error_stats['val_mean_q_error'], val_predictions, global_q_error_stats
 
 
+def _predict(model, batch, device):
+    outputs = model.forward(x=batch.x.to(device), edge_index=batch.edge_index.to(device),
+                            edge_attr=batch.edge_attr.to(device), batch=batch.batch.to(device))
+    cardinality, emptiness = cardinality_and_emptiness(outputs)
+    return combined_log_prediction(cardinality, emptiness)
+
+
 def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location,
-                            device, n_epoch, batch_size, lr, weight_decay=0.0):
+                            device, n_epoch, batch_size, lr, weight_decay=0.0,
+                            subquery_labels_train=None, subquery_labels_val=None, censored_loss=False,
+                            subquery_fraction=1.0, subquery_val_examples=20000, num_workers=2, resume=False):
+    """With subquery_labels_train (src/datastructures/subquery_training.py): train on the full
+    queries plus their counted sub-queries (a fresh `subquery_fraction` of them per epoch), with
+    the censored loss when censored_loss; validation adds sub-query metrics (val_sub_*) on a fixed
+    sample of `subquery_val_examples` validation sub-queries.
+    With resume, `writer` points at an existing run: training continues after its last saved epoch
+    from that epoch's weights (a fresh optimizer), and its recorded epochs are replayed into the
+    summary so train_progress.json stays one continuous history."""
     writer_tb = SummaryWriter(log_dir='runs/moe_experiment_1')
     lambda_aux = 0.01
     print("Training on {} queries, device: {}".format(len(train_dataset), device))
@@ -234,7 +252,40 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
     gine_conv_model = model_factory_gine_conv.load_gine_conv()
     gine_conv_model.to(device)
 
-    train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    start_epoch = 0
+    previous = None
+    if resume:
+        import json as _json
+        import os as _os
+        with open(_os.path.join(str(writer.experiment_directory), "train_progress.json")) as f:
+            previous = _json.load(f)
+        start_epoch = len(previous["val_loss"])
+        last = _os.path.join(str(writer.experiment_directory), f"epoch-{start_epoch - 1}", "model")
+        gine_conv_model.embedding_model.load_state_dict(
+            torch.load(_os.path.join(last, "embedding_model.pt"), map_location=device))
+        for index, head in enumerate(gine_conv_model.heads):
+            head_type = gine_conv_model.head_types[index]
+            head.load_state_dict(torch.load(_os.path.join(last, f"head_{head_type}.pt"), map_location=device))
+        print(f"Resuming {writer.experiment_directory} at epoch {start_epoch} from {last}")
+    use_examples = bool(subquery_labels_train) or censored_loss
+    sub_val_loader = None
+    if use_examples:
+        if "emptiness" in gine_conv_model.head_types and censored_loss:
+            raise ValueError("censored_loss replaces the emptiness head; use a model without it")
+        examples = CardinalityExamples(train_dataset, subquery_labels_train, censored=censored_loss)
+        print(f"Training examples: {examples.n_full:,} full queries + {examples.n_sub:,} sub-queries "
+              f"({subquery_fraction:.0%} of them per epoch), censored loss: {censored_loss}")
+        train_data_loader = DataLoader(examples, batch_size=batch_size,
+                                       sampler=EpochSampler(examples, subquery_fraction, seed=start_epoch),
+                                       num_workers=num_workers, persistent_workers=num_workers > 0)
+        if subquery_labels_val:
+            val_examples = CardinalityExamples(validation_dataset, subquery_labels_val, include_full=False,
+                                               censored=True)
+            keep = np.random.default_rng(0).permutation(len(val_examples))[:subquery_val_examples]
+            sub_val_loader = DataLoader(torch.utils.data.Subset(val_examples, keep.tolist()), batch_size=512,
+                                        num_workers=0)       # no extra forks next to the training workers
+    else:
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_data_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False)
 
     train_summary = TrainSummary([
@@ -247,7 +298,11 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
         ("val_p90_q_error", "min"),
         ("val_p95_q_error", "min"),
         ("val_p99_q_error", "min")
-    ] + (EMPTINESS_FIELDS if "emptiness" in gine_conv_model.head_types else []))
+    ] + (EMPTINESS_FIELDS if "emptiness" in gine_conv_model.head_types else [])
+      + (SUBQUERY_FIELDS if sub_val_loader is not None else []))
+    if previous is not None:                       # replay the recorded epochs into the summary
+        for epoch in range(start_epoch):
+            train_summary.update({k: v[epoch] for k, v in previous.items()}, epoch)
     total_params = sum(p.numel() for p in gine_conv_model.parameters())
     print(f"Total number of parameters: {total_params}")
 
@@ -271,7 +326,7 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
 
     gine_conv_model.register_moe_gradient_hooks(writer_tb, lambda: global_step)
 
-    for i in range(n_epoch):
+    for i in range(start_epoch, n_epoch):
         gine_conv_model.train()
 
         train_losses = []
@@ -283,7 +338,10 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
                                            edge_attr=batch.edge_attr.to(device),
                                            batch = batch.batch.to(device))
             cardinality, emptiness = cardinality_and_emptiness(pred)
-            loss = pretraining_loss(loss_fn, cardinality, emptiness, batch.y.to(device).view(-1))
+            if censored_loss:
+                loss = censored_l1(cardinality, batch.y.to(device).view(-1), batch.censor.to(device).view(-1))
+            else:
+                loss = pretraining_loss(loss_fn, cardinality, emptiness, batch.y.to(device).view(-1))
             aux_load_balance_loss = gine_conv_model.get_load_balancing_loss(device=device,
                                                                             writer=writer_tb,
                                                                             epoch=i)
@@ -300,6 +358,9 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
             validate_model_dataset(gine_conv_model, val_data_loader, loss_fn, device=device))
         print('Epoch {}/{}, average train loss: {}, val_loss: {}, val_mae: {}, val_q_error: {}'.
             format(i+1, n_epoch, np.mean(train_losses), val_loss, val_mae, val_q_error))
+        if sub_val_loader is not None:
+            stats_q_error.update(subquery_metrics(gine_conv_model, sub_val_loader, device,
+                                                  lambda model, batch: _predict(model, batch, device)))
         print(stats_q_error)
 
         if scheduler.get_last_lr() != previous_lr:
@@ -325,18 +386,22 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                              feature_type, model_config_location, n_epoch, batch_size, lr, seed,
                              occurrences_location = None, tp_cardinality_location = None, multiplicity_location=None,
                              hll_location = None, minhash_location=None, contextualizer_location=None,
-                             weight_decay=0.0,
+                             weight_decay=0.0, subquery_labels_train=None, subquery_labels_val=None,
+                             censored_loss=False, subquery_fraction=1.0, resume_from=None,
                              test_queries=None, test_cardinalities=None,
                              to_load=None, device='cpu'
                              ):
     faulthandler.enable()
-    writer.create_experiment_directory()
+    if resume_from:                                # continue an existing run in its own directory
+        writer.experiment_directory = resume_from
+    else:
+        writer.create_experiment_directory()
     query_env = BlazeGraphQueryEnvironment(endpoint_location)
     train_dataset, val_dataset = load_queries_into_dataset(queries_location_train, queries_location_val,
                                                            endpoint_location,
                                                            rdf2vec_vector_location, query_env, feature_type,
                                                            to_load=to_load,
-                                                           load_mappings=False,
+                                                           load_mappings=bool(subquery_labels_train),
                                                            occurrences_location=occurrences_location,
                                                            tp_cardinality_location=tp_cardinality_location,
                                                            multiplicity_location=multiplicity_location,
@@ -345,6 +410,8 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                                                            contextualizer_location=contextualizer_location,
                                                            )
     run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
-                            weight_decay=weight_decay)
+                            weight_decay=weight_decay, subquery_labels_train=subquery_labels_train,
+                            subquery_labels_val=subquery_labels_val, censored_loss=censored_loss,
+                            subquery_fraction=subquery_fraction, resume=bool(resume_from))
     return train_dataset, val_dataset
 

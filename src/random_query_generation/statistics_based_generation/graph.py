@@ -94,6 +94,8 @@ class DataGraph:
     # --- pattern sizes ---------------------------------------------------------------------
     @staticmethod
     def _range(predicates, p):
+        # p in the array's dtype: a Python int would make numpy cast the whole (hub-sized) array.
+        p = predicates.dtype.type(p)
         return np.searchsorted(predicates, p, "left"), np.searchsorted(predicates, p, "right")
 
     def objects_of(self, s, p):
