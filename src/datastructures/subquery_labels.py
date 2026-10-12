@@ -20,7 +20,7 @@ datasets, whose node features the DP slices sub-queries from.
 Counting: plain SELECT (COUNT(*)) per sub-query (QLever plans it). One thread per endpoint pulls
 from a shared queue, so a long count occupies one endpoint while the others keep going. Results are
 appended to --out as they finish (one JSON line per task); a rerun skips what is already there.
-A count that fails or times out is stored as null and not retried.
+A count that fails or times out is stored as null; `merge` imputes it (see there).
 """
 from __future__ import annotations
 
@@ -136,15 +136,23 @@ def _count(session, endpoint, sparql, timeout_s, token):
 
 def count(args):
     endpoints, token = _endpoints(args), _access_token(args)
-    alive = []
-    for endpoint in endpoints:          # health check: drop endpoints that do not answer
+    print(f"[count] checking {len(endpoints)} endpoints ...", flush=True)
+
+    def answers(endpoint):              # health check, in parallel with a short timeout
         try:
-            if _count(requests.Session(), endpoint, "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }", 30, token):
-                alive.append(endpoint)
+            response = requests.get(endpoint, params={"query": "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }"},
+                                    headers={"Accept": "application/sparql-results+json"}, timeout=10)
+            return response.status_code == 200
         except requests.RequestException:
-            pass
-    print(f"[count] {len(alive)}/{len(endpoints)} endpoints answer; access token {'set' if token else 'NOT set'}",
-          flush=True)
+            return False
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(endpoints)) as pool:
+        ok = list(pool.map(answers, endpoints))
+    alive = [e for e, good in zip(endpoints, ok) if good]
+    dead = sorted({e.rsplit(":", 1)[0] for e, good in zip(endpoints, ok) if not good})
+    print(f"[count] {len(alive)}/{len(endpoints)} endpoints answer" + (f" (not answering: {', '.join(dead)})" if dead else "")
+          + f"; access token {'set' if token else 'NOT set'}", flush=True)
     if not alive:
         raise SystemExit("no QLever endpoint answers")
     done = set()
@@ -152,9 +160,11 @@ def count(args):
         with open(args.out) as f:
             for line in f:
                 record = json.loads(line)
-                done.add((record["id"], record["mask"]))
+                if record["count"] is not None or not args.retry_failed:
+                    done.add((record["id"], record["mask"]))
     work = queue.Queue()
     total = 0
+    print(f"[count] reading {args.tasks} ...", flush=True)
     with _open(args.tasks, "r") as f:
         tasks = [json.loads(line) for line in f]
     random.Random(0).shuffle(tasks)            # long sub-queries spread over the run
@@ -185,7 +195,7 @@ def count(args):
                 out.write(json.dumps(record) + "\n")
                 state["done"] += 1
                 state["failed"] += value is None
-                if state["done"] % 5000 == 0:
+                if state["done"] in (100, 1000) or state["done"] % 5000 == 0:
                     elapsed = time.perf_counter() - state["start"]
                     print(f"[count] {state['done']:,}/{total:,} ({state['done'] / elapsed:.0f}/s, "
                           f"{state['failed']:,} failed or timed out, {elapsed / 60:.0f} min)", flush=True)
@@ -202,23 +212,41 @@ def count(args):
 def merge(args):
     with _open(args.tasks, "r") as f:
         tasks = {t["id"]: t for t in map(json.loads, f)}
-    labels = {"train": {}, "val": {}}
-    failed = 0
+    final = {}                        # (id, mask) -> count; a later valid result replaces an earlier null
     with open(args.results) as f:
         for record in map(json.loads, f):
-            task = tasks[record["id"]]
-            if record["count"] is None:
-                failed += 1
-                continue
-            entry = labels[task["split"]].setdefault(task["query"], {"triple_patterns": task["triple_patterns"], "counts": {}})
-            entry["counts"][str(record["mask"])] = record["count"]
+            key = (record["id"], record["mask"])
+            if record["count"] is not None or key not in final:
+                final[key] = record["count"]
+    # Failed / timed-out counts are imputed: the highest count among the query's counted
+    # sub-queries, or, if none of them was counted, the highest count over all sub-queries.
+    # Imputed masks are listed per query ("imputed"), e.g. for a one-sided loss in training.
+    query_max = {}
+    for (query_id, _), value in final.items():
+        if value is not None:
+            query_max[query_id] = max(query_max.get(query_id, 0), value)
+    global_max = max(query_max.values(), default=0)
+    labels = {"train": {}, "val": {}}
+    imputed_query = imputed_global = 0
+    for (query_id, mask), value in final.items():
+        task = tasks[query_id]
+        entry = labels[task["split"]].setdefault(task["query"], {"triple_patterns": task["triple_patterns"],
+                                                                  "counts": {}, "imputed": []})
+        if value is None:
+            if query_id in query_max:
+                value, imputed_query = query_max[query_id], imputed_query + 1
+            else:
+                value, imputed_global = global_max, imputed_global + 1
+            entry["imputed"].append(str(mask))
+        entry["counts"][str(mask)] = value
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     for split, table in labels.items():
         with open(out / f"subquery_labels_{split}.json", "w") as f:
             json.dump(table, f)
         print(f"[merge] {split}: {len(table):,} queries, {sum(len(e['counts']) for e in table.values()):,} sub-query labels")
-    print(f"[merge] {failed:,} sub-queries without a count (failed or timed out)")
+    print(f"[merge] imputed {imputed_query + imputed_global:,} failed / timed-out counts: {imputed_query:,} with the "
+          f"query's highest count, {imputed_global:,} with the overall highest ({global_max:,})")
 
 
 def main():
@@ -233,7 +261,10 @@ def main():
     c = sub.add_parser("count")
     c.add_argument("--tasks", required=True)
     c.add_argument("--out", required=True)
-    c.add_argument("--timeout", type=float, default=600)
+    c.add_argument("--timeout", type=float, default=30,
+                   help="per count; a short first pass labels the fast majority without long counts blocking endpoints")
+    c.add_argument("--retry-failed", action="store_true",
+                   help="count again the sub-queries stored as null (failed / timed out), e.g. with a longer timeout")
     c.add_argument("--endpoints", default=None, help="comma-separated; default: execution section of --config")
     c.add_argument("--config", default="experiments/experiment_configs/epinet_cost_estimation/cost_estimation_yago_mixed/"
                                        "online_amortized_dp_mixed_yago.yaml")

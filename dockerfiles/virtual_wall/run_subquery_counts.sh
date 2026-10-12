@@ -9,15 +9,17 @@
 #
 # Needs ~/subquery_tasks.jsonl.gz (made locally by `subquery_labels sample`, copied with scp).
 # Without QLEVER_HOSTS the endpoints come from the online config's execution section.
-# One thread per endpoint pulls from a shared queue: slow counts occupy one endpoint each, the
-# fast ones keep flowing. Results are appended to ~/subquery_results.jsonl as they finish; rerun
+# One thread per endpoint pulls from a shared queue. Two passes: first with a short timeout
+# (TIMEOUT, default 30 s) so the fast majority is labelled quickly; then, optionally, only the
+# failed / timed-out ones again with a long one:  RETRY_FAILED=1 TIMEOUT=600 bash <this script>
+# Results are appended to ~/subquery_results.jsonl as they finish; rerun
 # the same command after an interruption and it continues. Copy that file back when done.
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/users/reschauz/rl-based-join-optimization}"
 TASKS="${TASKS:-$HOME/subquery_tasks.jsonl.gz}"
 RESULTS="${RESULTS:-$HOME/subquery_results.jsonl}"
-TIMEOUT="${TIMEOUT:-600}"
+TIMEOUT="${TIMEOUT:-30}"
 cd "$REPO_DIR"
 
 [ -f "$TASKS" ] || { echo "Copy the task file to $TASKS first." >&2; exit 1; }
@@ -39,5 +41,5 @@ if [ -n "${QLEVER_HOSTS:-}" ]; then
 fi
 
 PYTHONPATH="$REPO_DIR" .venv/bin/python -u -m src.datastructures.subquery_labels count \
-  --tasks "$TASKS" --out "$RESULTS" --timeout "$TIMEOUT" "${ENDPOINTS[@]}" 2>&1 | tee -a "$HOME/subquery_counts.log"
+  --tasks "$TASKS" --out "$RESULTS" --timeout "$TIMEOUT" ${RETRY_FAILED:+--retry-failed} "${ENDPOINTS[@]}" 2>&1 | tee -a "$HOME/subquery_counts.log"
 echo "Done. Copy $RESULTS back, e.g.: scp <node>:$RESULTS data/generated_queries/mixed_yago_v2/subquery_labels/"
