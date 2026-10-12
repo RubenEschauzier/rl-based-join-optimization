@@ -1,0 +1,136 @@
+# Regularised oracle (compare with t_cv_repr_huge_graph_norm_hll, which overfit on mixed_yago_v2:
+# best epoch 23, train-val gap 0.35 by epoch 11). Same structure (3 TripleGINEConv layers with
+# GraphNorm, sum pooling, cardinality head), with
+#   - constant width 512 instead of widening to 4096 (~tens of millions -> ~3.4M parameters),
+#   - SliceDropout on the 128 embedding features of every node (p 0.3): the per-constant rdf2vec
+#     vector acts like an ID through which a large model memorises cardinalities per constant,
+#   - Dropout 0.2 after every message-passing layer and in the head (was: last layer / head only),
+#   - weight decay via the pretraining config (weight_decay, AdamW).
+model:
+  type: GINEConv
+  embedding:
+    layers:
+      - type: SliceDropout
+        start: 8                    # node features: 8 statistics / flag features, then 128 embedding
+        end: 136
+        p: 0.3
+        id: embedding_dropout
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 136
+            out_features: 512
+            id: gine_nn_1_lin_1
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_1_ln_1
+          - type: ReLU
+            id: gine_nn_1_relu_1
+          - type: Linear
+            in_features: 512
+            out_features: 512
+            id: gine_nn_1_lin_2
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_1_ln_2
+          - type: ReLU
+            id: gine_nn_1_relu_2
+          - type: Dropout
+            p: 0.2
+            id: gine_nn_1_dropout
+        edge_dim: 137
+        id: gine_1
+
+      - type: GraphNorm
+        in_channels: 512
+        id: graph_norm_1
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 512
+            out_features: 512
+            id: gine_nn_2_lin_1
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_2_ln_1
+          - type: ReLU
+            id: gine_nn_2_relu_1
+          - type: Linear
+            in_features: 512
+            out_features: 512
+            id: gine_nn_2_lin_2
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_2_ln_2
+          - type: ReLU
+            id: gine_nn_2_relu_2
+          - type: Dropout
+            p: 0.2
+            id: gine_nn_2_dropout
+        edge_dim: 137
+        id: gine_2
+
+      - type: GraphNorm
+        in_channels: 512
+        id: graph_norm_2
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 512
+            out_features: 512
+            id: gine_nn_3_lin_1
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_3_ln_1
+          - type: ReLU
+            id: gine_nn_3_relu_1
+          - type: Linear
+            in_features: 512
+            out_features: 512
+            id: gine_nn_3_lin_2
+          - type: LayerNorm
+            normalized_shape: 512
+            id: gine_nn_3_ln_2
+          - type: ReLU
+            id: gine_nn_3_relu_2
+          - type: Dropout
+            p: 0.2
+            id: gine_nn_3_dropout
+        edge_dim: 137
+        id: gine_3
+
+      - type: SumAggregation
+        id: sum_agg
+
+  heads:
+    - estimation_type: cardinality
+      layers:
+        - type: Linear
+          in_features: 512
+          out_features: 256
+          id: card_nn_lin_1
+        - type: LayerNorm
+          normalized_shape: 256
+          id: card_nn_ln_1
+        - type: ReLU
+          id: card_nn_relu_1
+        - type: Dropout
+          p: 0.2
+          id: card_nn_dropout_1
+        - type: Linear
+          in_features: 256
+          out_features: 64
+          id: card_nn_lin_2
+        - type: ReLU
+          id: card_nn_relu_2
+        - type: Linear
+          in_features: 64
+          out_features: 1
+          id: card_nn_lin_3
+
+weight_location:
+  directory: ""
+  chkp: true

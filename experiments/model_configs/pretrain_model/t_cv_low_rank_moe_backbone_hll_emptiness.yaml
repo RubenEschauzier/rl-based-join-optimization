@@ -1,0 +1,83 @@
+# Backbone (t_cv_repr_exact_separate_head_own_embeddings_hll) with low-rank MoE layers instead of
+# TripleGINEConv; hidden widths 60 / 61 (instead of 101 / 100) so the parameter count equals
+# the backbone's (154,740).
+# + emptiness head (hurdle model, see src/pretrain_procedure.py): logit of P(result is empty).
+model:
+  type: GINEConv
+  embedding:
+    layers:
+      - type: TripleGINEConvLowRankMoE
+        num_experts: 8
+        top_k: 2
+        rank: 4
+        routing_level: query
+        router_temperature: 1.0
+        adapter_scale: 0.1
+        nn:
+          - type: Linear
+            in_features: 136
+            out_features: 60
+            id: gine_nn_1_lin_1
+          - type: ReLU
+            id: gine_nn_1_relu_1
+          - type: Linear
+            in_features: 60
+            out_features: 101
+            id: gine_nn_1_lin_2
+        edge_dim: 137
+        id: gine_low_rank_moe_1
+
+      - type: TripleGINEConvLowRankMoE
+        num_experts: 8
+        top_k: 2
+        rank: 4
+        routing_level: query
+        router_temperature: 1.0
+        adapter_scale: 0.1
+        nn:
+          - type: Linear
+            in_features: 101
+            out_features: 61
+            id: gine_nn_2_lin_1
+          - type: ReLU
+            id: gine_nn_2_relu_1
+          - type: Linear
+            in_features: 61
+            out_features: 200
+            id: gine_nn_2_lin_2
+        edge_dim: 137
+        id: gine_low_rank_moe_2
+
+      - type: SumAggregation
+        id: sum_agg
+
+  heads:
+    - estimation_type: cardinality
+      layers:
+        - type: Linear
+          in_features: 200
+          out_features: 50
+          id: card_nn_lin_1
+        - type: ReLU
+          id: card_nn_relu_1
+        - type: Linear
+          in_features: 50
+          out_features: 1
+          id: card_nn_lin_2
+
+    - estimation_type: emptiness
+      layers:
+        - type: Linear
+          in_features: 200
+          out_features: 50
+          id: empty_nn_lin_1
+        - type: ReLU
+          id: empty_nn_relu_1
+        - type: Linear
+          in_features: 50
+          out_features: 1
+          id: empty_nn_lin_2
+
+weight_location:
+  directory: ""
+  chkp: true

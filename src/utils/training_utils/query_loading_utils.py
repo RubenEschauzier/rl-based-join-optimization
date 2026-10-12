@@ -17,7 +17,8 @@ from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
 from src.query_environments.blazegraph.query_environment_blazegraph import BlazeGraphQueryEnvironment
 from src.query_featurizers.featurize_edge_labeled_graph import QueryToEdgeLabeledGraph
 from src.query_featurizers.featurize_predicate_edges import QueryToEdgePredicateGraph
-from src.query_featurizers.featurize_predicate_edges_tp_hll import QueryToEdgePredicateGraphHll
+from src.query_featurizers.featurize_predicate_edges_tp_hll import QueryToEdgePredicateGraphHll, \
+    QueryToEdgePredicateGraphHllMinHash
 from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
 
 
@@ -91,14 +92,17 @@ def load_queries_into_dataset(queries_location_train, queries_location_val,
                               load_mappings = True,
                               to_load=None, occurrences_location=None, tp_cardinality_location=None,
                               multiplicity_location = None, hll_location = None,
-                              shuffle_train=True, shuffle_val=False):
+                              shuffle_train=True, shuffle_val=False, minhash_location=None,
+                              contextualizer_location=None):
     vectors = FeaturizeQueriesRdf2Vec.load_vectors(rdf2vec_vector_location)
     featurizer_edge_labeled_graph = load_featurizer(feature_type,
                                                     vectors, env,
                                                     occurrences_location,
                                                     tp_cardinality_location,
                                                     multiplicity_location,
-                                                    hll_location=hll_location)
+                                                    hll_location=hll_location,
+                                                    minhash_location=minhash_location,
+                                                    contextualizer_location=contextualizer_location)
     post_processor = filter_failed_cardinality_queries
 
     train_dataset = QueryCardinalityDataset(root=queries_location_train,
@@ -146,10 +150,11 @@ def load_queries_into_dataset_single(queries_location,
     return dataset
 
 
-def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge", "predicate_edge_hll"],
+def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_edge", "predicate_edge_hll",
+                                                    "predicate_edge_hll_minhash", "predicate_edge_hll_contextual"],
                     vectors, query_env,
                     occurrences_location=None, tp_cardinality_location=None, multiplicity_location=None,
-                    hll_location=None):
+                    hll_location=None, minhash_location=None, contextualizer_location=None):
 
     occurrences = None
     tp_cardinality = None
@@ -181,6 +186,26 @@ def load_featurizer(featurizer_type: typing.Literal["labeled_edge", "predicate_e
                                                       predicate_multiplicities=predicate_multiplicities,
                                                       tp_cardinalities=tp_cardinality,
                                                       loaded_hll_json=hll)
+    elif featurizer_type == "predicate_edge_hll_minhash":
+        with open(minhash_location, 'r') as f:
+            minhash = json.load(f)
+        query_to_graph = QueryToEdgePredicateGraphHllMinHash(vectors, query_env,
+                                                             term_occurrences=occurrences,
+                                                             predicate_multiplicities=predicate_multiplicities,
+                                                             tp_cardinalities=tp_cardinality,
+                                                             loaded_hll_json=hll,
+                                                             loaded_minhash_json=minhash)
+    elif featurizer_type == "predicate_edge_hll_contextual":
+        from src.contextual_embeddings.inference import FrozenContextualizer
+        from src.query_featurizers.featurize_predicate_edges_tp_hll_contextual import \
+            QueryToEdgePredicateGraphHllContextual
+        query_to_graph = QueryToEdgePredicateGraphHllContextual(vectors, query_env,
+                                                                term_occurrences=occurrences,
+                                                                predicate_multiplicities=predicate_multiplicities,
+                                                                tp_cardinalities=tp_cardinality,
+                                                                loaded_hll_json=hll,
+                                                                contextualizer=FrozenContextualizer(
+                                                                    contextualizer_location))
     else:
         raise NotImplementedError
     return functools.partial(query_to_graph.transform_undirected)

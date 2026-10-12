@@ -1,0 +1,62 @@
+# Contextual embeddings trained on counterfactual (near-miss) queries (src/contextual_embeddings).
+#   python -m src.contextual_embeddings.corpus     builds the corpus
+#   python -m src.contextual_embeddings.pretrain   builds the vocabulary and pretrains
+# The frozen result (training.output_directory/contextualizer.pt) is read by feature_type
+# predicate_edge_hll_contextual (pretraining config key contextualizer_location).
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+corpus:
+  # Graph, statistics, choke points and instantiation limits of the workload generator.
+  generation_config: experiments/experiment_configs/query_generation/statistics_based_yago.yaml
+  output_directory: data/contextual_embeddings/mixed_yago_v2/corpus
+  n_instances: 250000               # positives + negatives (~2 h with 12 workers)
+  shard_size: 50000
+  shapes: [star, path, tree, snowflake, cycle, diamond, flower, path_star]
+  sizes: [3, 4, 5, 6, 7, 8]         # patterns per instance
+  near_miss_probability: 0.9        # per positive: try a near-miss negative (hard-zero construction)
+  easy_probability: 0.3             # per positive: try an easy (random replacement) negative
+  workers: 12
+  job_time_budget: 2.0             # seconds per sampled shape; slower ones are skipped
+  seed: 0
+
+vocabulary:
+  directory: data/contextual_embeddings/mixed_yago_v2
+  # Warm start of the token table; terms of these queries are always in the vocabulary.
+  rdf2vec: data/rdf2vec_embeddings/mixed_yago_v2/model.json
+  queries: data/generated_queries/mixed_yago_v2
+  min_count: 1                      # corpus terms seen fewer times map to the unknown token
+
+# Neighbour profiles (src/contextual_embeddings/profiles.py): index-time neighbour-type histograms.
+# Built by: python -m src.contextual_embeddings.profiles. Used when model.profiles is true.
+profiles:
+  directory: data/contextual_embeddings/yago_profiles
+
+model:
+  profiles: false                   # true: token input = [rdf2vec ; neighbour profile] (see contextualizer_profiles_*)
+  dim: 128                          # = rdf2vec dimension (the featurizer swaps these 128 features)
+  hidden: 64
+  layers: 3                         # zero-locality: 43% of zeros need propagation along edges
+  dropout: 0.1
+
+training:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/contextualizer
+  epochs: 40
+  # Model selection / early stopping on the blind spot: positives vs constant-made near misses
+  # (all near misses are ~5x more often predicate swaps, already ~0.99, which hides its progress).
+  selection_metric: auroc_near_miss_constant
+  early_stopping_patience: 5
+  # Frozen token table: rdf2vec stays intact and nothing is memorised per constant (with a
+  # trainable table, held-out constant-made near misses fell from 0.74 to 0.64 after epoch 2).
+  freeze_table: true
+  batch_size: 512
+  lr: 0.001
+  table_lr: 0.003
+  table_l2: 0.01                    # pull of looked-up token vectors towards their rdf2vec start
+  arm_weight: 1.0
+  empty_weight: 1.0
+  heldout_constant_share: 0.05      # instances with a held-out constant only validate
+  seed: 0
+  device: cuda

@@ -13,6 +13,7 @@ from src.models.model_layers.triple_gine_conv import TripleGineConv
 from src.models.model_layers.triple_gine_conv_low_rank_moe import TripleGineConvLowRankMoE
 from src.models.model_layers.triple_gine_conv_moe import TripleGineConvMoE
 from src.models.model_layers.triple_pattern_pool import TriplePatternPooling
+from src.models.model_layers.slice_dropout import SliceDropout
 
 
 class GINEConvModel(torch.nn.Module):
@@ -123,6 +124,9 @@ class GINEConvModel(torch.nn.Module):
                 pool_class = getattr(torch_geometric.nn.aggr.basic, layer_type)
                 embedding_layers[layer_id] = (pool_class(**pool_params), 'x, batch -> x')
 
+        elif layer_type == 'SliceDropout':
+            params = self.__filter_parameters(layer_config, ['type', 'id'])
+            embedding_layers[layer_id] = (SliceDropout(**params), 'x -> x')
         elif layer_type in self.supported_mlp_layers:
             mlp_class = getattr(torch.nn, layer_type)
             mlp_params = self.__filter_parameters(layer_config, ['type', 'id'])

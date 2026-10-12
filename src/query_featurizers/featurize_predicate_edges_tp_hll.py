@@ -251,3 +251,37 @@ class QueryToEdgePredicateGraphHll:
 
     def get_unique_failed_terms(self):
         return self.embedding_unique_terms_failed
+
+class QueryToEdgePredicateGraphHllMinHash(QueryToEdgePredicateGraphHll):
+    """predicate_edge_hll features plus 4 per node from MinHash sketches of the sets each
+    variable is bound to by its patterns (src/datastructures/minhash_sketches.py): has >= 2
+    sets, certainly non-empty, log1p estimated joint intersection, log1p smallest pairwise
+    intersection. Constants get zeros. Every sketch must be precomputed (no endpoint fallback)."""
+
+    N_MINHASH_FEATURES = 4
+
+    def __init__(self, *args, loaded_minhash_json=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.minhash_store = loaded_minhash_json or {}
+
+    def get_node_features(self, rdflib_tp, term_to_id):
+        from src.datastructures.minhash_sketches import pattern_key, variable_features
+        base = super().get_node_features(rdflib_tp, term_to_id)
+        processed, extra = set(), []
+        for tp in rdflib_tp:
+            for term in (tp[0], tp[2]):
+                if term in processed:
+                    continue
+                processed.add(term)
+                if not isinstance(term, rdflib.term.Variable):
+                    extra.append([0.0] * self.N_MINHASH_FEATURES)
+                    continue
+                sketches = []
+                for s, p, o in rdflib_tp:
+                    key = pattern_key(s.n3(), p.n3(), o.n3(), term.n3())
+                    if key is not None:
+                        if key not in self.minhash_store:
+                            raise KeyError(f"MinHash sketch missing: {key}")
+                        sketches.append(self.minhash_store[key])
+                extra.append(variable_features(sketches))
+        return torch.cat([base, torch.tensor(extra, dtype=torch.float)], dim=1)

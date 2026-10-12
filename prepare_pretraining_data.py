@@ -29,12 +29,17 @@ import base64
 import json
 import os
 import pickle
+import queue
 import random
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import rdflib
+import requests
+
+from src.datastructures.minhash_sketches import make_sketch, pattern_key, set_query
 
 from src.datastructures.prepare_feature_data import calculate_hll_sketches, extract_multiplicities, read_queries
 from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_subsets
@@ -213,6 +218,75 @@ def statistics(queries, stats_dir, args, endpoints):
     hll_statistic(predicates, stats_dir, args.reuse_stats, endpoints[0], occurrences, 2)
 
 
+def _fetch_sketches(keys, endpoints, timeout_s):
+    """{key: sketch or None}: each set's members listed by QLever (TSV), one thread per endpoint."""
+    work = queue.Queue()
+    for key in keys:
+        work.put(key)
+    results, lock = {}, threading.Lock()
+
+    def worker(endpoint):
+        session = requests.Session()
+        while True:
+            try:
+                key = work.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                response = session.post(endpoint, params={"timeout": f"{int(timeout_s)}s"}, data=set_query(key),
+                                        headers={"Accept": "text/tab-separated-values",
+                                                 "Content-Type": "application/sparql-query"},
+                                        timeout=timeout_s + 60)
+                value = (make_sketch(line for line in response.text.splitlines()[1:] if line)
+                         if response.status_code == 200 else None)
+            except requests.RequestException:
+                value = None
+            with lock:
+                results[key] = value
+
+    threads = [threading.Thread(target=worker, args=(e,), daemon=True) for e in dict.fromkeys(endpoints)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def minhash_statistic(queries, stats_dir, endpoints, timeout_s):
+    """minhash_sketches.json: a bottom-k sketch of every set a query variable is bound to by one
+    of its patterns (src/datastructures/minhash_sketches.py), from QLever. Strict and
+    checkpointed like the counts."""
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    path = stats_dir / "minhash_sketches.json"
+    keys = set()
+    for q in queries:
+        for s, p, o in q["rdflib_patterns"]:
+            for v in (s, o):
+                if isinstance(v, rdflib.term.Variable):
+                    key = pattern_key(s.n3(), p.n3(), o.n3(), v.n3())
+                    if key is not None:
+                        keys.add(key)
+    values = {k: v for k, v in _load(path).items() if k in keys}
+    todo = sorted(keys - set(values))
+    print(f"[minhash] {len(keys):,} sets, {len(values):,} known, fetching {len(todo):,}", flush=True)
+    for attempt in range(2):
+        failed = []
+        for start in range(0, len(todo), BATCH):
+            batch = todo[start:start + BATCH]
+            fetched = _fetch_sketches(batch, endpoints, timeout_s)
+            for k in batch:
+                if fetched.get(k) is None:
+                    failed.append(k)
+                else:
+                    values[k] = fetched[k]
+            _save(path, values)
+            print(f"[minhash] {min(start + BATCH, len(todo)):,}/{len(todo):,} fetched, {len(failed)} failed", flush=True)
+        todo = failed
+        if not todo:
+            return
+    raise SystemExit(f"[minhash] {len(todo)} sets failed twice (e.g. {todo[:3]}); rerun.")
+
+
 # --- 3. embeddings ----------------------------------------------------------------------------
 
 def embeddings(queries, embedding_dir, args, endpoints):
@@ -253,8 +327,23 @@ class _NoFallback:
         raise RuntimeError(f"featuriser asked the endpoint for {name}: a statistic is missing")
 
 
-def featurise(queries, dataset_dir, stats_dir, embedding_dir):
-    splits = [dataset_dir / "dataset_train", dataset_dir / "dataset_val"]
+def feature_root(dataset_dir, features, root_name=None):
+    """Where a feature version's processed splits live: the dataset itself for the original
+    hll features, else a subdirectory (root_name, default the feature name) whose raw/ links to
+    the dataset's raw/."""
+    if features == "hll" and root_name is None:
+        return dataset_dir
+    root = dataset_dir / (root_name or features)
+    for name in ("dataset_train", "dataset_val"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+        if not (root / name / "raw").exists():
+            os.symlink(dataset_dir / name / "raw", root / name / "raw")
+    return root
+
+
+def featurise(queries, dataset_dir, stats_dir, embedding_dir, features="hll", contextualizer=None, root_name=None):
+    root = feature_root(dataset_dir, features, root_name)
+    splits = [root / "dataset_train", root / "dataset_val"]
     if all((s / "processed" / "processed_queries.pt").exists() for s in splits):
         print(f"[featurise] done: {[str(s / 'processed') for s in splits]}")
         return
@@ -273,10 +362,19 @@ def featurise(queries, dataset_dir, stats_dir, embedding_dir):
                 missing["multiplicities"].add(p.n3())
             if f"<{p}>" not in hll:
                 missing["hll"].add(p.n3())
+    minhash_location = None
+    if features == "hll_minhash":
+        minhash_location = str(stats_dir / "minhash_sketches.json")
+        sketches = _load(minhash_location)
+        missing["minhash"] = {pattern_key(s.n3(), p.n3(), o.n3(), v.n3())
+                              for q in queries for s, p, o in q["rdflib_patterns"] for v in (s, o)
+                              if isinstance(v, rdflib.term.Variable)} - set(sketches) - {None}
     if any(missing.values()):
         raise SystemExit(f"[featurise] statistics missing: { {k: len(v) for k, v in missing.items()} }")
     load_queries_into_dataset(str(splits[0]), str(splits[1]), None, str(embedding_dir / "model.json"),
-                              _NoFallback(), "predicate_edge_hll", load_mappings=False,
+                              _NoFallback(), f"predicate_edge_{features}", load_mappings=False,
+                              minhash_location=minhash_location,
+                              contextualizer_location=contextualizer if features == "hll_contextual" else None,
                               occurrences_location=str(stats_dir / "occurrences.json"),
                               tp_cardinality_location=str(stats_dir / "tp_cardinalities.json"),
                               multiplicity_location=str(stats_dir / "multiplicities.json"),
@@ -291,7 +389,7 @@ def _processed(split_dir):
     return QueryCardinalityDataset(root=str(split_dir), featurizer=None, load_mappings=False)
 
 
-def check(dataset_dir, compare_dir, embedding_flag_index):
+def check(dataset_dir, compare_dir, embedding_flag_index, extra_node_features=0):
     report = {}
     for name, directory in (("new", dataset_dir), ("reference", compare_dir)):
         dataset = _processed(directory / "dataset_train")
@@ -303,9 +401,11 @@ def check(dataset_dir, compare_dir, embedding_flag_index):
                         "zero_y": int((dataset._data.y == 0).sum())}
     print(json.dumps(report, indent=2))
     new, reference = report["new"], report["reference"]
-    if (new["x_dim"], new["edge_dim"], new["keys"]) != (reference["x_dim"], reference["edge_dim"], reference["keys"]):
+    expected = (reference["x_dim"] + extra_node_features, reference["edge_dim"], reference["keys"])
+    if (new["x_dim"], new["edge_dim"], new["keys"]) != expected:
         raise SystemExit("[check] feature layout differs from the reference dataset")
-    print("[check] same feature layout as the reference dataset")
+    print("[check] same feature layout as the reference dataset"
+          + (f" (+{extra_node_features} node features)" if extra_node_features else ""))
 
 
 def write_config(args, dataset_dir, stats_dir, embedding_dir):
@@ -349,7 +449,19 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--w2v-workers", type=int, default=5)
     parser.add_argument("--steps", default="split,stats,embed,featurise,check,config",
-                        help="Comma-separated subset of split,stats,embed,featurise,check,config.")
+                        help="Comma-separated subset of split,stats,minhash,embed,featurise,check,config.")
+    parser.add_argument("--features", choices=["hll", "hll_minhash", "hll_contextual"], default="hll",
+                        help="hll: the mixed_yago_hll features. hll_minhash: + 4 MinHash set-intersection "
+                             "features per variable (needs the minhash step), processed into <dataset>/hll_minhash. "
+                             "hll_contextual: the rdf2vec part replaced by a frozen contextualizer (--contextualizer), "
+                             "processed into <dataset>/hll_contextual.")
+    parser.add_argument("--feature-root", default=None,
+                        help="Directory name under the dataset for the processed splits (default: the feature name); "
+                             "e.g. to keep features of different contextualizers apart.")
+    parser.add_argument("--contextualizer", default=None,
+                        help="contextualizer.pt of src/contextual_embeddings (for --features hll_contextual).")
+    parser.add_argument("--set-timeout", type=float, default=60,
+                        help="Timeout of a minhash set query (QLever allows at most its -s value without a token).")
     args = parser.parse_args()
 
     endpoints = [e.strip().rstrip("/") for e in args.endpoints.split(",") if e.strip()]
@@ -362,17 +474,22 @@ def main():
     if "split" in steps:
         split(dataset_dir, args.val)
     queries = None
-    if steps & {"stats", "embed", "featurise"}:
+    if steps & {"stats", "minhash", "embed", "featurise"}:
         queries = read_queries(str(dataset_dir))         # top-level files: all queries, train and val
     if "stats" in steps:
         statistics(queries, stats_dir, args, endpoints)
+    if "minhash" in steps:
+        minhash_statistic(queries, stats_dir, endpoints, args.set_timeout)
     if "embed" in steps:
         embeddings(queries, embedding_dir, args, endpoints)
     if "featurise" in steps:
-        featurise(queries, dataset_dir, stats_dir, embedding_dir)
+        if args.features == "hll_contextual" and not args.contextualizer:
+            raise SystemExit("--features hll_contextual needs --contextualizer")
+        featurise(queries, dataset_dir, stats_dir, embedding_dir, args.features, args.contextualizer, args.feature_root)
     if "check" in steps:
         n_multiplicities = len(next(iter(_load(stats_dir / "multiplicities.json").values())))
-        check(dataset_dir, ROOT / args.compare, 2 + n_multiplicities + 1 + 2)
+        check(feature_root(dataset_dir, args.features, args.feature_root), ROOT / args.compare, 2 + n_multiplicities + 1 + 2,
+              4 if args.features == "hll_minhash" else 0)
     if "config" in steps:
         write_config(args, dataset_dir, stats_dir, embedding_dir)
 

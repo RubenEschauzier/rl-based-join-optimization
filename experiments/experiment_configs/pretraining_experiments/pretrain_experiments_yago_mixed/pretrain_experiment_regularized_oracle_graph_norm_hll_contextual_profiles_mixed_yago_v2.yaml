@@ -1,0 +1,24 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/mixed_yago_v2/hll_contextual_profiles/dataset_train"
+  dataset_val: "data/generated_queries/mixed_yago_v2/hll_contextual_profiles/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/mixed_yago_v2/model.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_regularized_oracle_graph_norm_hll_contextual.yaml"
+  occurrences_location: "data/term_occurrences/mixed_yago_v2/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago_v2/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago_v2/multiplicities.json"
+  hll_location: "data/term_occurrences/mixed_yago_v2/hll_sketches.json"
+  contextualizer_location: "experiments/experiment_outputs/mixed_yago_v2/contextualizer_profiles/contextualizer.pt"
+  feature_type: "predicate_edge_hll_contextual"
+  n_epoch: 50
+  batch_size: 128
+  seed: 0
+  lr: 0.0001
+  weight_decay: 0.05                # AdamW (decoupled weight decay)
+  experiment_root_directory: "experiments/experiment_outputs/mixed_yago_v2/pretrained_models"
+

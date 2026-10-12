@@ -1,0 +1,15 @@
+# Contextualizer with neighbour profiles: the token input of a constant is [rdf2vec ; profile], the
+# profile being a learned encoding of its index-time neighbour-type histogram
+# (src/contextual_embeddings/profiles.py). Everything else as contextualizer_mixed_yago_v2.yaml
+# (same corpus, vocabulary, frozen token table, selection on constant-made near misses).
+#   python -m src.contextual_embeddings.pretrain --config-name contextualizer_profiles_mixed_yago_v2.yaml
+defaults:
+  - contextualizer_mixed_yago_v2
+  - _self_
+
+model:
+  profiles: true
+  profile_hidden: 64
+
+training:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/contextualizer_profiles

@@ -13,6 +13,58 @@ from src.utils.training_utils.query_loading_utils import load_queries_into_datas
 from src.utils.training_utils.training_tracking import TrainSummary
 from src.utils.training_utils.utils import q_error_fn
 
+# A model with an "emptiness" head is a hurdle model: that head gives the logit of P(result is
+# empty), the cardinality head (log1p rows) is trained on non-empty queries only, and the
+# prediction is 0 rows when P(empty) exceeds this threshold.
+EMPTINESS_THRESHOLD = 0.5
+
+
+def _head(outputs, head_type):
+    return next((h["output"] for h in outputs if h["output_type"] == head_type), None)
+
+
+def cardinality_and_emptiness(outputs):
+    """The cardinality head's log1p prediction and the emptiness logit (None without that head)."""
+    cardinality = _head(outputs, "cardinality")
+    if cardinality is None:                       # single-head models: the first head
+        cardinality = outputs[0]["output"]
+    emptiness = _head(outputs, "emptiness")
+    return cardinality.reshape(-1), None if emptiness is None else emptiness.reshape(-1)
+
+
+def pretraining_loss(loss_fn, cardinality, emptiness, y):
+    target = torch.log1p(y)
+    if emptiness is None:
+        return loss_fn(cardinality, target)
+    empty = y == 0
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(emptiness, empty.float())
+    if (~empty).any():
+        loss = loss + loss_fn(cardinality[~empty], target[~empty])
+    return loss
+
+
+def combined_log_prediction(cardinality, emptiness):
+    """log1p rows predicted by the model: the cardinality head, or 0 where the emptiness head
+    says the result is empty."""
+    if emptiness is None:
+        return cardinality
+    return torch.where(torch.sigmoid(emptiness) > EMPTINESS_THRESHOLD, torch.zeros_like(cardinality), cardinality)
+
+
+def emptiness_statistics(p_empty, actual):
+    from sklearn.metrics import roc_auc_score
+    p_empty, empty = np.asarray(p_empty), np.asarray(actual) == 0
+    said_empty = p_empty > EMPTINESS_THRESHOLD
+    return {
+        "val_empty_accuracy": float(np.mean(said_empty == empty)),
+        "val_empty_precision": float(np.sum(said_empty & empty) / max(np.sum(said_empty), 1)),
+        "val_empty_recall": float(np.sum(said_empty & empty) / max(np.sum(empty), 1)),
+        "val_empty_auroc": float(roc_auc_score(empty, p_empty)) if 0 < empty.sum() < len(empty) else float("nan"),
+    }
+
+EMPTINESS_FIELDS = [("val_empty_accuracy", "max"), ("val_empty_precision", "max"),
+                    ("val_empty_recall", "max"), ("val_empty_auroc", "max")]
+
 
 class DualMetricScheduler:
 
@@ -95,6 +147,7 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
     losses, maes = [], []
     all_q_errors = []
     val_predictions = []
+    all_p_empty, all_actual = [], []
 
     for val_batch in val_dataset_loader:
         x = val_batch.x.to(device)
@@ -105,8 +158,10 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
         y_true = val_batch.y.to(device).view(-1)
 
         with torch.no_grad():
-            pred = model.forward(x=x, edge_index=edge_index, edge_attr=edge_attr, batch=batch)
-            pred = pred[0]['output'].view(-1)
+            outputs = model.forward(x=x, edge_index=edge_index, edge_attr=edge_attr, batch=batch)
+            cardinality, emptiness = cardinality_and_emptiness(outputs)
+            pred = combined_log_prediction(cardinality, emptiness)
+            p_empty = None if emptiness is None else torch.sigmoid(emptiness).cpu().numpy().tolist()
 
         # Use expm1 to correctly invert log1p
         pred_linear = torch.expm1(pred)
@@ -134,6 +189,11 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
                 "q_error": q_errors_list[i],
                 "type": val_batch.type[i] if hasattr(val_batch, 'type') else None
             })
+            if p_empty is not None:
+                val_predictions[-1]["p_empty"] = p_empty[i]
+        if p_empty is not None:
+            all_p_empty.extend(p_empty)
+            all_actual.extend(actuals_list)
 
     mean_loss = np.mean(losses)
     mean_mae = np.mean(maes)
@@ -148,6 +208,8 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
         "val_p95_q_error": percentiles[2],
         "val_p99_q_error": percentiles[3]
     }
+    if all_p_empty:
+        global_q_error_stats.update(emptiness_statistics(all_p_empty, all_actual))
 
     val_predictions.sort(key=lambda x: x["q_error"], reverse=True)
 
@@ -163,7 +225,7 @@ def validate_model_dataset(model, val_dataset_loader, loss_fn, device, print_top
 
 
 def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_config_location,
-                            device, n_epoch, batch_size, lr,):
+                            device, n_epoch, batch_size, lr, weight_decay=0.0):
     writer_tb = SummaryWriter(log_dir='runs/moe_experiment_1')
     lambda_aux = 0.01
     print("Training on {} queries, device: {}".format(len(train_dataset), device))
@@ -185,11 +247,13 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
         ("val_p90_q_error", "min"),
         ("val_p95_q_error", "min"),
         ("val_p99_q_error", "min")
-    ])
+    ] + (EMPTINESS_FIELDS if "emptiness" in gine_conv_model.head_types else []))
     total_params = sum(p.numel() for p in gine_conv_model.parameters())
     print(f"Total number of parameters: {total_params}")
 
-    optimizer = torch.optim.Adam(gine_conv_model.parameters(), lr=lr)
+    # weight_decay > 0: AdamW (decoupled weight decay); otherwise plain Adam as before
+    optimizer = (torch.optim.AdamW(gine_conv_model.parameters(), lr=lr, weight_decay=weight_decay)
+                 if weight_decay else torch.optim.Adam(gine_conv_model.parameters(), lr=lr))
     # scheduler = ReduceLROnPlateau(optimizer, 'min',
     #                               patience=3,
     #                               threshold=1e-2
@@ -218,11 +282,8 @@ def run_pretraining_dataset(train_dataset, validation_dataset, writer, model_con
                                            edge_index=batch.edge_index.to(device),
                                            edge_attr=batch.edge_attr.to(device),
                                            batch = batch.batch.to(device))
-            # Assume only one cardinality estimation head
-            pred = pred[0]['output'].to(device)
-            y = torch.log1p(batch.y.to(device))
-
-            loss = loss_fn(pred.squeeze(), y)
+            cardinality, emptiness = cardinality_and_emptiness(pred)
+            loss = pretraining_loss(loss_fn, cardinality, emptiness, batch.y.to(device).view(-1))
             aux_load_balance_loss = gine_conv_model.get_load_balancing_loss(device=device,
                                                                             writer=writer_tb,
                                                                             epoch=i)
@@ -263,7 +324,8 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                              endpoint_location, rdf2vec_vector_location, writer,
                              feature_type, model_config_location, n_epoch, batch_size, lr, seed,
                              occurrences_location = None, tp_cardinality_location = None, multiplicity_location=None,
-                             hll_location = None,
+                             hll_location = None, minhash_location=None, contextualizer_location=None,
+                             weight_decay=0.0,
                              test_queries=None, test_cardinalities=None,
                              to_load=None, device='cpu'
                              ):
@@ -279,7 +341,10 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                                                            tp_cardinality_location=tp_cardinality_location,
                                                            multiplicity_location=multiplicity_location,
                                                            hll_location=hll_location,
+                                                           minhash_location=minhash_location,
+                                                           contextualizer_location=contextualizer_location,
                                                            )
-    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr)
+    run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
+                            weight_decay=weight_decay)
     return train_dataset, val_dataset
 
