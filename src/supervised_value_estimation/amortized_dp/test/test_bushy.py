@@ -208,3 +208,15 @@ def test_stitched_cost_to_go_is_exact_on_all_subsets_and_an_upper_bound_on_plans
         assert exact - 1e-9 <= stitched <= repair_cost + 1e-9
     assert bushy.stitched_cost_to_go(bushy.initial_forest(7), [labels.full_mask], labels.logcard) == math.inf
     assert bushy.stitched_cost_to_go((labels.full_mask,), [], labels.logcard) == NEG_INF
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_estimator_beam_all_trees_are_distinct_complete_plans_cheapest_first(seed):
+    labels, _ = _synthetic_labels(7, extra_edges=3, seed=seed)
+    est = lambda masks: [labels.logcard[m] for m in masks]
+    best, _ = bushy.estimator_beam_plan(7, labels.neighbour_masks, est, 8)
+    trees, _ = bushy.estimator_beam_plan(7, labels.neighbour_masks, est, 8, all_trees=True)
+    assert len(trees) > 1 and len({bushy.canonical(t) for t in trees}) == len(trees)
+    assert all(bushy.is_valid_tree(t, 7, labels.neighbour_masks) for t in trees)
+    costs = [bushy.tree_log_cost(t, labels.logcard) for t in trees]
+    assert costs == sorted(costs) and bushy.canonical(trees[0]) == bushy.canonical(best)

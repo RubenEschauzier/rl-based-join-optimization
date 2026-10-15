@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from src.supervised_value_estimation.amortized_dp import bushy, soft_dp
-from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import multi_query_batch, plan_cost, query_loss
+from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import failed_bound, multi_query_batch, plan_cost, query_loss
 from src.supervised_value_estimation.amortized_dp.test.test_amortized_dp import _synthetic_labels
 from src.supervised_value_estimation.amortized_dp.test.test_soft_dp import _synthetic_query
 
@@ -40,16 +40,45 @@ def test_plan_loss_is_a_regret_and_its_gradient_prefers_the_cheaper_plans(seed):
     masks = s.masks.tolist()
     est = torch.tensor([math.log1p(counts.get(m, 0)) for m in masks], dtype=torch.float64)
     est = (est + torch.randn(len(masks), dtype=torch.float64)).requires_grad_()
-    l1, n_terms, plan = query_loss(est, None, (s, masks), counts, 0.5, "cpu")
+    l1, n_terms, plan, floor = query_loss(est, None, (s, masks), counts, 0.5, "cpu", None)
     assert n_terms == len(family) and float(plan) >= -1e-9          # E_p[cost] >= the stitched optimum
+    assert 0.0 <= floor <= float(plan) + 1e-9 or floor >= 0.0          # the floor: true counts as estimates
+    assert query_loss(torch.tensor([math.log1p(counts.get(m, 0)) for m in masks], dtype=torch.float64), None,
+                      (s, masks), counts, 0.5, "cpu", None)[2] == pytest.approx(floor)
     before = float(plan)
     plan.backward()
     with torch.no_grad():                                             # a small step along -grad lowers the regret
         stepped = est - 1e-2 * est.grad
-    assert float(query_loss(stepped, None, (s, masks), counts, 0.5, "cpu")[2]) < before
+    assert float(query_loss(stepped, None, (s, masks), counts, 0.5, "cpu", None)[2]) < before
 
 
-def test_plan_cost_needs_every_join_count():
+def test_plan_cost_needs_every_join_count_and_costs_a_failed_one_at_the_bound():
     tree = ((0, 1), 2)
-    assert plan_cost(tree, {0b011: 5, 0b111: 7}) == 12
-    assert plan_cost(tree, {0b111: 7}) is None
+    assert plan_cost(tree, {0b011: 5, 0b111: 7}) == (12, 0)
+    assert plan_cost(tree, {0b111: 7}) == (None, 0)
+    assert plan_cost(tree, {0b011: None, 0b111: 7}) == (None, 0)
+    assert plan_cost(tree, {0b011: None, 0b111: 7}, bound=14) == (21, 1)
+
+
+def test_failed_bound_is_twice_the_querys_largest_count():
+    assert failed_bound({1: 10, 2: None, 3: 400}, fallback=10 ** 9) == 800
+    assert failed_bound({2: None}, fallback=1000) == 2000
+    assert failed_bound({1: 0, 2: None}, fallback=1000) == 2
+
+
+def test_a_failed_count_is_one_sided_and_costs_the_bound():
+    labels, _ = _synthetic_labels(4, extra_edges=1, seed=0)
+    counts = {m: int(math.exp(x)) for m, x in labels.logcard.items() if m & (m - 1)}
+    failed = max(m for m in counts if m != 0b1111 and m & (m - 1))
+    counts[failed] = None
+    s = soft_dp.SubsetStructure(labels.neighbour_masks, "cpu", family=list(counts))
+    masks = s.masks.tolist()
+    k = masks.index(failed)
+    bound = failed_bound(counts, 0)
+    low = torch.zeros(len(masks), dtype=torch.float64)
+    high = low.clone()
+    high[k] = math.log1p(bound) + 5                                   # above the bound: no L1 for it
+    low[k] = math.log1p(bound) - 5                                    # below: penalised by the gap
+    l1_high = query_loss(high, None, (s, masks), counts, 0.5, "cpu", bound)[0]
+    l1_low = query_loss(low, None, (s, masks), counts, 0.5, "cpu", bound)[0]
+    assert float(l1_low - l1_high) == pytest.approx(5.0)

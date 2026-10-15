@@ -1,0 +1,38 @@
+# Epinet on the frozen small (query-conditioned) cardinality model
+# (src/supervised_value_estimation/amortized_dp/cardinality_epinet.py).
+#   python -m src.supervised_value_estimation.amortized_dp.cardinality_epinet [overrides]
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+seed: 0
+output_directory: experiments/experiment_outputs/mixed_yago_v2/cardinality_epinet
+# A run directory with cache_{train,val,plans}.pt to reuse (the frozen model's features); null builds them.
+cache_directory: null
+
+estimator:
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-27-43
+  select: val_sub_loss
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val
+  labels_train: data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_train.json
+  labels_val: data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_val.json
+  # True counts of the online-validation plans' subsets ({query: {mask: count}}), evaluated as "plans".
+  plan_counts: experiments/experiment_outputs/mixed_yago_v2/work_2026-10-15/why_not_better/true_counts.pkl
+
+epinet:          # as sweep trial 85 (MLP prior only), K = 128 (epinet-contrast memory: k ~ 0.80 / sqrt(K) + 0.083)
+  index_dim: 16
+  hidden_dim: 64
+  prior_hidden_dim: 128
+  prior_scale_target: 1.0      # prior spread over z, log units
+  sigma: 0.05                  # target perturbation, log units
+  n_indexes_train: 128
+
+epochs: 20
+batch_size: 2048
+lr: 0.001
+weight_decay: 0.0

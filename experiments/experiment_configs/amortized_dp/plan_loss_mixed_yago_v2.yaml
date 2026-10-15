@@ -30,9 +30,11 @@ online:
   queries_per_round: 256
   # Share of a round's queries drawn from already counted ones and re-planned with the current model.
   revisit_fraction: 0.25
-  # Plans counted per query: the hard DP plan, the beam plan of this width (what is deployed), and
-  # explore_plans DP plans over estimates + N(0, explore_sigma) per subset (log scale).
+  # Plans counted per query: the hard DP plan, the beam plan of this width (what is deployed; with
+  # count_beam_alternatives all its final trees), and explore_plans DP plans over estimates
+  # + N(0, explore_sigma) per subset (log scale).
   deployed_width: 8
+  count_beam_alternatives: true
   explore_plans: 2
   explore_sigma: 1.0
   count_timeout_s: 30
@@ -46,8 +48,10 @@ online:
   l1_weight: 1.0
   # log E_p[true C_out] - log min true C_out over the counted subsets' plans, p at temperature plan_tau:
   # p(split) proportional to cost^(-1 / plan_tau).
-  plan_weight: 1.0
-  plan_tau: 0.5
+  # (plan_loss_floor.py: at tau 0.5 the floor -- the regret with true counts as estimates -- is ~30% of the
+  # validation families' regret, at 0.2 ~10%; L1 is ~10x the plan loss, hence the weight.)
+  plan_weight: 5.0
+  plan_tau: 0.2
 
   validation:
     every_rounds: 5

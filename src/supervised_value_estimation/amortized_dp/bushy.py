@@ -273,7 +273,8 @@ def estimator_beam_plan(n: int, neighbour_masks: Sequence[int], log_cards, width
     unbounded width is the exact bushy DP over the estimates. `log_cards(masks)` estimates a
     list of subsets and is called once per step, for the subsets not estimated before.
     Returns the tree with the smallest estimated C_out (with all_trees: the beam's final trees,
-    cheapest first) and the number of subsets estimated."""
+    cheapest first -- up to `width` distinct complete plans, since the last merge is not deduplicated
+    by its forest, which is the same complete forest for all of them) and the number of subsets estimated."""
     known: dict[int, float] = {}
     beams = [(initial_forest(n), NEG_INF, {1 << i: i for i in range(n)})]     # (forest, log C_out so far, trees)
     while len(beams[0][0]) > 1:
@@ -285,6 +286,8 @@ def estimator_beam_plan(n: int, neighbour_masks: Sequence[int], log_cards, width
         best: dict[tuple[int, ...], tuple[float, int]] = {}                 # child forest -> cheapest candidate
         for k, (index, a, b) in enumerate(candidates):
             child, so_far = merge(beams[index][0], a, b), _logaddexp(beams[index][1], known[a | b])
+            if all_trees and len(child) == 1:
+                child = (k,)              # last merge: every candidate completes the plan; keep the distinct trees
             if child not in best or so_far < best[child][0]:
                 best[child] = (so_far, k)
         next_beams = []
@@ -292,7 +295,7 @@ def estimator_beam_plan(n: int, neighbour_masks: Sequence[int], log_cards, width
             index, a, b = candidates[k]
             trees = dict(beams[index][2])
             trees[a | b] = (trees.pop(a), trees.pop(b))
-            next_beams.append((child, so_far, trees))
+            next_beams.append((merge(beams[index][0], a, b), so_far, trees))
         beams = next_beams
     if all_trees:
         return [next(iter(beam[2].values())) for beam in beams], len(known)
