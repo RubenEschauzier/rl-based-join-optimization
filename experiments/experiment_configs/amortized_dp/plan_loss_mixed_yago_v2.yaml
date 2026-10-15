@@ -1,0 +1,61 @@
+# Online plan-loss fine-tuning of the small (query-conditioned) cardinality model for bushy C_out
+# planning, with true counts from QLever (src/supervised_value_estimation/amortized_dp/online/train_plan_loss.py).
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_plan_loss [overrides]
+# Local setup: the 4 single-core QLever bench containers (ports 7000-7003).
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+estimator:       # the model being fine-tuned (also the "pretrain only" planner at round 0)
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-27-43
+  select: val_sub_loss
+
+gnce:            # fixed baseline: GOO / beam on the GNCE cardinality model
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_gnce.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_gnce_subqueries_mixed_yago_v2.yaml-13-10-2026-18-32-49
+  select: val_sub_loss
+  dataset: data/generated_queries/mixed_yago_v2/gnce/dataset_val
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val
+
+online:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/plan_loss
+  seed: 0
+
+  rounds: 20
+  queries_per_round: 256
+  # Share of a round's queries drawn from already counted ones and re-planned with the current model.
+  revisit_fraction: 0.25
+  # Plans counted per query: the hard DP plan, the beam plan of this width (what is deployed), and
+  # explore_plans DP plans over estimates + N(0, explore_sigma) per subset (log scale).
+  deployed_width: 8
+  explore_plans: 2
+  explore_sigma: 1.0
+  count_timeout_s: 30
+  # Train on the most recently counted queries, this many; steps per round = passes * window / batch.
+  replay_queries: 4096
+  gradient_passes_per_round: 2
+  queries_per_batch: 32
+  lr: 0.00003
+  weight_decay: 0.0
+  grad_clip: 1.0
+  l1_weight: 1.0
+  # log E_p[true C_out] - log min true C_out over the counted subsets' plans, p at temperature plan_tau:
+  # p(split) proportional to cost^(-1 / plan_tau).
+  plan_weight: 1.0
+  plan_tau: 0.5
+
+  validation:
+    every_rounds: 5
+    at_start: true
+    n_queries: 500           # the seeded selection of train_online_bushy / why_not_better.py
+    widths: [1, 4, 8]
+    # Optional count cache to start from ({query: {mask: count}}), e.g. why_not_better.py's.
+    true_counts_cache: experiments/experiment_outputs/mixed_yago_v2/work_2026-10-15/why_not_better/true_counts.pkl
+
+  execution:
+    endpoints: ["http://localhost:7000", "http://localhost:7001", "http://localhost:7002", "http://localhost:7003"]

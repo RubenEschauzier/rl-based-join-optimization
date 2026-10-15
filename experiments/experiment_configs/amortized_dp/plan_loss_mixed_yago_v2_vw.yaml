@@ -1,0 +1,24 @@
+# plan_loss_mixed_yago_v2.yaml on Virtual Wall 2: the QLever nodes of the online runs (15 single-core
+# instances per node, ports 7000-7014; same hosts as bushy_online_mixed_yago_v2_vw.yaml), 90 endpoints.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_plan_loss \
+#     --config-name plan_loss_mixed_yago_v2_vw.yaml
+defaults:
+  - plan_loss_mixed_yago_v2
+  - _self_
+
+online:
+  rounds: 40
+  queries_per_round: 1024
+  replay_queries: 8192
+  execution:
+    endpoints: []              # empty: every host in endpoint_hosts x ports_per_host from base_port
+    endpoint_hosts: [
+      "http://10.2.32.224",
+      "http://10.2.32.214",
+      "http://10.2.32.225",
+      "http://10.2.32.216",
+      "http://10.2.32.226",
+      "http://10.2.32.227",
+    ]
+    ports_per_host: 15
+    base_port: 7000
