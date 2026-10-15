@@ -1,0 +1,29 @@
+# GNCE-style features (rdf2vec + term occurrences, no HLL, no contextualizer) trained with sub-queries and the
+# censored loss, otherwise as pretrain_experiment_triple_conv_gnce_mixed_yago_v2.yaml: separates the effect of
+# sub-query training from that of our features (2026-10-13).
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/mixed_yago_v2/gnce/dataset_train"
+  dataset_val: "data/generated_queries/mixed_yago_v2/gnce/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/mixed_yago_v2/model.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_gnce.yaml"
+  occurrences_location: "data/term_occurrences/mixed_yago_v2/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago_v2/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago_v2/multiplicities.json"
+  feature_type: "predicate_edge"
+  n_epoch: 50
+  # Sub-query training as in pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml.
+  subquery_labels_train: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_train.json"
+  subquery_labels_val: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_val.json"
+  censored_loss: true
+  subquery_fraction: 0.35
+  num_workers: 1
+  batch_size: 64
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/mixed_yago_v2/pretrained_models"

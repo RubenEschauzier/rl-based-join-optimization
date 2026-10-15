@@ -1,0 +1,23 @@
+# bushy_online_mixed_yago_v2.yaml on Virtual Wall 2: the QLever nodes set up with
+# dockerfiles/virtual_wall/setup_node.sh qlever (15 pinned single-core instances per node, ports
+# 7000-7014), and larger rounds for ~90 endpoints. Set the node addresses on the command line:
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_online_bushy \
+#     --config-name bushy_online_mixed_yago_v2_vw.yaml \
+#     'online.execution.endpoint_hosts=[10.2.32.x,10.2.32.y,...]'
+defaults:
+  - bushy_online_mixed_yago_v2
+  - _self_
+
+online:
+  rounds: 40
+  queries_per_round: 1024
+  replay_queries: 8192
+  validation:
+    n_queries: 500
+  execution:
+    endpoints: []              # empty: every host in endpoint_hosts x ports_per_host from base_port
+    endpoint_hosts: []
+    ports_per_host: 15
+    base_port: 7000
+    n_actors: 6
+    in_flight_per_endpoint: 1

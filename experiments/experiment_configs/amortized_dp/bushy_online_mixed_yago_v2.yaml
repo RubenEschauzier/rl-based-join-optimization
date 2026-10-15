@@ -1,0 +1,75 @@
+# Online training of the bushy value net on real QLever executions
+# (src/supervised_value_estimation/amortized_dp/online/train_online_bushy.py), starting from the
+# hybrid-target, fine-tuned offline net (bushy_hybrid_mixed_yago_v2.yaml + 3 epochs at lr 1e-4).
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_online_bushy [overrides]
+# Local setup: the 4 single-core QLever bench containers (ports 7000-7003, no result cache).
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+embedder:        # pattern embeddings, as the offline net was trained with
+  policy_config: experiments/model_configs/policy_networks/t_cv_repr_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-27-43
+  select: val_sub_loss
+
+gnce:            # baseline: bottom-up planning (GOO / beam) on the GNCE cardinality model (sub-query run)
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_gnce.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_gnce_subqueries_mixed_yago_v2.yaml-13-10-2026-18-32-49
+  select: val_sub_loss
+  dataset: data/generated_queries/mixed_yago_v2/gnce/dataset_val
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val
+  # Cached pattern embeddings of the training queries (next to selection.pkl of the hybrid run).
+  train_embeddings: experiments/experiment_outputs/mixed_yago_v2/work_2026-10-14/bushy_hybrid/train_hybrid/embeddings.pt
+
+online:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/bushy_online
+  init_checkpoint: experiments/experiment_outputs/mixed_yago_v2/work_2026-10-14/bushy_hybrid/value_net_ft.pt
+  seed: 0
+
+  rounds: 30
+  queries_per_round: 256
+  # Greedy plan + (K - 1) one-step deviations at its closest calls.
+  plans_per_query: 4
+  # What planning minimises: latency (step latencies + latency-to-go, the online heads) or cout.
+  # The first cout_warmup_rounds rounds plan by C_out (the latency heads start untrained); validation
+  # runs the latency planners from then on.
+  decision_objective: latency
+  cout_warmup_rounds: 5
+  # Train on the most recently executed queries, this many.
+  replay_queries: 4096
+  # Gradient steps per round = passes * window states / states_per_batch.
+  gradient_passes_per_round: 2
+  states_per_batch: 256
+  lr: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  rank_weight: 1.0
+  rank_temperature: 1.0     # as the offline training
+  latency_weight: 1.0
+  step_weight: 1.0
+  # Weight of predicting below a stitched (upper-bound) target; above always weighs 1.
+  upper_bound_under_weight: 0.1
+
+  timeouts:
+    # Per query: min(default_s, max(min_s, multiplier * fastest known latency)), fixed per round.
+    default_s: 10
+    min_s: 1
+    multiplier: 3.0
+
+  validation:
+    every_rounds: 5
+    at_start: true
+    n_queries: 300
+    # Beam widths for our latency planner and the GNCE planner (1 = greedy / GOO).
+    widths: [1, 4, 8]
+    timeout_s: 30
+
+  execution:
+    endpoints: ["http://localhost:7000", "http://localhost:7001", "http://localhost:7002", "http://localhost:7003"]
+    n_actors: 4
+    # Single-core endpoints: one query at a time each, or latencies inflate each other.
+    in_flight_per_endpoint: 1

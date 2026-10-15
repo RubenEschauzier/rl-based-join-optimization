@@ -27,6 +27,11 @@ Optional heads as in model.py, for online training on real executions:
                   and a symmetric encoding of the two merged parts (the left-deep first join of
                   two scans is just a merge of two singletons; no separate stand-in is needed).
 Optional epinet, as in model.py, on the forest context (state heads) and context + merge (step).
+Optional mixture of experts (`moe`): the low-rank residual experts of the backbone's
+TripleGINEConvLowRankMoE (BatchedLowRankAdapters) on the set encoder (next to rho) and on every
+message layer, routed per QUERY (routing_level 'query': the router sees the mean projected pattern
+embedding, the same for every state of a query) to the top_k of num_experts, with the backbone's
+load-balancing loss (load_balancing_loss). The experts start as zero updates (expert_R = 0).
 
 Left-deep planning is the special case in which one component grows by singletons; its forest
 has one super-node plus singleton patterns, like the contracted graph of model.py, but the
@@ -39,8 +44,10 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from src.models.model_layers.triple_gine_conv_low_rank_moe import BatchedLowRankAdapters
 from src.supervised_value_estimation.amortized_dp.model import ContractedJoinGraphValueNet, _mlp
 
 
@@ -49,18 +56,59 @@ class ForestValueNet(ContractedJoinGraphValueNet):
     the forward pass encodes a forest instead of one joined set. The context has the left-deep
     model's width (3H + 1), so the heads and epinets are the same modules."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, moe=None, **kwargs):
         super().__init__(*args, **kwargs)
         if self.has_step_head:
             del self.first_join_node                     # a first join is a merge of two singletons
         # Symmetric encoding of a merge's two parts: [a + b, a * b] -> H.
         self.merge_projection = _mlp(2 * self.hidden_dim, self.hidden_dim, self.hidden_dim)
+        # Optional mixture of experts: {num_experts, top_k, rank, scale, temperature, balance_weight}.
+        self.moe_config = dict(moe) if moe else None
+        if self.moe_config:
+            config, hidden = self.moe_config, self.hidden_dim
+            if not 1 <= config["top_k"] <= config["num_experts"]:
+                raise ValueError("moe top_k must be between 1 and num_experts")
+            experts = lambda: BatchedLowRankAdapters(hidden, hidden, config["num_experts"], config["rank"])
+            self.moe_router = nn.Linear(hidden, config["num_experts"])
+            self.moe_set = experts()
+            self.moe_message = nn.ModuleList([experts() for _ in self.message_layers])
+            self.routing = None
 
-    def _set_encodings(self, nodes, membership):
-        """DeepSets encodings of sets given as (B, K, n) float membership; empty sets -> 0."""
+    def _route(self, nodes, pattern_mask):
+        """Per batch element (B, E) dense expert weights: softmax over the top_k router scores of
+        the query's mean projected pattern embedding, 0 for the other experts. Keeps the routing
+        probabilities and assignments for load_balancing_loss."""
+        config = self.moe_config
+        mask = pattern_mask.unsqueeze(-1).float()
+        context = (nodes * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        scores = self.moe_router(context) / config.get("temperature", 1.0)
+        top_scores, top = torch.topk(scores, config["top_k"], dim=-1)
+        weights = torch.zeros_like(scores).scatter(1, top, F.softmax(top_scores, dim=-1))
+        self.routing = (F.softmax(scores, dim=-1), torch.zeros_like(scores).scatter(1, top, 1.0 / config["top_k"]))
+        return weights
+
+    def load_balancing_loss(self):
+        """As TripleGineConvLowRankMoE.load_balancing_loss, over the last forward's batch."""
+        if self.routing is None:
+            raise RuntimeError("A forward pass is required before computing the routing loss")
+        probabilities, assignments = self.routing
+        return self.moe_config["num_experts"] * torch.sum(probabilities.mean(dim=0) * assignments.mean(dim=0).detach())
+
+    def _experts(self, adapters, x, route):
+        """The routed low-rank expert update of (B, K, H) features: sum_e w_e (x L_e R_e + b_e), with
+        each batch element's query weights (dense over the experts, so no per-node gathers)."""
+        low = torch.einsum("bkh,ehr->bker", x, adapters.expert_L)
+        update = torch.einsum("bker,be,ero->bko", low, route, adapters.expert_R) + (route @ adapters.bias).unsqueeze(1)
+        return self.moe_config.get("scale", 1.0) * update
+
+    def _set_encodings(self, nodes, membership, route=None):
+        """DeepSets encodings of sets given as (B, K, n) float membership; empty sets -> 0. With the
+        mixture of experts, `route` (from _route) adds the routed experts next to rho."""
         sizes = membership.sum(dim=-1)
-        encoding = self.set_rho(torch.bmm(membership, self.set_phi(nodes))) + self.size_embedding(
-            sizes.long().clamp(max=self.max_triple_patterns))
+        summed = torch.bmm(membership, self.set_phi(nodes))
+        encoding = self.set_rho(summed) + self.size_embedding(sizes.long().clamp(max=self.max_triple_patterns))
+        if route is not None:
+            encoding = encoding + self._experts(self.moe_set, summed, route)
         return encoding * (sizes > 0).unsqueeze(-1)
 
     def forward(self, embeddings, pattern_mask, adjacency, component, newest, edge_features=None,
@@ -95,7 +143,8 @@ class ForestValueNet(ContractedJoinGraphValueNet):
         slots = torch.arange(n_patterns, device=device)
         membership = ((component.unsqueeze(1) == slots.view(1, -1, 1)) & pattern_mask.unsqueeze(1)).float()  # (B, K, n)
         active = membership.sum(dim=-1) > 0                                          # (B, K)
-        encodings = self._set_encodings(nodes, membership)                           # (B, K, H)
+        route = self._route(nodes, pattern_mask) if self.moe_config else None
+        encodings = self._set_encodings(nodes, membership, route)                    # (B, K, H)
 
         # Component graph: adjacent when any member patterns share a variable.
         linked = torch.einsum("bkn,bnm,blm->bkl", membership, adjacency.float(), membership)
@@ -104,9 +153,12 @@ class ForestValueNet(ContractedJoinGraphValueNet):
         features = encodings
         if self.message_layer == "mean":
             degree = component_adjacency.sum(dim=2, keepdim=True).clamp(min=1.0)
-            for message_layer, layer_norm in zip(self.message_layers, self.layer_norms):
+            for i, (message_layer, layer_norm) in enumerate(zip(self.message_layers, self.layer_norms)):
                 aggregated = torch.bmm(component_adjacency, features) / degree
-                features = layer_norm(features + message_layer(torch.cat([features, aggregated], dim=-1)))
+                update = message_layer(torch.cat([features, aggregated], dim=-1))
+                if route is not None:
+                    update = update + self._experts(self.moe_message[i], features, route)
+                features = layer_norm(features + update)
                 features = features * active.unsqueeze(-1)
         else:
             component_edges = None
@@ -116,8 +168,11 @@ class ForestValueNet(ContractedJoinGraphValueNet):
                 # Features of every pattern pair across two components, summed; log1p as in model.py.
                 summed = torch.einsum("bkn,bnmf,blm->bklf", membership, edge_features.float(), membership)
                 component_edges = torch.log1p(summed) * component_adjacency.unsqueeze(-1)
-            for message_layer, layer_norm in zip(self.message_layers, self.layer_norms):
-                features = layer_norm(features + message_layer(features, component_adjacency, component_edges))
+            for i, (message_layer, layer_norm) in enumerate(zip(self.message_layers, self.layer_norms)):
+                update = message_layer(features, component_adjacency, component_edges)
+                if route is not None:
+                    update = update + self._experts(self.moe_message[i], features, route)
+                features = layer_norm(features + update)
                 features = features * active.unsqueeze(-1)
 
         # Forest pooling (DeepSets over the components).
@@ -148,7 +203,7 @@ class ForestValueNet(ContractedJoinGraphValueNet):
             if merge_side is None:
                 raise ValueError("The step head needs merge_side.")
             sides = torch.stack([merge_side == 0, merge_side == 1], dim=1).float() * pattern_mask.unsqueeze(1)
-            left, right = self._set_encodings(nodes, sides).unbind(dim=1)
+            left, right = self._set_encodings(nodes, sides, route).unbind(dim=1)
             merge = self.merge_projection(torch.cat([left + right, left * right], dim=-1))
             outputs["features_step"] = torch.cat([context, merge], dim=-1)
             outputs["step"] = self.step_head(
@@ -161,7 +216,8 @@ class ForestValueNet(ContractedJoinGraphValueNet):
         head on their set encodings, e.g. card(Ci u Cj) for every candidate merge of a forest."""
         nodes = self.input_projection(embeddings)
         membership = (sets & pattern_mask.unsqueeze(1)).float()
-        return self.card_head(self._set_encodings(nodes, membership)).squeeze(-1)
+        route = self._route(nodes, pattern_mask) if self.moe_config else None
+        return self.card_head(self._set_encodings(nodes, membership, route)).squeeze(-1)
 
 
 def forest_inputs(forests: Sequence[Sequence[int]], n_patterns: int, newest: Optional[Sequence[int]] = None,

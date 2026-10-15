@@ -1,0 +1,35 @@
+# ORACLE (stage B final, 2026-10-13): 4 TripleGINE layers x 384 (2.2M), on the query-conditioned contextual
+# features, sub-queries + censored loss, 30 epochs; otherwise as
+# pretrain_experiment_triple_conv_hll_contextual_profiles_subqueries_mixed_yago_v2.yaml.
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train"
+  dataset_val: "data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/mixed_yago_v2/model.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_oracle_o4_w384_l4_hll.yaml"
+  occurrences_location: "data/term_occurrences/mixed_yago_v2/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago_v2/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago_v2/multiplicities.json"
+  hll_location: "data/term_occurrences/mixed_yago_v2/hll_sketches.json"
+  contextualizer_location: "experiments/experiment_outputs/mixed_yago_v2/contextualizer_profiles_attention_soft/contextualizer.pt"
+  feature_type: "predicate_edge_hll_contextual"
+  n_epoch: 30
+  resume_from: "experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_oracle_o4_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-29-37"   # disk-full crash after epoch 13
+  # Sub-query training (src/datastructures/subquery_training.py): full queries + their QLever-counted
+  # sub-queries, sliced from the full query as the DP does; censored loss (empty: only predictions
+  # above 0 are wrong; imputed timeout: only predictions below the imputed count are wrong).
+  subquery_labels_train: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_train.json"
+  subquery_labels_val: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_val.json"
+  censored_loss: true
+  subquery_fraction: 0.35
+  num_workers: 1                     # 1 slicing worker: ~9 GB instead of ~13.5 GB, so two trainings fit            # a fresh 35% of the 797k sub-queries per epoch, plus all 134k full queries
+  batch_size: 64
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/mixed_yago_v2/pretrained_models"
+

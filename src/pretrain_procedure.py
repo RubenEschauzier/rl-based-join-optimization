@@ -387,7 +387,7 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
                              occurrences_location = None, tp_cardinality_location = None, multiplicity_location=None,
                              hll_location = None, minhash_location=None, contextualizer_location=None,
                              weight_decay=0.0, subquery_labels_train=None, subquery_labels_val=None,
-                             censored_loss=False, subquery_fraction=1.0, resume_from=None,
+                             censored_loss=False, subquery_fraction=1.0, resume_from=None, num_workers=2,
                              test_queries=None, test_cardinalities=None,
                              to_load=None, device='cpu'
                              ):
@@ -412,6 +412,6 @@ def main_pretraining_dataset(queries_location_train, queries_location_val,
     run_pretraining_dataset(train_dataset, val_dataset, writer, model_config_location, device, n_epoch, batch_size, lr,
                             weight_decay=weight_decay, subquery_labels_train=subquery_labels_train,
                             subquery_labels_val=subquery_labels_val, censored_loss=censored_loss,
-                            subquery_fraction=subquery_fraction, resume=bool(resume_from))
+                            subquery_fraction=subquery_fraction, resume=bool(resume_from), num_workers=num_workers)
     return train_dataset, val_dataset
 

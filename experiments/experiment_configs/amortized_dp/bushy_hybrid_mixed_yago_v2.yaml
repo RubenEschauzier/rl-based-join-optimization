@@ -1,0 +1,64 @@
+# Bushy value net on EVERY training query with hybrid targets
+# (src/supervised_value_estimation/amortized_dp/bushy_train.py, data.hybrid):
+#   <= max_subsets connected subsets: oracle on all of them, exact constrained bushy-DP targets;
+#   larger queries: online-style targets (sparse_rows): the oracle scores at most sparse_budget
+#   subsets along its own beam plan, rollouts and deviations; G = stitched upper bound
+#   (one-sided loss, training.upper_bound_under_weight).
+# Oracle / embedder / datasets as stage C of 2026-10-13 (bushy_greedy, the base value net).
+# Validation unchanged: the same 600 queries (<= 1,024 subsets) with exact targets.
+#   python -m src.supervised_value_estimation.amortized_dp.bushy_train --config-name bushy_hybrid_mixed_yago_v2.yaml [overrides]
+# Mixture-of-experts run: model.moe=... (see bushy_hybrid_moe_mixed_yago_v2.yaml).
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+output_directory: experiments/experiment_outputs/mixed_yago_v2/work_2026-10-14/bushy_hybrid
+
+oracle:
+  config: experiments/model_configs/pretrain_model/t_cv_repr_oracle_o4_w384_l4_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_oracle_o4_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-29-37
+  select: val_sub_loss
+
+embedder:
+  policy_config: experiments/model_configs/policy_networks/t_cv_repr_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-27-43
+  select: val_sub_loss
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val
+  hybrid: true
+  n_train: null            # all training queries
+  n_val: 600
+  max_subsets: 4096        # exact targets up to this many connected subsets
+  val_max_subsets: 1024    # the validation queries of the base run
+  rollouts: 2              # exact queries: as the base run
+  max_states: 14
+  sparse_beam_width: 4     # larger queries: the oracle's beam search width
+  sparse_rollouts: 2
+  sparse_max_states: 24
+  sparse_budget: 4096      # oracle-scored subsets per larger query, at most
+  sparse_greedy_plans: 256 # the rest of the budget: noisy greedy plans under the oracle (more plans to stitch bounds from)
+  sparse_greedy_temperature: 1.0   # merge probability ~ card^(-1/T)
+  shard_size: 10000
+  label_workers: 10        # labelling processes, each with its own oracle on the GPU
+  save_labels: true
+  workers: 12
+
+model:
+  hidden: 128
+  layers: 3
+  message_layer: gine
+
+training:
+  epochs: 15
+  batch_states: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  rank_weight: 1.0
+  temperature: 1.0
+  upper_bound_under_weight: 0.1
+  selection_queries: 300
+  device: cuda
+  seed: 0

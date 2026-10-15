@@ -262,3 +262,135 @@ def optimal_bushy_plan(labels: QueryLabels, logcard: dict[int, float] | None = N
 def forest_cost_to_go(labels: QueryLabels, forest: Sequence[int], logcard: dict[int, float] | None = None) -> float:
     """log G(forest): the cheapest cost of merging the forest's components into one plan."""
     return bushy_dp(labels, logcard, forest)[0]
+
+
+# --- estimator-only planners (no cost-to-go) ----------------------------------------------
+
+def estimator_beam_plan(n: int, neighbour_masks: Sequence[int], log_cards, width: int, all_trees: bool = False):
+    """Bottom-up beam search on a cardinality estimator alone: keep the `width` forests with the
+    smallest estimated C_out so far (the sum of their own merges' cards; there is no cost-to-go).
+    Width 1 is greedy operator ordering (GOO: merge the pair with the smallest result); an
+    unbounded width is the exact bushy DP over the estimates. `log_cards(masks)` estimates a
+    list of subsets and is called once per step, for the subsets not estimated before.
+    Returns the tree with the smallest estimated C_out (with all_trees: the beam's final trees,
+    cheapest first) and the number of subsets estimated."""
+    known: dict[int, float] = {}
+    beams = [(initial_forest(n), NEG_INF, {1 << i: i for i in range(n)})]     # (forest, log C_out so far, trees)
+    while len(beams[0][0]) > 1:
+        candidates = [(index, a, b) for index, (forest, _, _) in enumerate(beams)
+                      for a, b in candidate_merges(forest, neighbour_masks)]
+        missing = list(dict.fromkeys(a | b for _, a, b in candidates if a | b not in known))
+        if missing:
+            known.update(zip(missing, log_cards(missing)))
+        best: dict[tuple[int, ...], tuple[float, int]] = {}                 # child forest -> cheapest candidate
+        for k, (index, a, b) in enumerate(candidates):
+            child, so_far = merge(beams[index][0], a, b), _logaddexp(beams[index][1], known[a | b])
+            if child not in best or so_far < best[child][0]:
+                best[child] = (so_far, k)
+        next_beams = []
+        for child, (so_far, k) in sorted(best.items(), key=lambda item: item[1][0])[:width]:
+            index, a, b = candidates[k]
+            trees = dict(beams[index][2])
+            trees[a | b] = (trees.pop(a), trees.pop(b))
+            next_beams.append((child, so_far, trees))
+        beams = next_beams
+    if all_trees:
+        return [next(iter(beam[2].values())) for beam in beams], len(known)
+    return next(iter(beams[0][2].values())), len(known)
+
+
+# --- partial tables: stitched upper bounds on the cost-to-go ----------------------------------
+
+def repair_completion(tree: Tree, forest: Sequence[int]) -> list[tuple[int, int]]:
+    """A completion of `forest` that follows `tree`: the tree's merges bottom-up, each one joining
+    the current components that hold its two sides (skipped once they are one component). Every
+    tree node processed so far lies inside one component, so two joined components share a
+    variable whenever the tree's two sides do: always a valid plan from the forest, and the
+    tree's own remaining merges when the forest is on the tree's path. Returns the merges."""
+    owner = {}
+    for component in forest:
+        for p in members(component):
+            owner[p] = component
+    merges = []
+    for a, b in tree_to_merges(tree):
+        left, right = owner[(a & -a).bit_length() - 1], owner[(b & -b).bit_length() - 1]
+        if left == right:
+            continue
+        merges.append((left, right))
+        for p in members(left | right):
+            owner[p] = left | right
+    return merges
+
+
+class StitchTable:
+    """Stitched upper bounds on G(forest) from a partial table: the constrained bushy DP restricted
+    to the join results in `sets` (each with a card in logcard), i.e. over the plans from a forest
+    whose every join builds a set in `sets` out of two parts that are forest components or such
+    sets. Any plan stitched together from scored subsets counts; with all connected subsets it is
+    the exact forest_cost_to_go. The splits of a set into two parts from `sets` (or single
+    patterns) do not depend on the forest: computed once, when first needed, and shared by all the
+    forests of a query; the DP itself runs top-down from the full set, so it only visits sets that
+    some stitched plan can use."""
+
+    def __init__(self, sets: Iterable[int], logcard: dict[int, float]):
+        import numpy as np
+        self.np = np
+        self.joins = {u for u in sets if u & (u - 1)}
+        n = max(self.joins, default=1).bit_length()
+        self.parts = np.array(sorted(self.joins | {1 << i for i in range(n)}), dtype=np.int64)
+        self.weight = {}
+        self.peak = max((logcard[u] for u in self.joins), default=0.0)   # linear space, scaled as in bushy_dp
+        self.logcard = logcard
+        self.splits_of: dict[int, list[tuple[int, int]]] = {}
+
+    def splits(self, u: int) -> list[tuple[int, int]]:
+        if u not in self.splits_of:
+            np, parts = self.np, self.parts
+            inside = parts[((parts & ~u) == 0) & (parts < (u ^ parts))]          # v < u ^ v (so v != u)
+            rest = u ^ inside
+            found = parts[np.minimum(np.searchsorted(parts, rest), len(parts) - 1)] == rest
+            self.splits_of[u] = list(zip(inside[found].tolist(), rest[found].tolist()))
+        return self.splits_of[u]
+
+    def cost_to_go(self, forest: Sequence[int]) -> float:
+        """log of the stitched upper bound on G(forest); -inf when complete, inf when no plan
+        stitched from the sets completes the forest."""
+        if len(forest) == 1:
+            return NEG_INF
+        components = set(forest)
+        full = 0
+        for c in forest:
+            full |= c
+        whole: dict[int, bool] = {}
+        build: dict[int, float] = {}
+        unlisted = [c for c in forest if c & (c - 1) and c not in self.joins]   # components not in `sets`
+
+        def is_whole(u):                                 # a union of components (not cutting one)
+            if u not in whole:
+                whole[u] = all(u & c in (0, c) for c in forest)
+            return whole[u]
+
+        def cost(u):
+            if u in components:
+                return 0.0
+            if u not in build:
+                best = math.inf
+                if u in self.joins:
+                    for v, w in self.splits(u):
+                        if is_whole(v) and is_whole(w):
+                            best = min(best, cost(v) + cost(w))
+                    for c in unlisted:
+                        w = u ^ c
+                        if c & ~u == 0 and w and (w in self.joins or w in components) and is_whole(w):
+                            best = min(best, cost(w))
+                if best < math.inf:
+                    best += math.exp(self.logcard[u] - self.peak)
+                build[u] = best
+            return build[u]
+        value = cost(full)
+        return self.peak + math.log(value) if value < math.inf else math.inf
+
+
+def stitched_cost_to_go(forest: Sequence[int], sets: Iterable[int], logcard: dict[int, float]) -> float:
+    """log of the stitched upper bound on G(forest) over the join results in `sets` (StitchTable)."""
+    return StitchTable(sets, logcard).cost_to_go(forest)

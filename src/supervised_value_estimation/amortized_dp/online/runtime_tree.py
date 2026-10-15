@@ -96,3 +96,76 @@ def parse_execution(tree, plan, triple_patterns):
         "scan_rows": scan_rows,              # pattern index -> rows of its scan
         "any_cached": any(cached for _, cached in joins),
     }
+
+
+# --- bushy plans ---------------------------------------------------------------------------
+
+def bushy_sparql(tree, triple_patterns) -> str:
+    """SPARQL forcing a bushy plan tree (bushy.py): every subtree is its own group, so QLever
+    plans each group separately and joins them, e.g. ((0, 1), (2, 3)) ->
+    { { { tp0 } { tp1 } } { { tp2 } { tp3 } } }. A leaf is { tp }."""
+    def group(node, depth):
+        pad = "  " * depth
+        if isinstance(node, int):
+            return f"{pad}{{ {triple_patterns[node]} }}"
+        return f"{pad}{{\n{group(node[0], depth + 1)}\n{group(node[1], depth + 1)}\n{pad}}}"
+    return "SELECT * WHERE {\n" + group(tree, 1) + "\n}"
+
+
+def parse_bushy_execution(tree, plan_masks, triple_patterns):
+    """Observations from one executed bushy plan (forced with bushy_sparql). `plan_masks` are the
+    pattern masks of the plan's join results (bushy.internal_masks).
+
+    Every join node's pattern set is the union of the scans below it (matched to patterns by their
+    terms), so no assumption on child order or on Sort nodes in between is needed. Per join:
+        rows   exact cardinality of its result                           (if the join completed)
+        step   time of the merge: the join's subtree total time minus the totals of the nearest
+               joins below each operand, so it includes the scans of single-pattern operands and
+               any sort in between (as the left-deep step times do); the steps of a plan add up
+               to its total time. Keyed by the two operand masks (smaller first).
+    aligned: the join sets are exactly the plan's. Step times through cached subtrees, or through
+    an operand whose own timing is invalid, are dropped; cardinalities are kept."""
+    pattern_terms = [TERM_PATTERN.findall(pattern)[:3] for pattern in triple_patterns]
+    rows, steps, scan_rows, joins = {}, {}, {}, []
+    state = {"unmatched": False, "cached": False}
+
+    def walk(node):
+        """-> (pattern mask, nearest join node info or None, subtree cached)."""
+        children = [walk(child) for child in (node.get("children", []) or [])]
+        cached = _cached(node) or any(c[2] for c in children)
+        description = str(node.get("description", ""))
+        if description.startswith(SCAN_PREFIXES):
+            index = _match_scan(description, pattern_terms)
+            if index is None:
+                state["unmatched"] = True
+                return 0, None, cached
+            if _finished(node) and node.get("result_rows") is not None:
+                scan_rows[index] = int(node["result_rows"])
+            return 1 << index, None, cached
+        mask = 0
+        for child_mask, _, _ in children:
+            mask |= child_mask
+        if description.startswith(JOIN_PREFIXES):
+            finished = _finished(node)
+            total = node.get("total_time")
+            operands = [c[0] for c in children]
+            below = [c[1] for c in children]
+            timing = (finished and not cached and total is not None and len(operands) == 2
+                      and all(b is None or b["timing"] for b in below))
+            info = {"mask": mask, "timing": timing, "total": float(total) if total is not None else None}
+            if finished and node.get("result_rows") is not None:
+                rows[mask] = int(node["result_rows"])
+            if timing:
+                key = tuple(sorted(operands))
+                steps[key] = max(info["total"] - sum(b["total"] for b in below if b is not None), 0.0)
+            joins.append(mask)
+            state["cached"] |= cached
+            return mask, info, cached
+        nearest = next((c[1] for c in children if c[1] is not None), None) if len(children) == 1 else None
+        return mask, nearest, cached
+
+    if tree:
+        walk(tree)
+    aligned = not state["unmatched"] and sorted(joins) == sorted(plan_masks)
+    return {"aligned": aligned, "n_join_nodes": len(joins), "rows": rows, "steps": steps,
+            "scan_rows": scan_rows, "any_cached": state["cached"]}

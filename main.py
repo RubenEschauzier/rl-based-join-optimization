@@ -84,6 +84,7 @@ def main(cfg: DictConfig):
             censored_loss=c1.get("censored_loss", False),
             subquery_fraction=c1.get("subquery_fraction", 1.0),
             resume_from=c1.get("resume_from", None),
+            num_workers=c1.get("num_workers", 2),
             writer=writer,
             model_config_location=c1.model_config,
             n_epoch=c1.n_epoch,

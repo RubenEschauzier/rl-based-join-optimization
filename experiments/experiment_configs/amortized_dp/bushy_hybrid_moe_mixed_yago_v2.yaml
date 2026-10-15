@@ -1,0 +1,19 @@
+# As bushy_hybrid_mixed_yago_v2.yaml (same data, cached in the same directory), plus extra capacity:
+# the backbone's low-rank mixture of experts (BatchedLowRankAdapters) on the set encoder and every
+# message layer, routed per query (ForestValueNet moe). ~+270k parameters (331k -> ~600k), 2 of 8
+# experts active per query.
+defaults:
+  - bushy_hybrid_mixed_yago_v2
+  - _self_
+
+model:
+  moe:
+    num_experts: 8
+    top_k: 2
+    rank: 32
+    scale: 1.0
+    temperature: 1.0
+    balance_weight: 0.01
+
+training:
+  tag: _moe

@@ -80,3 +80,69 @@ class QueryObservations:
             if parent == 0 and pair in remaining:
                 best = min(best, milliseconds + math.expm1(remaining[pair]))
         return best
+
+
+class ForestObservations:
+    """Per-query store for executed BUSHY plans (online/train_online_bushy.py).
+
+        logcard   log1p(rows) of every scan and join result seen in any executed plan
+        step_ms   (operand mask, operand mask) (smaller first) -> fastest observed time of the
+                  merge of those two operands (runtime_tree.parse_bushy_execution)
+        plans     every executed plan tree with its latency, censoring, timeout and alignment
+
+    Targets for a forest F (bushy.py), both upper bounds stitched across executions:
+        C_out cost-to-go    bushy.StitchTable over the observed join results
+        latency-to-go       the same top-down DP over observed merges, each costing its observed
+                            step time: the fastest remaining time assembled from observed steps.
+    """
+
+    def __init__(self, query: str, family: str, n_tp: int, neighbour_masks: list[int], triple_patterns: list[str]):
+        self.labels = QueryLabels(query=query, family=family, n_tp=n_tp, neighbour_masks=neighbour_masks, logcard={})
+        self.triple_patterns = list(triple_patterns)
+        self.step_ms: dict[tuple[int, int], float] = {}
+        self.executions: list[dict] = []
+        self.version = 0                     # bumped by every add: cached training rows go stale
+
+    @property
+    def logcard(self):
+        return self.labels.logcard
+
+    def add(self, tree, parsed, latency_s, censored, timeout_s):
+        for pattern, rows in parsed["scan_rows"].items():
+            self.logcard[1 << pattern] = math.log1p(rows)
+        for mask, rows in parsed["rows"].items():
+            self.logcard[mask] = math.log1p(rows)
+        for key, milliseconds in parsed["steps"].items():
+            self.step_ms[key] = min(self.step_ms.get(key, math.inf), milliseconds)
+        self.executions.append({"tree": tree, "latency_s": latency_s, "censored": censored, "timeout_s": timeout_s,
+                                "cached": parsed["any_cached"], "aligned": parsed["aligned"]})
+        self.version += 1
+
+    @property
+    def best_latency_s(self):
+        latencies = [e["latency_s"] for e in self.executions if not e["censored"] and not e["cached"]]
+        return min(latencies) if latencies else None
+
+    def latency_to_go(self, forest) -> float:
+        """Fastest known remaining milliseconds from `forest` over observed merges (inf if none
+        completes it, 0 for a complete forest)."""
+        by_union = {}
+        for (a, b), milliseconds in self.step_ms.items():
+            by_union.setdefault(a | b, []).append((a, b, milliseconds))
+        components = set(forest)
+        full = 0
+        for c in forest:
+            full |= c
+        memo = {}
+
+        def whole(u):
+            return all(u & c in (0, c) for c in forest)
+
+        def cost(u):
+            if u in components:
+                return 0.0
+            if u not in memo:
+                memo[u] = min((ms + cost(a) + cost(b) for a, b, ms in by_union.get(u, ()) if whole(a) and whole(b)),
+                              default=math.inf)
+            return memo[u]
+        return cost(full)

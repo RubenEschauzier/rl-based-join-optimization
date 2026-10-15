@@ -96,7 +96,8 @@ def pretrain(cfg):
     profiles = ProfileTable(cfg.profiles.directory) if cfg.model.get("profiles", False) else None
     model = Contextualizer(init, int(cfg.model.hidden), int(cfg.model.layers), float(cfg.model.get("dropout", 0.0)),
                            profile_types=None if profiles is None else profiles.type_features,
-                           profile_hidden=int(cfg.model.get("profile_hidden", 64))).to(device)
+                           profile_hidden=int(cfg.model.get("profile_hidden", 64)),
+                           profile_attention=cfg.model.get("profile_attention", None)).to(device)
     freeze_table = bool(cfg.training.get("freeze_table", False))
     if freeze_table:                 # rdf2vec stays intact; nothing can be memorised per constant
         model.table.weight.requires_grad = False
@@ -145,6 +146,7 @@ def pretrain(cfg):
                         "dropout": float(cfg.model.get("dropout", 0.0)),
                         "profiles_directory": None if profiles is None else str(cfg.profiles.directory),
                         "profile_hidden": int(cfg.model.get("profile_hidden", 64)),
+                        "profile_attention": cfg.model.get("profile_attention", None), "predicate_terms": predicates,
                         "terms": terms, "metrics": metrics}, out_dir / "contextualizer.pt")
         else:
             since_best += 1

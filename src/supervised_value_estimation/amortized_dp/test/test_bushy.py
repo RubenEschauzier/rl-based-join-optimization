@@ -148,3 +148,63 @@ def test_csg_cmp_pairs_are_every_valid_split_once_in_dp_order(seed):
         done[a | b] = index
     for index, (a, b) in enumerate(pairs):       # both halves are complete before they are used
         assert done.get(a, -1) < index and done.get(b, -1) < index
+
+
+def _goo(labels):
+    """Greedy operator ordering, written out directly: merge the pair with the smallest result card."""
+    forest, trees = bushy.initial_forest(labels.n_tp), {1 << i: i for i in range(labels.n_tp)}
+    while len(forest) > 1:
+        a, b = min(bushy.candidate_merges(forest, labels.neighbour_masks), key=lambda m: labels.logcard[m[0] | m[1]])
+        trees[a | b] = (trees.pop(a), trees.pop(b))
+        forest = bushy.merge(forest, a, b)
+    return next(iter(trees.values()))
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_estimator_beam_is_goo_at_width_one_and_the_exact_dp_unbounded(seed):
+    labels, _ = _synthetic_labels(7, extra_edges=seed % 4, seed=seed)
+    calls = []
+    def log_cards(masks):
+        calls.append(masks)
+        return [labels.logcard[m] for m in masks]
+    tree, estimated = bushy.estimator_beam_plan(7, labels.neighbour_masks, log_cards, width=1)
+    assert tree == _goo(labels)
+    assert estimated == sum(len(c) for c in calls) and all(len(set(c)) == len(c) for c in calls)
+    for width in (2, 4):
+        assert bushy.is_valid_tree(bushy.estimator_beam_plan(7, labels.neighbour_masks, log_cards, width)[0], 7, labels.neighbour_masks)
+    tree, _ = bushy.estimator_beam_plan(7, labels.neighbour_masks, log_cards, width=10 ** 6)
+    assert abs(bushy.tree_log_cost(tree, labels.logcard) - bushy.optimal_bushy_plan(labels)[1]) < 1e-9
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_repair_completion_is_a_valid_plan_and_follows_the_tree_on_its_path(seed):
+    labels, _ = _synthetic_labels(7, extra_edges=seed % 4, seed=seed)
+    rng = random.Random(seed)
+    tree, _ = bushy.optimal_bushy_plan(labels)
+    for steps in range(6):
+        forest, trees = _random_forest(labels, steps, rng)
+        merges = bushy.repair_completion(tree, forest)
+        state = forest
+        for a, b in merges:
+            assert (a, b) in bushy.candidate_merges(state, labels.neighbour_masks) or (b, a) in bushy.candidate_merges(state, labels.neighbour_masks)
+            state = bushy.merge(state, a, b)
+        assert len(state) == 1
+        on_path = bushy.forest_after(tree, 7, steps)
+        assert bushy.repair_completion(tree, on_path) == bushy.tree_to_merges(tree)[steps:]
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_stitched_cost_to_go_is_exact_on_all_subsets_and_an_upper_bound_on_plans(seed):
+    labels, _ = _synthetic_labels(7, extra_edges=seed % 4, seed=seed)
+    rng = random.Random(seed)
+    tree, _ = bushy.optimal_bushy_plan(labels)
+    for steps in range(6):
+        forest, _ = _random_forest(labels, steps, rng)
+        exact = bushy.forest_cost_to_go(labels, forest)
+        assert bushy.stitched_cost_to_go(forest, labels.logcard, labels.logcard) == pytest.approx(exact, abs=1e-9)
+        repair = [a | b for a, b in bushy.repair_completion(tree, forest)]
+        repair_cost = logsumexp([labels.logcard[m] for m in repair])
+        stitched = bushy.stitched_cost_to_go(forest, set(bushy.internal_masks(tree)) | set(repair), labels.logcard)
+        assert exact - 1e-9 <= stitched <= repair_cost + 1e-9
+    assert bushy.stitched_cost_to_go(bushy.initial_forest(7), [labels.full_mask], labels.logcard) == math.inf
+    assert bushy.stitched_cost_to_go((labels.full_mask,), [], labels.logcard) == NEG_INF

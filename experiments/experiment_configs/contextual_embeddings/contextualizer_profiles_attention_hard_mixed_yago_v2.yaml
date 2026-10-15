@@ -1,0 +1,13 @@
+# Contextualizer with neighbour profiles AND query-conditioned profiles (profile_attention: hard): every
+# pattern edge from a constant also gets the part of the constant's histogram the pattern asks about
+# (src/contextual_embeddings/model.py). Everything else as contextualizer_profiles_mixed_yago_v2.yaml.
+#   python -m src.contextual_embeddings.pretrain --config-name contextualizer_profiles_attention_hard_mixed_yago_v2.yaml
+defaults:
+  - contextualizer_profiles_mixed_yago_v2
+  - _self_
+
+model:
+  profile_attention: hard
+
+training:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/contextualizer_profiles_attention_hard

@@ -1,0 +1,46 @@
+# Bushy greedy learned optimizer (src/supervised_value_estimation/amortized_dp/bushy_train.py):
+# forest-state value net on the best backbone's pattern embeddings, trained on exact constrained
+# bushy-DP targets from the oracle's cardinalities.
+#   python -m src.supervised_value_estimation.amortized_dp.bushy_train [overrides]
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+output_directory: experiments/experiment_outputs/mixed_yago_v2/bushy_greedy
+
+oracle:          # cardinalities for the targets (the larger backbone of stage B)
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_profiles_subqueries_mixed_yago_v2.yaml-12-10-2026-19-51-19
+  select: val_sub_loss
+
+embedder:        # pattern embeddings: the best small backbone's TripleGINE layers + triple pooling
+  policy_config: experiments/model_configs/policy_networks/t_cv_repr_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_profiles_subqueries_mixed_yago_v2.yaml-12-10-2026-19-51-19
+  select: val_sub_loss
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_profiles/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_profiles/dataset_val
+  n_train: 12000           # training queries (with <= max_subsets connected subsets)
+  n_val: 600
+  max_subsets: 1024
+  rollouts: 2              # random merge rollouts per query
+  max_states: 14           # states per query (the oracle-optimal path is always kept)
+  workers: 12
+
+model:
+  hidden: 128
+  layers: 3
+  message_layer: gine
+
+training:
+  epochs: 30
+  batch_states: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  rank_weight: 1.0
+  temperature: 1.0
+  selection_queries: 300   # validation queries greedily planned for model selection
+  device: cuda
+  seed: 0

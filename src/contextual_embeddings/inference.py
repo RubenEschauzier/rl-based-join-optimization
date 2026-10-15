@@ -25,13 +25,15 @@ class FrozenContextualizer:
         self.model = Contextualizer(torch.zeros_like(state["table.weight"]), checkpoint["hidden"], checkpoint["layers"],
                                     checkpoint.get("dropout", 0.0),
                                     profile_types=None if self.profiles is None else self.profiles.type_features,
-                                    profile_hidden=checkpoint.get("profile_hidden", 64))
+                                    profile_hidden=checkpoint.get("profile_hidden", 64),
+                                    profile_attention=checkpoint.get("profile_attention"))
         self.model.load_state_dict(state, strict=False)
         self.model.to(device).eval()
         for parameter in self.model.parameters():
             parameter.requires_grad = False
         self.device = device
         self.index = {t: i for i, t in enumerate(checkpoint["terms"])}
+        self.predicate_id = {t: i for i, t in enumerate(checkpoint.get("predicate_terms") or [])}
         self.dim = self.model.dim
 
     def token(self, term):
@@ -47,7 +49,8 @@ class FrozenContextualizer:
     @torch.no_grad()
     def embed_query(self, rdflib_patterns):
         node_of, node_token, node_is_variable = {}, [], []
-        src, dst, edge_token, edge_direction = [], [], [], []
+        src, dst, edge_token, edge_direction, edge_feature = [], [], [], [], []
+        n_predicates = len(self.predicate_id)
         for s, p, o in rdflib_patterns:
             for term in (s, o):
                 if term not in node_of:
@@ -60,6 +63,8 @@ class FrozenContextualizer:
             dst += [v, u]
             edge_token += [t, t]
             edge_direction += [1.0, -1.0]
+            p_id = self.predicate_id.get(str(p), -1)
+            edge_feature += [p_id, n_predicates + p_id] if p_id >= 0 else [-1, -1]
         as_long = lambda x: torch.tensor(x, dtype=torch.long, device=self.device)
         profile = None
         if self.profiles is not None:
@@ -67,6 +72,7 @@ class FrozenContextualizer:
             profile = profile_rows(ids, self.profiles, self.device)
         out = self.model.encode(as_long(node_token), torch.tensor(node_is_variable, device=self.device),
                                 as_long([src, dst]), as_long(edge_token),
-                                torch.tensor(edge_direction, device=self.device), profile).cpu().numpy()
+                                torch.tensor(edge_direction, device=self.device), profile,
+                                as_long(edge_feature)).cpu().numpy()
         predicates = {p: self.model.table.weight[self.token(p)].cpu().numpy() for _, p, _ in rdflib_patterns}
         return {term: out[i] for term, i in node_of.items()}, predicates
