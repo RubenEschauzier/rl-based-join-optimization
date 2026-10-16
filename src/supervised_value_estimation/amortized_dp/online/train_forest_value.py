@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 from src.supervised_value_estimation.amortized_dp import bushy, forest_value as fv, history_dp, soft_dp
 from src.supervised_value_estimation.amortized_dp.bushy_train import count_connected_subsets, load_backbone, load_split
@@ -191,7 +193,7 @@ def main(cfg: DictConfig):
         model.eval(), net.eval()
         start = time.perf_counter()
         plans = {}
-        for v in validation:
+        for v in tqdm(validation, desc="Planning (validation)", file=sys.stdout, mininterval=30):
             ours = plan_query(model, net, v, degrees, device, widths, reference=bool(fcfg.reference_planners))
             plans[v.key] = {(k if k.startswith("est") else f"value {k}"): t for k, t in ours.items()} | gnce_plans[v.key]
         planned = time.perf_counter() - start
@@ -280,7 +282,7 @@ def main(cfg: DictConfig):
         model.eval(), net.eval()
         to_count = []
         deployed = f"beam-{int(online.deployed_width)}" if int(online.deployed_width) > 1 else "GOO"
-        for q in batch:
+        for q in tqdm(batch, desc="Planning", file=sys.stdout, mininterval=30):
             plans = plan_query(model, net, q, degrees, device, [int(online.deployed_width)], int(online.explore_plans),
                                float(online.explore_sigma), generator, bool(online.count_beam_alternatives))
             masks = [m for t in plans.values() for m in bushy.internal_masks(t)]
