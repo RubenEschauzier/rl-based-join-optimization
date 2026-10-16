@@ -31,6 +31,12 @@ with TRUE C_out (sum of the plans' join result counts, cached across validations
 costs the bound, and the number of plans with one is reported per planner) as the geomean ratio to
 GNCE GOO and to the same planner at round 0, by query size.
 
+With `history.enabled` (history_dp.py) the estimator is the cardinality model plus a history head inside the DP:
+planning uses one history-DP pass at tau = 0 over all connected subsets, clamped by the degree bound; training
+takes the same L1 and plan loss through the history DP (the plan loss on the counted family, the L1 on the full
+lattice of queries with at most history.full_lattice_cap connected subsets, on the family otherwise), with
+gradients into the backbone (online.lr) and the head (history.lr). history-<round>.pt holds the head.
+
 Outputs in online.output_directory/plan-loss-<time>/: config.yaml, rounds.jsonl, validation.jsonl,
 validation-<round>.json (per query plans and costs), model-<round>.pt (the estimator's state_dict),
 counts.pkl (all counts: training and validation).
@@ -49,8 +55,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from src.supervised_value_estimation.amortized_dp import bushy, soft_dp
-from src.supervised_value_estimation.amortized_dp.bushy_train import load_backbone, load_split
+from src.supervised_value_estimation.amortized_dp import bushy, history_dp, soft_dp
+from src.supervised_value_estimation.amortized_dp.bushy_train import count_connected_subsets, load_backbone, load_split
 from src.supervised_value_estimation.amortized_dp.labels import family_of, model_log_cardinalities
 from src.supervised_value_estimation.amortized_dp.online.train_online import _endpoints
 from src.supervised_value_estimation.amortized_dp.online.train_online_bushy import connected, neighbour_masks_of
@@ -86,6 +92,38 @@ def log_cards(model, x, edge_index, edge_attr, batch):
     return next(h["output"] for h in heads if h["output_type"] == "cardinality").reshape(-1)
 
 
+def phi_and_direct(model, x, edge_index, edge_attr, batch):
+    """(pooled embedding phi, log-card estimate) per graph: the cardinality head's input and output."""
+    phi = model.embedding_model.forward(x, edge_index, edge_attr, batch)
+    return phi, model.heads[model.head_types.index("cardinality")](phi).reshape(-1)
+
+
+def subset_phi(model, data, masks, device, chunk=16384):
+    out = [phi_and_direct(model, *soft_dp.subset_batch(data, masks[i:i + chunk], device)) for i in range(0, len(masks), chunk)]
+    return torch.cat([o[0] for o in out]), torch.cat([o[1] for o in out])
+
+
+@torch.no_grad()
+def history_estimates(model, history, q, structure, device):
+    """The history head's log1p estimates (hard DP histories, tau = 0) of every subset of `structure`, clamped by
+    the degree bound: what the history planners plan with."""
+    head, degrees = history
+    phi, direct = subset_phi(model, q.data, structure.masks, device)
+    b = history_dp.merge([{"structure": structure, "exact": history_dp.single_pattern_logcounts(q.data, structure.masks)}], device)
+    L, _, _ = head(b, phi, direct, 0.0)
+    return history_dp.degree_bound(q.patterns, structure, L.clamp(min=0), degrees)
+
+
+def history_part(q, structure, counts, bound, device, l1=True):
+    """history_dp.merge's part of one query: labels, failed counts and true log1p counts (failed = the bound)."""
+    masks = structure.masks.tolist()
+    label = torch.tensor([math.log1p(counts[m]) if counts.get(m) is not None else math.nan for m in masks], device=device)
+    failed = torch.tensor([m in counts and counts[m] is None for m in masks], device=device)
+    true = torch.tensor([math.log1p(bound if counts.get(m, 0) is None else counts.get(m, 0)) for m in masks], device=device)
+    return {"structure": structure, "exact": history_dp.single_pattern_logcounts(q.data, structure.masks), "label": label,
+            "failed": failed, "true": true, "l1": torch.full((len(masks),), l1, dtype=torch.bool, device=device)}
+
+
 def failed_bound(counts, fallback):
     """The count a failed count of this query stands for: 2 x its largest successful count (2 x
     `fallback`, the run's largest, if it has none); at least 2."""
@@ -108,12 +146,17 @@ def plan_cost(tree, counts, bound=None):
 
 
 @torch.no_grad()
-def estimate_and_plan(model, q, device, widths, explore_plans=0, explore_sigma=0.0, generator=None, alternatives=False):
+def estimate_and_plan(model, q, device, widths, explore_plans=0, explore_sigma=0.0, generator=None, alternatives=False,
+                      history=None):
     """Estimate every connected subset, then plan: {name: tree} for "DP", widths ("GOO" / "beam-w";
     with `alternatives` also the beam's other final trees, "beam-w #i") and the perturbed DP plans
-    "explore-i"; also the number of subsets each beam estimated."""
+    "explore-i"; also the number of subsets each beam estimated. With `history` ((head, degrees)) the
+    estimates are history_estimates'."""
     s = soft_dp.SubsetStructure(q.neighbour_masks, device)
-    est = soft_dp.model_subset_logcards(model, q.data, s.masks, device)
+    if history is not None:
+        est = history_estimates(model, history, q, s, device)
+    else:
+        est = soft_dp.model_subset_logcards(model, q.data, s.masks, device)
     plans = {"DP": soft_dp.hard_plan(s, soft_dp.soft_dp(s, est, 0.0)[1])}
     for i in range(explore_plans):
         noisy = est + explore_sigma * torch.randn(est.shape, device=est.device, generator=generator)
@@ -156,6 +199,48 @@ def query_loss(model_out, q, family, counts, tau, device, bound):
     return l1, int(joins.sum()), expected - best, float(floor)
 
 
+def history_entry(q, structure, counts, bound, tau, full_cap, device):
+    """(family part, whether the query's L1 is taken on its full lattice, log optimum C_out over the family or inf,
+    plan-loss floor) of a counted query: what history_step needs, rebuilt when the query gets new counts."""
+    full = count_connected_subsets(q.neighbour_masks, full_cap) <= full_cap
+    part = history_part(q, structure, counts, bound, device, l1=not full)
+    best, floor = math.inf, 0.0
+    if structure.full >= 0:
+        with torch.no_grad():
+            b0 = float(soft_dp.soft_dp(structure, part["true"], 0.0)[0][structure.full])
+            if b0 < soft_dp.UNBUILT / 2:
+                best = b0
+                mu = soft_dp.plan_marginals(structure, soft_dp.soft_dp(structure, part["true"], tau)[1])
+                floor = float(soft_dp.expected_log_cost(structure, mu, part["true"])) - b0
+    return part, full, best, floor
+
+
+def history_step(model, head, chosen, families, cache, counts, largest, tau, device):
+    """(L1 mean, plan loss mean, floors of the queries with a plan loss) of one batch through the history DP, with
+    gradients into the backbone and the head. The plan loss runs on the counted families; the L1 on the full lattice
+    of the queries that have one in the cache (built here, they are not kept), on the family for the others."""
+    entries = [cache[q.key] for q in chosen]
+    phi, direct = phi_and_direct(model, *multi_query_batch([(q, families[q.key][0].masks) for q in chosen], device))
+    b = history_dp.merge([e[0] for e in entries], device)
+    L, _, log_p = head(b, phi, direct, tau)
+    plan, ok = history_dp.plan_losses(b, log_p, torch.tensor([e[2] for e in entries], device=device))
+    err, use = history_dp.l1_terms(L, b)
+    terms = [err[use]]
+    full = [q for q, e in zip(chosen, entries) if e[1]]
+    if full:
+        structures = [soft_dp.SubsetStructure(q.neighbour_masks, device) for q in full]
+        phi_f, direct_f = phi_and_direct(model, *multi_query_batch([(q, s.masks) for q, s in zip(full, structures)], device))
+        bf = history_dp.merge([history_part(q, s, counts[q.key], failed_bound(counts[q.key], largest), device)
+                               for q, s in zip(full, structures)], device)
+        Lf, _, _ = head(bf, phi_f, direct_f, tau)
+        ef, uf = history_dp.l1_terms(Lf, bf)
+        terms.append(ef[uf])
+    terms = torch.cat(terms)
+    zero = torch.zeros((), device=device)
+    floors = [e[3] for e, o in zip(entries, ok.tolist()) if o]
+    return (terms.mean() if len(terms) else zero), (plan[ok].mean() if bool(ok.any()) else zero), floors
+
+
 @hydra.main(version_base=None, config_path="../../../../experiments/experiment_configs/amortized_dp",
             config_name="plan_loss_mixed_yago_v2.yaml")
 def main(cfg: DictConfig):
@@ -172,11 +257,28 @@ def main(cfg: DictConfig):
 
     model, epoch = load_backbone(cfg.estimator.config, cfg.estimator.run, cfg.estimator.select, device)
     print(f"Estimator: {cfg.estimator.run} (epoch {epoch}), {sum(p.numel() for p in model.parameters()):,} parameters", flush=True)
+    history = None                                       # (history head, predicate degree statistics)
+    if cfg.get("history") and bool(cfg.history.enabled):
+        with open(cfg.history.degrees) as f:
+            degrees = json.load(f)
+        head = history_dp.HistoryDP.load(cfg.history.init, device) if cfg.history.get("init") else history_dp.HistoryDP().to(device)
+        history = (head, degrees)
+        print(f"History head: {cfg.history.get('init') or 'new (delta = 0: starts as the estimator)'}, "
+              f"{sum(p.numel() for p in head.parameters()):,} parameters; degrees of {len(degrees)} predicates", flush=True)
 
     # --- queries: the same seeded selection as train_online_bushy ------------------------------------
     train_dataset = load_split(cfg.data.train_dir)
     train_pool = [i for i in range(len(train_dataset)) if connected(neighbour_masks_of(train_dataset[i].triple_patterns))]
     rng.shuffle(train_pool)
+    if history is not None and not cfg.history.get("init"):
+        with torch.no_grad():                            # the head's phi standardisation, from a sample
+            phis = []
+            for i in train_pool[:64]:
+                q = Query(train_dataset[i])
+                if count_connected_subsets(q.neighbour_masks, 1024) <= 1024:
+                    phis.append(subset_phi(model, q.data, soft_dp.SubsetStructure(q.neighbour_masks, device).masks, device)[0])
+            phi = torch.cat(phis)
+            history[0].mean.copy_(phi.mean(0)), history[0].std.copy_(phi.std(0).clamp(min=1e-3))
     val_dataset = load_split(cfg.data.val_dir)
     gnce_dataset = load_split(cfg.gnce.dataset)
     gnce_index = {" ".join(gnce_dataset[i].query.split()): i for i in range(len(gnce_dataset))}
@@ -236,7 +338,7 @@ def main(cfg: DictConfig):
         start = time.perf_counter()
         plans, evaluations = {}, {}
         for v in validation:
-            ours, evals = estimate_and_plan(model, v, device, widths)
+            ours, evals = estimate_and_plan(model, v, device, widths, history=history)
             plans[v.key] = {f"ours {'bushy DP' if k == 'DP' else k}": t for k, t in ours.items()} | gnce_plans[v.key]
             evaluations[v.key] = {f"ours {'bushy DP' if k == 'DP' else k}": e for k, e in evals.items()}
         planned = time.perf_counter() - start
@@ -283,11 +385,19 @@ def main(cfg: DictConfig):
             print(line, flush=True)
         print("  * plans with a failed count, costed at the query's failed-count bound (2 x its largest count)", flush=True)
         torch.save(model.state_dict(), run_directory / f"model-{round_index}.pt")
+        if history is not None:
+            history[0].save(run_directory / f"history-{round_index}.pt")
         with open(run_directory / "counts.pkl", "wb") as f:
             pickle.dump(counts, f)
 
     # --- training ------------------------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(online.lr), weight_decay=float(online.weight_decay))
+    trainable = list(model.parameters()) + (list(history[0].parameters()) if history is not None else [])
+    groups = [{"params": list(model.parameters()), "lr": float(online.lr)}]
+    if history is not None:
+        groups.append({"params": list(history[0].parameters()), "lr": float(cfg.history.lr)})
+    optimizer = torch.optim.AdamW(groups, weight_decay=float(online.weight_decay))
+    history_cache: dict[str, tuple] = {}                 # query -> (family part, full lattice?, log optimum, floor)
+    full_cap = int(cfg.history.full_lattice_cap) if history is not None else 0
     seen: dict[str, Query] = {}                          # counted training queries, oldest first
     families: dict[str, tuple] = {}                      # query -> (family structure, its masks, counts seen)
     next_index = 0
@@ -304,7 +414,8 @@ def main(cfg: DictConfig):
         to_count = []
         for q in batch:
             plans, _ = estimate_and_plan(model, q, device, [int(online.deployed_width)], int(online.explore_plans),
-                                         float(online.explore_sigma), generator, bool(online.count_beam_alternatives))
+                                         float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
+                                         history=history)
             to_count.append((q, [m for t in plans.values() for m in bushy.internal_masks(t)]))
         t1 = time.perf_counter()
         new, failed, count_s = count_missing(to_count)
@@ -320,31 +431,39 @@ def main(cfg: DictConfig):
         window = list(seen.values())
         for key in [k for k in families if k not in seen]:
             del families[key]
+            history_cache.pop(key, None)
         for q in window:
             if q.key not in families or families[q.key][2] != len(counts[q.key]):
                 s = soft_dp.SubsetStructure(q.neighbour_masks, device, family=list(counts[q.key]))   # failed ones too
                 families[q.key] = (s, s.masks.tolist(), len(counts[q.key]))
+                if history is not None:
+                    history_cache[q.key] = history_entry(q, s, counts[q.key], failed_bound(counts[q.key], largest[0]),
+                                                         float(online.plan_tau), full_cap, device)
         steps = max(1, int(float(online.gradient_passes_per_round) * len(window) / int(online.queries_per_batch)))
         stats = {"l1": [], "plan": [], "floor": [], "loss": []}
         for _ in range(steps):
             chosen = [window[k] for k in rng.choice(len(window), min(int(online.queries_per_batch), len(window)), replace=False)]
-            out = log_cards(model, *multi_query_batch([(q, families[q.key][0].masks) for q in chosen], device))
-            l1_sum, l1_n, plan_terms, floors, offset = 0.0, 0, [], [], 0
-            for q in chosen:
-                s, masks, _ = families[q.key]
-                l1, n_terms, plan, floor = query_loss(out[offset:offset + len(s)], q, (s, masks), counts[q.key], float(online.plan_tau),
-                                               device, failed_bound(counts[q.key], largest[0]))
-                offset += len(s)
-                l1_sum, l1_n = l1_sum + l1, l1_n + n_terms
-                if plan is not None:
-                    plan_terms.append(plan)
-                    floors.append(floor)
-            l1_mean = l1_sum / max(l1_n, 1)
-            plan_mean = torch.stack(plan_terms).mean() if plan_terms else torch.zeros((), device=device)
+            if history is not None:
+                l1_mean, plan_mean, floors = history_step(model, history[0], chosen, families, history_cache, counts,
+                                                          largest[0], float(online.plan_tau), device)
+            else:
+                out = log_cards(model, *multi_query_batch([(q, families[q.key][0].masks) for q in chosen], device))
+                l1_sum, l1_n, plan_terms, floors, offset = 0.0, 0, [], [], 0
+                for q in chosen:
+                    s, masks, _ = families[q.key]
+                    l1, n_terms, plan, floor = query_loss(out[offset:offset + len(s)], q, (s, masks), counts[q.key],
+                                                          float(online.plan_tau), device, failed_bound(counts[q.key], largest[0]))
+                    offset += len(s)
+                    l1_sum, l1_n = l1_sum + l1, l1_n + n_terms
+                    if plan is not None:
+                        plan_terms.append(plan)
+                        floors.append(floor)
+                l1_mean = l1_sum / max(l1_n, 1)
+                plan_mean = torch.stack(plan_terms).mean() if plan_terms else torch.zeros((), device=device)
             loss = float(online.l1_weight) * l1_mean + float(online.plan_weight) * plan_mean
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(online.grad_clip))
+            torch.nn.utils.clip_grad_norm_(trainable, float(online.grad_clip))
             optimizer.step()
             stats["l1"].append(float(l1_mean)), stats["plan"].append(float(plan_mean)), stats["loss"].append(float(loss))
             stats["floor"].append(float(np.mean(floors)) if floors else 0.0)

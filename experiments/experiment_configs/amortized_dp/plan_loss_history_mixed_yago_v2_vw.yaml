@@ -1,0 +1,24 @@
+# plan_loss_history_mixed_yago_v2.yaml on Virtual Wall 2: the 90 QLever endpoints of plan_loss_mixed_yago_v2_vw.yaml
+# (40 rounds x 1,024 queries, replay 8,192, validation on 2,000 queries every 5 rounds).
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_plan_loss \
+#     --config-name plan_loss_history_mixed_yago_v2_vw.yaml
+defaults:
+  - plan_loss_mixed_yago_v2_vw
+  - _self_
+
+online:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/plan_loss_history
+  l1_weight: 0.1
+  validation:
+    n_queries: 2000          # as plan-loss-16-10-2026-00-08-13 (comparable validation selection)
+
+history:
+  enabled: true
+  lr: 0.0003                 # the head's learning rate (the backbone's is online.lr)
+  # Warm start: the head trained offline on the frozen backbone (work_2026-10-16/history_dp.py, run 16-10-2026-15-16-09,
+  # on plan-loss-16-10-2026-00-08-13's training counts); null starts it at delta = 0 (= the cardinality model).
+  init: experiments/experiment_outputs/mixed_yago_v2/history_dp/offline_head_16-10-2026.pt
+  # Largest degree per predicate side (objects per subject "s", subjects per object "o") from the YAGO graph,
+  # for the inference-time degree bound (work_2026-10-16/degree_skew.py).
+  degrees: data/term_occurrences/mixed_yago_v2/predicate_degrees.json
+  full_lattice_cap: 1024     # L1 on the full lattice of queries with at most this many connected subsets
