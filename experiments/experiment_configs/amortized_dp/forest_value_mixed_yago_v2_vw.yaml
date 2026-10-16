@@ -1,0 +1,30 @@
+# forest_value_mixed_yago_v2.yaml on Virtual Wall 2: the 90 QLever endpoints of plan_loss_mixed_yago_v2_vw.yaml,
+# 40 rounds x 1,024 queries, replay 8,192, validation on the 2,000 queries of runs A and B every 5 rounds.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value \
+#     --config-name forest_value_mixed_yago_v2_vw.yaml
+defaults:
+  - forest_value_mixed_yago_v2
+  - _self_
+
+online:
+  rounds: 40
+  queries_per_round: 1024
+  replay_queries: 8192
+  explore_plans: 6           # as run A (plan-loss-16-10-2026-00-08-13)
+  validation:
+    n_queries: 2000
+  execution:
+    endpoints: []
+    endpoint_hosts: [
+      "http://10.2.32.224",
+      "http://10.2.32.214",
+      "http://10.2.32.225",
+      "http://10.2.32.216",
+      "http://10.2.32.226",
+      "http://10.2.32.227",
+    ]
+    ports_per_host: 15
+    base_port: 7000
+
+forest:
+  count_candidates: true     # 90 endpoints: also count every candidate merge along the deployed plan

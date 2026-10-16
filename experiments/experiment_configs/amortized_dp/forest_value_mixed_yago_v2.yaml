@@ -1,0 +1,29 @@
+# Online training of the forest value planner (forest_value.py) and the cardinality model together, with true counts
+# from QLever (src/supervised_value_estimation/amortized_dp/online/train_forest_value.py). Starts from the pretrained
+# cardinality model and an UNTRAINED planner (no offline warm start): round 0 = the estimator beam with the hard
+# degree bound. Local setup: the 4 QLever bench containers of plan_loss_mixed_yago_v2.yaml.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value [--config-name ...] [overrides]
+defaults:
+  - plan_loss_mixed_yago_v2
+  - _self_
+
+online:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/forest_value
+  l1_weight: 1.0             # the L1 anchor at full weight (run B's 0.1 let the estimates drift)
+  plan_weight: 5.0
+  plan_tau: 0.2              # per-step policy temperature over the candidates' log cost-to-go
+
+forest:
+  degrees: data/term_occurrences/mixed_yago_v2/predicate_degrees.json
+  lr: 0.0003                 # the planner's learning rate (the backbone's is online.lr)
+  d: 64
+  heads: 4
+  layers: 2
+  bound_hidden: 32
+  bound_l1_weight: 1.0       # L1 on the bounded estimates l'' of counted nodes (trains the soft bound)
+  value_weight: 1.0          # |V - log G| on forests with a stitched true cost-to-go
+  consistency_weight: 0.1    # |V(F) - min over candidates of Q^| (no counts needed)
+  plan_warmup_rounds: 2      # no plan regret in the first rounds: V first learns from its own targets
+  count_candidates: false    # also count every candidate merge along the deployed plan (more counts per query)
+  max_plans_per_query: 16    # counted plans kept per query for training (most recent)
+  reference_planners: true   # validation: the plain estimator beam-8 and the lattice DP + hard bound
