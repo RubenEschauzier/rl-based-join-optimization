@@ -74,6 +74,44 @@ def count_subsets(tasks, endpoints, timeout_s):
     return results
 
 
+class CountStream:
+    """count_subsets with tasks added while the counting runs (one thread per endpoint, as count_subsets): add(tasks)
+    any number of times, then finish() -> {key: rows or None} once every task is counted. seconds: from the start to
+    the last result."""
+
+    def __init__(self, endpoints, timeout_s):
+        self.work, self.results, self.lock = queue.Queue(), {}, threading.Lock()
+        self.timeout_s, self.start = timeout_s, time.perf_counter()
+        self.seconds = 0.0
+        self.threads = [threading.Thread(target=self._worker, args=(endpoint,), daemon=True)
+                        for endpoint in dict.fromkeys(endpoints)]
+        for thread in self.threads:
+            thread.start()
+
+    def _worker(self, endpoint):
+        session = requests.Session()
+        while (task := self.work.get()) is not None:
+            key, query = task
+            try:
+                value = count_on_endpoint(session, endpoint, query, self.timeout_s)
+            except (requests.RequestException, ValueError, KeyError):
+                value = None
+            with self.lock:
+                self.results[key] = value
+                self.seconds = time.perf_counter() - self.start
+
+    def add(self, tasks):
+        for task in tasks:
+            self.work.put(task)
+
+    def finish(self):
+        for _ in self.threads:                           # after every task: a worker stops once the queue is drained
+            self.work.put(None)
+        for thread in self.threads:
+            thread.join()
+        return self.results
+
+
 def load_or_count(path, queries, endpoints, timeout_s):
     """queries: {query string: (triple patterns, connected subset masks)} ->
     {query string: {mask: rows or None}}, counting only what the cache at `path` lacks."""

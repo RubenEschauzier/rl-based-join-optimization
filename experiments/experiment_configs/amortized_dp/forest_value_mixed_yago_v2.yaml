@@ -24,6 +24,24 @@ forest:
   value_weight: 1.0          # |V - log G| on forests with a stitched true cost-to-go
   consistency_weight: 0.1    # |V(F) - min over candidates of Q^| (no counts needed)
   plan_warmup_rounds: 2      # no plan regret in the first rounds: V first learns from its own targets
+  stop_gradient: true        # the planner reads the backbone's phi and l detached: only L1 trains the backbone
   count_candidates: false    # also count every candidate merge along the deployed plan (more counts per query)
   max_plans_per_query: 16    # counted plans kept per query for training (most recent)
   reference_planners: true   # validation: the plain estimator beam-8 and the lattice DP + hard bound
+
+epinet:          # forest_epinet.py; off here (forest_value_epinet_mixed_yago_v2_vw.yaml turns it on)
+  enabled: false
+  index_dim: 16              # as the cardinality epinet (sweep trial 85)
+  hidden_dim: 64
+  prior_hidden_dim: 128
+  prior_scale_target: 1.0    # prior spread over z, log units
+  sigma: 0.05                # Gaussian-bootstrap target perturbation, log units
+  n_indexes_train: 128       # K (epinet-contrast memory: k ~ 0.80 / sqrt(K) + 0.083)
+  max_rows: 2048             # subsets / forests per head per step (a random subset)
+  lr: 0.001
+  weight: 1.0
+  thompson: true             # exploration beams: one epistemic index each instead of N(0, explore_sigma) score noise
+  sample_scale: auto         # refit each round on fresh counts towards 90% coverage of 90% intervals (half steps); or a number
+  select_pool_factor: 4      # count the top 1/4 of 4x as many new candidate queries by priority (1: no selection)
+  train_select_factor: 2     # train on the top 1/2 of 2x as many window queries per batch (1: uniform)
+  n_indexes_priority: 32

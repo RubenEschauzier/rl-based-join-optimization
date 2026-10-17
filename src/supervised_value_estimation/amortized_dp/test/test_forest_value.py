@@ -180,3 +180,149 @@ def test_plan_loss_by_hand():
     assert res["states_with_choice"] == len(regrets)
     res["plan"].backward()                                                 # reaches the bound and the value net
     assert net.value.out[-1].weight.grad is not None and float(net.value.out[-1].weight.grad.abs().sum()) > 0
+
+
+@torch.no_grad()
+def _reference_beam_plan(net, ctx, width, all_trees=False):
+    """The per-candidate Python beam that beam_plans replaced (d29b0cb), kept as the reference."""
+    n, nb = ctx.n, ctx.neighbour_masks
+    full = (1 << n) - 1
+    phi_q, lq = ctx.encoded([full])
+    singles = [1 << i for i in range(n)]
+    _, ls = ctx.encoded(singles)
+    q_std = net.standardise(phi_q)
+    t = lambda x, **kw: torch.tensor(x, device=lq.device, **kw)
+    beams = [(bushy.initial_forest(n), fv.NEG, {m: (float(ls[i]), fv.NEG, i) for i, m in enumerate(singles)})]
+    while len(beams[0][0]) > 1:
+        cands = [(bi, a, b) for bi, (forest, _, _) in enumerate(beams) for a, b in bushy.candidate_merges(forest, nb)]
+        U = [a | b for _, a, b in cands]
+        phi_u, l_u = ctx.encoded(U)
+        comps = [beams[bi][2] for bi, _, _ in cands]
+        la = t([c[a][0] for c, (_, a, _) in zip(comps, cands)])
+        lb = t([c[b][0] for c, (_, _, b) in zip(comps, cands)])
+        fa = torch.stack([fv.merge_fan(a, b, ctx.touch_s, ctx.touch_o, ctx.fan) for _, a, b in cands]).to(lq.device)
+        fb = torch.stack([fv.merge_fan(b, a, ctx.touch_s, ctx.touch_o, ctx.fan) for _, a, b in cands]).to(lq.device)
+        size = t([bin(u).count("1") / n for u in U])
+        l2, _ = net.bound(l_u, la, lb, fa, fb, net.standardise(phi_u), size)
+        ca = t([c[a][1] for c, (_, a, _) in zip(comps, cands)])
+        cb = t([c[b][1] for c, (_, _, b) in zip(comps, cands)])
+        cost_u = torch.logaddexp(l2, torch.logaddexp(ca, cb))
+        so_far = torch.logaddexp(t([beams[bi][1] for bi, _, _ in cands]), l2)
+        children = [bushy.merge(beams[bi][0], a, b) for bi, a, b in cands]
+        k = len(children[0])
+        if k == 1:
+            total = so_far.double()
+        else:
+            masks = [[c for c in child if c != u] + [u] for child, u in zip(children, U)]
+            old = [m for ms in masks for m in ms[:-1]]
+            phi_old, _ = ctx.encoded(old)
+            l_old = t([comps[j][m][0] for j, ms in enumerate(masks) for m in ms[:-1]])
+            c_old = t([comps[j][m][1] for j, ms in enumerate(masks) for m in ms[:-1]])
+            sz_old = t([bin(m).count("1") / n for m in old])
+            tok_old = fv.token_features(net.standardise(phi_old), l_old, c_old, sz_old * n < 1.5, sz_old).view(len(cands), k - 1, -1)
+            tok_new = fv.token_features(net.standardise(phi_u), l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
+            tokens = torch.cat([tok_old, tok_new[:, None]], 1)
+            adj = torch.stack([fv.forest_adjacency(ms, nb, k, ctx.reach) for ms in masks]).to(lq.device)
+            query = torch.cat([q_std.expand(len(cands), -1), (lq / 10).expand(len(cands))[:, None],
+                               torch.full((len(cands), 1), k / n, device=lq.device)], 1)
+            V = net.values(tokens, torch.zeros(len(cands), k, dtype=torch.bool, device=lq.device), adj, query,
+                           lq.expand(len(cands)), torch.full((len(cands),), k, device=lq.device))
+            total = torch.logaddexp(so_far.double(), V.double())
+        best: dict = {}
+        for j, child in enumerate(children):
+            key = (j,) if all_trees and k == 1 else child
+            score = (float(total[j]), float(so_far[j]))
+            if key not in best or score < best[key][0]:
+                best[key] = (score, j)
+        next_beams = []
+        for _, (_, j) in sorted(best.items(), key=lambda item: item[1][0])[:width]:
+            bi, a, b = cands[j]
+            info = dict(beams[bi][2])
+            ta, tb = info.pop(a)[2], info.pop(b)[2]
+            info[a | b] = (float(l2[j]), float(cost_u[j]), (ta, tb))
+            next_beams.append((children[j], float(so_far[j]), info))
+        beams = next_beams
+    trees = [next(iter(beam[2].values()))[2] for beam in beams]
+    return trees if all_trees else trees[0]
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_batched_beam_matches_the_reference(seed):
+    """beam_plans equals the per-candidate Python beam it replaced (trained value net and gate, constants, cycles)."""
+    n = 6 + seed % 4
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    net = _net(seed, trained=True)
+    for w in (1, 3, 8):
+        for all_trees in (False, True):
+            ref = _reference_beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), w, all_trees)
+            got, _ = fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), w, all_trees)
+            assert got == ref
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_groups_are_independent_beams(seed):
+    """Several groups in one batch give each group's own beam; noisy groups give valid trees."""
+    n = 8
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    net = _net(seed, trained=True)
+    widths, alls = [1, 4, 8, 8], [False, True, True, False]
+    groups, _ = fv.beam_plans(net, fv.QueryContext(n, nb, patterns, degrees, encode), widths, all_trees=alls)
+    for w, a, trees in zip(widths, alls, groups):
+        alone, _ = fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), w, a)
+        assert trees == (alone if a else [alone])
+    g = torch.Generator().manual_seed(seed)
+    groups, _ = fv.beam_plans(net, fv.QueryContext(n, nb, patterns, degrees, encode), [8, 8, 8], [0.0, 1.0, 1.0],
+                              [True, False, False], g)
+    assert groups[0] == fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), 8, True)[0]
+    assert all(bushy.is_valid_tree(t, n, nb) for ts in groups for t in ts)
+
+
+def test_stop_gradient_leaves_only_the_raw_l1_on_the_encoder():
+    n = 6
+    patterns, nb, degrees = _query(n, 2)
+    encode, table = _encoder(n, 2)
+    net = _net(2, trained=True)
+    tree, _ = fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), 2)
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks
+    conn = torch.nonzero(connected_masks(nb, "cpu")).squeeze(1).tolist()
+    counts = {m: random.Random(m).randint(0, 1000) for m in conn if m & (m - 1)}
+    part = fv.build_query_data(n, nb, patterns, degrees, [tree], counts, 10 ** 9)
+    for stop in (False, True):
+        phi, l = encode(part["masks"].tolist())
+        phi, l = phi.clone().requires_grad_(), l.clone().requires_grad_()
+        res = fv.losses(fv.forward_batch(net, [part], phi, l, "cpu", 0.5, stop_gradient=stop), 0.5)
+        (res["plan"] + res["value"] + res["consistency"] + res["l1_bound"]).backward(retain_graph=True)
+        planner_reaches_encoder = phi.grad is not None and float(phi.grad.abs().sum()) > 0
+        assert planner_reaches_encoder != stop
+        phi.grad = l.grad = None
+        res["l1_raw"].backward()
+        assert float(l.grad.abs().sum()) > 0
+
+
+def _counted_part(n, seed):
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    tree, _ = fv.beam_plan(_net(seed), fv.QueryContext(n, nb, patterns, degrees, encode), 2)
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks
+    conn = torch.nonzero(connected_masks(nb, "cpu")).squeeze(1).tolist()
+    counts = {m: random.Random(m).randint(0, 1000) for m in conn if m & (m - 1)}
+    part = fv.build_query_data(n, nb, patterns, degrees, [tree], counts, 10 ** 9)
+    return part, nb, encode
+
+
+def test_chunked_value_pass_is_the_same():
+    part, nb, encode = _counted_part(7, 4)
+    phi, l = encode(part["masks"].tolist())
+    torch.manual_seed(0)
+    net = fv.ForestPlanner(phi_dim=D, d=16, heads=2, layers=2, bound_hidden=8)
+    torch.nn.init.normal_(net.value.out[-1].weight, std=0.5)
+    grads = []
+    for chunk in (None, 5):
+        net.zero_grad()
+        res = fv.losses(fv.forward_batch(net, [part], phi, l, "cpu", 0.5, value_chunk=chunk), 0.5)
+        (res["value"] + res["plan"]).backward()
+        grads.append(torch.cat([p.grad.flatten() for p in net.parameters() if p.grad is not None]))
+        grads.append(res["value"].detach())
+    assert torch.allclose(grads[0], grads[2], atol=1e-6) and torch.allclose(grads[1], grads[3])

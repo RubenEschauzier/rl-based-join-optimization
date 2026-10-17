@@ -23,7 +23,8 @@ with G predicted by the value network instead of being left out. Three parts:
    single-pattern flag and size; plus a query token (phi(Q), l(Q), components left). Attention has a learned bias
    per head between components that share a variable. W starts at 0 (last layer zero): V is then constant within
    a query and the planner is the estimator beam with the bound.
-3. Planner: beam over forests by total(F) (beam_plan); width 1 is greedy.
+3. Planner: beam over forests by total(F) (beam_plan); width 1 is greedy. beam_plans runs several beams of one query
+   (the deployed beam and the exploration beams, or the validation widths) as one batch.
 
 Training (losses, on counted plans): per state F on a counted plan, its candidate merges m with child forests F_m
        Q^(m) = logaddexp( l''(U_m), V(F_m) )          estimated cost-to-go of F through m
@@ -33,7 +34,8 @@ Training (losses, on counted plans): per state F on a counted plan, its candidat
    value    |V(F) - log G(F)| on forests with a known G (3+ components)
    l1       |l - log1p count| on counted subsets, and the same on l'' of counted nodes (one-sided for failed counts)
    consistency  |V(F) - min_m Q^(m)| (target detached) on states with 3+ components (no counts needed)
-(build_query_data, forward_batch, losses). Everything is in log1p space, as the cardinality model.
+(build_query_data, forward_batch, losses). Everything is in log1p space, as the cardinality model. With stop_gradient
+the planner reads the encoder's phi and l detached: only the L1 on l trains the encoder.
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ from typing import Callable, Sequence
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from src.supervised_value_estimation.amortized_dp import bushy
 from src.supervised_value_estimation.amortized_dp.labels import members
@@ -186,14 +189,18 @@ class ForestValue(nn.Module):
         nn.init.zeros_(self.out[-1].weight)
         nn.init.zeros_(self.out[-1].bias)
 
-    def forward(self, tokens, pad, adj, query):
-        """tokens [B, K, D+4], pad [B, K] (True = no component), adj [B, K, K], query [B, D+2] -> W [B]."""
+    def forward(self, tokens, pad, adj, query, return_hidden=False):
+        """tokens [B, K, D+4], pad [B, K] (True = no component), adj [B, K, K], query [B, D+2] -> W [B]; with
+        return_hidden (W, h), h [B, d] the normalised query-token state the output layers read (the epinet's value
+        features)."""
         x = torch.cat([self.query(query)[:, None], self.token(tokens)], 1)
         pad = torch.cat([torch.zeros_like(pad[:, :1]), pad], 1)
         adj = F.pad(adj, (1, 0, 1, 0))
         for layer in self.layers:
             x = layer(x, pad, adj)
-        return self.out(x[:, 0]).squeeze(1)
+        h = self.out[0](x[:, 0])
+        W = self.out[1:](h).squeeze(1)
+        return (W, h) if return_hidden else W
 
 
 class ForestPlanner(nn.Module):
@@ -210,12 +217,16 @@ class ForestPlanner(nn.Module):
     def standardise(self, phi):
         return (phi - self.mean) / self.std
 
-    def values(self, tokens, pad, adj, query, lq, k):
-        """V(F) [B] from the value network's inputs, l(Q) [B] and the number of components k [B]."""
-        W = self.value(tokens, pad, adj, query)
+    def values(self, tokens, pad, adj, query, lq, k, w_shift=None, return_hidden=False):
+        """V(F) [B] from the value network's inputs, l(Q) [B] and the number of components k [B]. w_shift: h -> [B]
+        added to W (an epinet sample, forest_epinet.py); return_hidden: (V, W, h)."""
+        W, h = self.value(tokens, pad, adj, query, return_hidden=True)
+        if w_shift is not None:
+            W = W + w_shift(h)
         v = torch.logaddexp(lq, W)
         v = torch.where(k == 2, lq, v)
-        return torch.where(k <= 1, torch.full_like(v, NEG), v)
+        v = torch.where(k <= 1, torch.full_like(v, NEG), v)
+        return (v, W, h) if return_hidden else v
 
     def save(self, path, extra=None):
         torch.save({"config": self.config, "state": self.state_dict(), **(extra or {})}, path)
@@ -238,97 +249,170 @@ def token_features(phi_std, l2, cost, single, size):
 # --- planning ------------------------------------------------------------------------------------------------
 
 class QueryContext:
-    """One query for planning: the encoder's (phi, l) per subset mask, cached (encode(masks) -> (phi [M, D], l [M]),
-    exact counts for single patterns), and the per-query constants."""
+    """One query for planning: the encoder's (phi, l) per subset mask, cached in one table (encode(masks) -> (phi [M, D],
+    l [M]), exact counts for single patterns), and the per-query constants."""
 
     def __init__(self, n, neighbour_masks, patterns, degrees, encode: Callable):
         self.n, self.neighbour_masks, self.encode = n, list(neighbour_masks), encode
         self.touch_s, self.touch_o, self.fan = pattern_fanouts(patterns, degrees)
-        self.cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.cache: dict[int, int] = {}                  # mask -> row of phi / l
+        self.phi = self.l = None
         self.reach: dict[int, int] = {}
 
-    def encoded(self, masks):
-        missing = [m for m in dict.fromkeys(masks) if m not in self.cache]
+    def rows(self, masks):
+        """[M] rows of phi / l for the masks (list or tensor), encoding the ones not seen yet."""
+        keys = masks.tolist() if torch.is_tensor(masks) else list(masks)
+        missing = [m for m in dict.fromkeys(keys) if m not in self.cache]
         if missing:
             phi, l = self.encode(missing)
-            for i, m in enumerate(missing):
-                self.cache[m] = (phi[i], l[i])
-        return torch.stack([self.cache[m][0] for m in masks]), torch.stack([self.cache[m][1] for m in masks])
+            base = len(self.cache)
+            self.cache.update((m, base + i) for i, m in enumerate(missing))
+            self.phi = phi if self.phi is None else torch.cat([self.phi, phi])
+            self.l = l if self.l is None else torch.cat([self.l, l])
+        return torch.tensor([self.cache[m] for m in keys], dtype=torch.long, device=self.l.device)
+
+    def encoded(self, masks):
+        r = self.rows(masks)
+        return self.phi[r], self.l[r]
+
+
+def _popcount(m, n):
+    return ((m[..., None] >> torch.arange(n, device=m.device)) & 1).sum(-1)
+
+
+def _merge_fans(a, b, n, touch_s, touch_o, fan):
+    """merge_fan over tensors of masks: [M, 3]."""
+    i = _popcount(a - 1, n).clamp(max=n - 1)            # the pattern of a single-pattern a
+    on_s, on_o = (b & touch_s[i]) != 0, (b & touch_o[i]) != 0
+    big = torch.full_like(fan[i, 0], BIG)
+    out = torch.where((on_s & on_o)[:, None], torch.zeros_like(big),
+                      torch.where(on_s[:, None], fan[i, 0], torch.where(on_o[:, None], fan[i, 1], big)))
+    return torch.where(((a & (a - 1)) == 0)[:, None], out, big)
 
 
 @torch.no_grad()
-def beam_plan(net: ForestPlanner, ctx: QueryContext, width: int, all_trees=False, noise=0.0, generator=None, trace=None):
-    """Bottom-up beam by total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far). Returns
-    (tree(s), number of subsets encoded): the best tree, or with all_trees the beam's final trees, cheapest first (as
-    bushy.estimator_beam_plan). noise: sigma of Gaussian noise on each candidate's score (exploration). trace: a list
-    that receives (child forest masks, l''(U), V(child)) of every candidate (tests)."""
-    n, nb = ctx.n, ctx.neighbour_masks
-    full = (1 << n) - 1
-    phi_q, lq = ctx.encoded([full])
-    singles = [1 << i for i in range(n)]
-    _, ls = ctx.encoded(singles)
+def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
+               epinet=None, indexes=None):
+    """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by
+    total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far, then by first appearance), with
+    N(0, noises[g]) on each candidate's score (exploration). Returns ([trees of group g, cheapest first: all the
+    beam's final trees with all_trees[g], else the best one], number of subsets encoded). All forests of a step have
+    the same number of components, so a step is a few tensor operations over every candidate of every group. trace:
+    a list that receives (child forest masks, l''(U), V(child)) of every candidate (tests). epinet, indexes [G, D]:
+    Thompson sampling (forest_epinet.ForestEpinet): group g plans with l_z(U) = l(U) + epinet.card_shift and
+    W_z = W + epinet.value_shift at its index z_g, one sample for the whole plan; z = 0 is the plain planner."""
+    G = len(widths)
+    noises = list(noises) if noises is not None else [0.0] * G
+    all_trees = list(all_trees) if all_trees is not None else [False] * G
+    n = ctx.n
+    rq = ctx.rows([(1 << n) - 1])
+    rs = ctx.rows([1 << i for i in range(n)])
+    phi_q, lq = ctx.phi[rq], ctx.l[rq]
     device = lq.device
     q_std = net.standardise(phi_q)
-    # beam entry: (forest, log cost so far, {mask: (l'', log subtree cost, tree)})
-    beams = [(bushy.initial_forest(n), NEG, {m: (float(ls[i]), NEG, i) for i, m in enumerate(singles)})]
-    while len(beams[0][0]) > 1:
-        cands = [(bi, a, b) for bi, (forest, _, _) in enumerate(beams) for a, b in bushy.candidate_merges(forest, nb)]
-        U = [a | b for _, a, b in cands]
-        phi_u, l_u = ctx.encoded(U)
-        comps = [beams[bi][2] for bi, _, _ in cands]
-        la = torch.tensor([c[a][0] for c, (_, a, _) in zip(comps, cands)], device=device)
-        lb = torch.tensor([c[b][0] for c, (_, _, b) in zip(comps, cands)], device=device)
-        fa = torch.stack([merge_fan(a, b, ctx.touch_s, ctx.touch_o, ctx.fan) for _, a, b in cands]).to(device)
-        fb = torch.stack([merge_fan(b, a, ctx.touch_s, ctx.touch_o, ctx.fan) for _, a, b in cands]).to(device)
-        size = torch.tensor([bin(u).count("1") / n for u in U], device=device)
-        l2, _ = net.bound(l_u, la, lb, fa, fb, net.standardise(phi_u), size)
-        ca = torch.tensor([c[a][1] for c, (_, a, _) in zip(comps, cands)], device=device)
-        cb = torch.tensor([c[b][1] for c, (_, _, b) in zip(comps, cands)], device=device)
-        cost_u = torch.logaddexp(l2, torch.logaddexp(ca, cb))
-        so_far = torch.logaddexp(torch.tensor([beams[bi][1] for bi, _, _ in cands], device=device), l2)
-        children = [bushy.merge(beams[bi][0], a, b) for bi, a, b in cands]
-        k = len(children[0])
-        if k == 1:
+    lq_g = lq.expand(G)
+    if epinet is not None:
+        indexes = indexes.to(device)
+        lq_g = lq + epinet.card_shift(q_std.expand(G, -1), indexes)
+    long = dict(dtype=torch.long, device=device)
+    bit = torch.ones(n, **long) << torch.arange(n, **long)
+    nb = torch.tensor(ctx.neighbour_masks, **long)
+    touch_s, touch_o, fan = torch.tensor(ctx.touch_s, **long), torch.tensor(ctx.touch_o, **long), ctx.fan.to(device)
+    width_t = torch.tensor(widths, **long)
+    noise_t = torch.tensor(noises, dtype=torch.float32, device=device)
+    all_t = torch.tensor(all_trees, dtype=torch.bool, device=device)
+    # beam entries: components sorted by mask; mask, reach, cache row, l'', log subtree cost; per entry the cost so far
+    grp = torch.arange(G, **long)
+    cm = bit.expand(G, n).clone()
+    cr = (nb & ~bit).expand(G, n).clone()
+    crow = rs.expand(G, n).clone()
+    cl = ctx.l[rs].expand(G, n).clone()
+    cc = torch.full((G, n), NEG, device=device)
+    so = torch.full((G,), NEG, device=device)
+    trees = [list(range(n)) for _ in range(G)]
+    for k in range(n, 1, -1):
+        I, J = torch.triu_indices(k, k, 1, device=device)
+        e, p = ((cr[:, I] & cm[:, J]) != 0).nonzero(as_tuple=True)            # by entry, then pair (i < j)
+        i, j = I[p], J[p]
+        a, b = cm[e, i], cm[e, j]
+        U = a | b
+        ru = ctx.rows(U)
+        phi_u, l_u = ctx.phi[ru], ctx.l[ru]
+        gc = grp[e]
+        if epinet is not None:
+            l_u = l_u + epinet.card_shift(net.standardise(phi_u), indexes[gc])
+        size = _popcount(U, n) / n
+        l2, _ = net.bound(l_u, cl[e, i], cl[e, j], _merge_fans(a, b, n, touch_s, touch_o, fan),
+                          _merge_fans(b, a, n, touch_s, touch_o, fan), net.standardise(phi_u), size)
+        cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
+        so_far = torch.logaddexp(so[e], l2)
+        C, kc = len(e), k - 1
+        ar = torch.arange(k, **long)
+        old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
+        eo = e[:, None]
+        child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
+        child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
+        if kc == 1:
+            V = torch.full_like(l2, NEG)
             total = so_far.double()
-            if trace is not None:
-                trace.extend((tuple(sorted(c)), float(l2[j]), NEG) for j, c in enumerate(children))
         else:
-            masks = [[c for c in child if c != u] + [u] for child, u in zip(children, U)]          # new component last
-            old = [m for ms in masks for m in ms[:-1]]
-            phi_old, _ = ctx.encoded(old)
-            l_old = torch.tensor([comps[j][m][0] for j, ms in enumerate(masks) for m in ms[:-1]], device=device)
-            c_old = torch.tensor([comps[j][m][1] for j, ms in enumerate(masks) for m in ms[:-1]], device=device)
-            sz_old = torch.tensor([bin(m).count("1") / n for m in old], device=device)
-            tok_old = token_features(net.standardise(phi_old), l_old, c_old, sz_old * n < 1.5, sz_old).view(len(cands), k - 1, -1)
+            sz_old = _popcount(cm[eo, old], n) / n
+            tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
             tok_new = token_features(net.standardise(phi_u), l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
             tokens = torch.cat([tok_old, tok_new[:, None]], 1)
-            adj = torch.stack([forest_adjacency(ms, nb, k, ctx.reach) for ms in masks]).to(device)
-            pad = torch.zeros(len(cands), k, dtype=torch.bool, device=device)
-            query = torch.cat([q_std.expand(len(cands), -1), (lq / 10).expand(len(cands))[:, None],
-                               torch.full((len(cands), 1), k / n, device=device)], 1)
-            kk = torch.full((len(cands),), k, device=device)
-            V = net.values(tokens, pad, adj, query, lq.expand(len(cands)), kk)
+            adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
+            query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
+            shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
+            V = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
+                           torch.full((C,), kc, **long), w_shift=shift)
             total = torch.logaddexp(so_far.double(), V.double())
-            if trace is not None:
-                trace.extend((tuple(sorted(c)), float(l2[j]), float(V[j])) for j, c in enumerate(children))
-        if noise > 0:
-            total = total + noise * torch.randn(total.shape, device=device, generator=generator)
-        best: dict = {}
-        for j, child in enumerate(children):
-            key = (j,) if all_trees and k == 1 else child
-            score = (float(total[j]), float(so_far[j]))
-            if key not in best or score < best[key][0]:
-                best[key] = (score, j)
-        next_beams = []
-        for _, (_, j) in sorted(best.items(), key=lambda item: item[1][0])[:width]:
-            bi, a, b = cands[j]
-            info = dict(beams[bi][2])
-            ta, tb = info.pop(a)[2], info.pop(b)[2]
-            info[a | b] = (float(l2[j]), float(cost_u[j]), (ta, tb))
-            next_beams.append((children[j], float(so_far[j]), info))
-        beams = next_beams
-    trees = [next(iter(beam[2].values()))[2] for beam in beams]
-    return (trees if all_trees else trees[0]), len(ctx.cache)
+        if trace is not None:
+            trace.extend((tuple(sorted(m)), x, v) for m, x, v in zip(child_m.tolist(), l2.tolist(), V.tolist()))
+        if bool((noise_t > 0).any()):
+            total = total + noise_t[gc] * torch.randn(total.shape, device=device, generator=generator)
+
+        # per group and child forest the best candidate (final step with all_trees: every candidate), then per group
+        # the best widths[g] of those
+        idx = torch.arange(C, **long)
+        distinct = torch.where(all_t[gc] & (kc == 1), idx, torch.zeros_like(idx))
+        _, inv = torch.unique(torch.cat([gc[:, None], child_m.sort(1).values, distinct[:, None]], 1), dim=0, return_inverse=True)
+        K = int(inv.max()) + 1
+        order = torch.sort(so_far, stable=True).indices
+        order = order[torch.sort(total[order], stable=True).indices]               # by (total, so far, index)
+        pos = torch.full((K,), C, **long).scatter_reduce(0, inv[order], idx, "amin")
+        win = order[pos]
+        first = torch.full((K,), C, **long).scatter_reduce(0, inv, idx, "amin")
+        o = torch.argsort(first, stable=True)
+        o = o[torch.sort(so_far[win[o]], stable=True).indices]
+        o = o[torch.sort(total[win[o]], stable=True).indices]                     # by (total, so far, first appearance)
+        win = win[o]
+        win = win[torch.sort(gc[win], stable=True).indices]
+        gw = gc[win]
+        counts = torch.bincount(gw, minlength=G)
+        rank = torch.arange(len(win), **long) - (torch.cumsum(counts, 0) - counts)[gw]
+        sel = win[rank < width_t[gw]]
+
+        es, olds, perm = e[sel], old[sel], child_m[sel].argsort(1)
+        cm = child_m[sel].gather(1, perm)
+        cr = child_r[sel].gather(1, perm)
+        crow = torch.cat([crow[es[:, None], olds], ru[sel][:, None]], 1).gather(1, perm)
+        cl = torch.cat([cl[es[:, None], olds], l2[sel][:, None]], 1).gather(1, perm)
+        cc = torch.cat([cc[es[:, None], olds], cost_u[sel][:, None]], 1).gather(1, perm)
+        so, grp = so_far[sel], gc[sel]
+        built = [[trees[ee][x] for x in ol] + [(trees[ee][ii], trees[ee][jj])]
+                 for ee, ii, jj, ol in zip(es.tolist(), i[sel].tolist(), j[sel].tolist(), olds.tolist())]
+        trees = [[t[x] for x in pm] for t, pm in zip(built, perm.tolist())]
+    out = [[] for _ in range(G)]
+    for g, t in zip(grp.tolist(), trees):
+        out[g].append(t[0])
+    return [ts if keep else ts[:1] for ts, keep in zip(out, all_trees)], len(ctx.cache)
+
+
+def beam_plan(net: ForestPlanner, ctx: QueryContext, width: int, all_trees=False, noise=0.0, generator=None, trace=None):
+    """One beam (beam_plans): (the best tree, or with all_trees the beam's final trees, cheapest first, as
+    bushy.estimator_beam_plan; number of subsets encoded). Width 1 is greedy."""
+    groups, encoded = beam_plans(net, ctx, [width], [noise], [all_trees], generator, trace)
+    return (groups[0] if all_trees else groups[0][0]), encoded
 
 
 # --- training data -------------------------------------------------------------------------------------------
@@ -426,9 +510,16 @@ def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, faile
             "raw_failed": torch.tensor([counts[m] is None for m in raw_masks])}
 
 
-def forward_batch(net: ForestPlanner, parts, phi, l, device, tau):
+def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=False, value_chunk=None, hidden=False):
     """Everything the losses need for a batch of build_query_data parts, given the encoder's phi [M, D] and l [M]
-    for the concatenation of the parts' `masks` (single patterns: exact counts). Returns a dict of tensors."""
+    for the concatenation of the parts' `masks` (single patterns: exact counts). Returns a dict of tensors.
+    stop_gradient: the planner reads phi and l detached, so the plan, value, consistency and bounded-L1 losses stop
+    at its inputs and only the L1 on l ("l" in the result) reaches the encoder. value_chunk: V in chunks of this many forests, with gradients under
+    activation checkpointing (same result; memory of one chunk instead of the batch). hidden: also "W" and "H" (the
+    value net's query-token state) per forest, for the epinet; parts' "raw_keys" / "forest_keys" pass through."""
+    l_raw = l
+    if stop_gradient:
+        phi, l = phi.detach(), l.detach()
     off_m = off_n = off_f = off_s = 0
     width = max(p["n"] for p in parts)
     cat = {key: [] for key in ("node_mask", "node_c1", "node_c2", "node_height", "node_size", "fa", "fb",
@@ -486,12 +577,25 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau):
     tokens = tokens * valid[..., None]
     k = b["forest_k"]
     query = torch.cat([phi_std[b["forest_q"]], (l[b["forest_q"]] / 10)[:, None], (k / b["forest_n"])[:, None]], 1)
-    V = net.values(tokens, ~valid, b["forest_adj"], query, l[b["forest_q"]], k)
+    args = (tokens, ~valid, b["forest_adj"], query, l[b["forest_q"]], k)
+    call = (lambda *a: net.values(*a, return_hidden=True)) if hidden else net.values
+    if value_chunk and len(fn) > value_chunk:
+        run = (lambda *a: checkpoint(call, *a, use_reentrant=False)) if torch.is_grad_enabled() else call
+        outs = [run(*(a[s:s + value_chunk] for a in args)) for s in range(0, len(fn), value_chunk)]
+        res = tuple(torch.cat(t) for t in zip(*outs)) if hidden else torch.cat(outs)
+    else:
+        res = call(*args)
+    V, W, H = res if hidden else (res, None, None)
+    if hidden:
+        b["W"], b["H"] = W, H
+    for key in ("raw_keys", "forest_keys"):
+        if all(key in p for p in parts):
+            b[key] = torch.cat([p[key] for p in parts]).to(device)
 
     # per candidate: estimated and true cost-to-go from its state
     cand = b["cand"]
     q_hat = torch.logaddexp(l2[cand[:, 1]], V[cand[:, 2]])
-    return {"l": l, "l2": l2, "V": V, "q_hat": q_hat, **b}
+    return {"l": l_raw, "l2": l2, "V": V, "q_hat": q_hat, **b}
 
 
 def _segment_logsumexp(x, seg, size):

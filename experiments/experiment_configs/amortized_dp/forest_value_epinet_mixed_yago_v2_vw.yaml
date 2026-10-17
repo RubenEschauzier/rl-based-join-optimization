@@ -1,0 +1,14 @@
+# forest_value_mixed_yago_v2_vw.yaml with the epinet (forest_epinet.py): Thompson-sampled exploration beams and
+# epistemic selection of which queries to count and train on. Same rounds, endpoints and validation queries as the
+# plain run, so the two compare round by round.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value \
+#     --config-name forest_value_epinet_mixed_yago_v2_vw.yaml
+defaults:
+  - forest_value_mixed_yago_v2_vw
+  - _self_
+
+online:
+  output_directory: experiments/experiment_outputs/mixed_yago_v2/forest_value_epinet
+
+epinet:
+  enabled: true

@@ -9,13 +9,29 @@ bound. Each ROUND, as train_plan_loss:
   1. take `queries_per_round` training queries (a share `revisit_fraction` already seen, re-planned);
   2. plan each with the current model: the beam of width `deployed_width` (all its final trees with
      `count_beam_alternatives`) and `explore_plans` beams with N(0, explore_sigma) noise on the scores; with
-     forest.count_candidates also the result of every candidate merge along the deployed plan;
-  3. COUNT the new subsets on QLever (a failed count costs the query's failed-count bound, 2 x its largest count);
+     forest.count_candidates also the result of every candidate merge along the deployed plan (all beams of a
+     query run as one batch, fv.beam_plans);
+  3. COUNT the new subsets on QLever (a failed count costs the query's failed-count bound, 2 x its largest count),
+     streamed: each query's subsets are counted while the next queries are planned (CountStream);
   4. train on the most recent `replay_queries` counted queries (up to forest.max_plans_per_query counted plans each):
          l1_weight * L1(l) + forest.bound_l1_weight * L1(l'') + forest.value_weight * |V - log G|
          + plan_weight * per-step plan regret + forest.consistency_weight * |V - min Q^|   (forest_value.losses)
      with gradients into the backbone (online.lr) and the planner (forest.lr). The plan regret is off for the first
      forest.plan_warmup_rounds rounds: the untrained V would otherwise push the estimates to compensate for it.
+     With forest.stop_gradient the planner reads the backbone's phi and l detached: only the L1 on l trains the
+     backbone (the plan loss pulled the estimates away from the counts: the references drifted in the run of 17-10).
+With epinet.enabled (forest_epinet.py: one epistemic index z drives an epinet on the subset estimates and one on
+the value; Osband et al. 2023, Wen et al. 2023):
+  - Thompson sampling (epinet.thompson): each exploration beam draws one z and plans with l_z, V_z, instead of
+    N(0, explore_sigma) noise on its scores; the deployed beam uses z = 0 (the plain planner);
+  - which queries to count (epinet.select_pool_factor f > 1): the new queries of a round are the top 1/f of f times
+    as many candidates by priority Var_z V_z(F0), the epistemic variance of the predicted cost of the whole query
+    ("Fine-Tuning Language Models via Epistemic Neural Networks", the "variance" priority);
+  - which queries to train on (epinet.train_select_factor f > 1): each batch is the top 1/f of f times as many
+    window queries by the same priority (computed once per round);
+  - training: the epinet losses (forest_epinet.losses, Gaussian bootstrap) next to the planner's, epinet only;
+  - calibration: each round on its fresh counts (not yet trained on): coverage of the 90% interval and Spearman of
+    std vs |error|, per head; with epinet.sample_scale auto the sample scale is refitted so 90% intervals cover 90%.
 Validation (round 0, then every validation.every_rounds) on the same 2,000 queries as train_plan_loss: "value GOO /
 beam-4 / beam-8" (this planner) next to GNCE GOO / beam-4 / beam-8, and with forest.reference_planners the current
 cardinality model's plain estimator beam-8 and its lattice DP with the hard degree bound. True C_out, geomean vs
@@ -24,7 +40,7 @@ and the tail: percentiles (PERCENTILES) and shares > 2x / > 10x of the per-query
 cheapest plan any planner (ours or GNCE) found for the query at round 0.
 
 Outputs in online.output_directory/forest-value-<time>/: config.yaml, rounds.jsonl, validation.jsonl,
-validation-<round>.json, model-<round>.pt (cardinality model), planner-<round>.pt, counts.pkl.
+validation-<round>.json, model-<round>.pt (cardinality model), planner-<round>.pt, epinet-<round>.pt, counts.pkl.
 """
 from __future__ import annotations
 
@@ -42,7 +58,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from src.supervised_value_estimation.amortized_dp import bushy, forest_value as fv, history_dp, soft_dp
+from src.supervised_value_estimation.amortized_dp import bushy, forest_epinet as fe, forest_value as fv, history_dp, soft_dp
 from src.supervised_value_estimation.amortized_dp.bushy_train import count_connected_subsets, load_backbone, load_split
 from src.supervised_value_estimation.amortized_dp.labels import model_log_cardinalities
 from src.supervised_value_estimation.amortized_dp.online.train_online import _endpoints
@@ -50,7 +66,7 @@ from src.supervised_value_estimation.amortized_dp.online.train_online_bushy impo
 from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import (BUCKETS, Query, failed_bound,
                                                                                  multi_query_batch, phi_and_direct,
                                                                                  plan_cost, subset_phi)
-from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_query, count_subsets
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import CountStream, count_query, count_subsets
 
 PERCENTILES = (50, 90, 95, 99)
 
@@ -67,20 +83,82 @@ def encoder(model, q, device):
 
 
 @torch.no_grad()
+def encode_batch(model, queries, parts, device):
+    """The encoder's (phi, l) for the concatenated masks of the parts (single patterns: exact counts)."""
+    x = multi_query_batch([(q, p["masks"].to(device)) for q, p in zip(queries, parts)], device)
+    phi, l = phi_and_direct(model, *x)
+    m = torch.cat([p["masks"] for p in parts]).to(device)
+    exact = torch.cat([history_dp.single_pattern_logcounts(q.data, p["masks"].to(device)) for q, p in zip(queries, parts)])
+    return phi, torch.where((m & (m - 1)) == 0, exact, l)
+
+
+@torch.no_grad()
+def start_items(model, queries, device, chunk=256):
+    """forest_epinet.start_forests items: per query (phi, l) of its single patterns and of the whole query."""
+    items = []
+    for s in range(0, len(queries), chunk):
+        qs = queries[s:s + chunk]
+        masks = [torch.tensor([1 << i for i in range(q.n)] + [(1 << q.n) - 1], device=device) for q in qs]
+        phi, l = phi_and_direct(model, *multi_query_batch(list(zip(qs, masks)), device))
+        off = 0
+        for q, m in zip(qs, masks):
+            exact = history_dp.single_pattern_logcounts(q.data, m)
+            items.append((phi[off:off + q.n + 1], torch.cat([exact[:q.n], l[off + q.n:off + q.n + 1]]), q.neighbour_masks))
+            off += q.n + 1
+    return items
+
+
+@torch.no_grad()
+def card_calibration(model, net, epi, pairs, device, n_indexes=64, generator=None):
+    """forest_epinet.calibration of the subset head on [(query, {mask: count})] (multi-pattern, counted)."""
+    pairs = [(q, table) for q, table in pairs if table]
+    if not pairs:
+        return None
+    queries = [q for q, _ in pairs]
+    phi, l = encode_batch(model, queries, [{"masks": torch.tensor(list(t), dtype=torch.long)} for _, t in pairs], device)
+    true = torch.tensor([math.log1p(c) for _, t in pairs for c in t.values()], device=device)
+    Z = torch.randn(n_indexes, epi.index_dim, device=device, generator=generator)
+    return fe.calibration(fe.scaled_card_samples(epi, net, phi, l, Z), l, true)
+
+
+@torch.no_grad()
+def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, generator=None, chunk=32):
+    """forest_epinet.calibration of the value head on the forests with a stitched G of these parts."""
+    samples, base, true = [], [], []
+    Z = torch.randn(n_indexes, epi.index_dim, device=device, generator=generator)
+    for s in range(0, len(parts), chunk):
+        qs, ps = queries[s:s + chunk], parts[s:s + chunk]
+        phi, l = encode_batch(model, qs, ps, device)
+        out = fv.forward_batch(net, ps, phi, l, device, 1.0, True, hidden=True)
+        f = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
+        lq = out["l"][out["forest_q"][f]]
+        samples.append(torch.logaddexp(lq, out["W"][f] + epi.scale_value * epi.value_samples(out["H"][f], Z)))
+        base.append(out["V"][f]), true.append(out["g_true"][f])
+    if not samples:
+        return None
+    return fe.calibration(torch.cat(samples, 1), torch.cat(base), torch.cat(true))
+
+
+@torch.no_grad()
 def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, generator=None, alternatives=False,
-               reference=False):
+               reference=False, epinet=None, thompson=False):
     """{name: tree} for "beam-w" (with alternatives also "beam-w #i"), "explore-i" and, with reference, the plain
-    estimator "est beam-8" and "est DP + bound"; plus the deployed beam's states' candidate merges (masks)."""
+    estimator "est beam-8" and "est DP + bound"; plus the deployed beam's states' candidate merges (masks). With an
+    epinet and thompson, each exploration beam plans with its own epistemic index instead of score noise."""
     ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, encoder(model, q, device))
+    groups = [("GOO" if w == 1 else f"beam-{w}", w, 0.0, alternatives) for w in widths]
+    groups += [(f"explore-{i}", widths[-1], 0.0 if thompson else sigma, False) for i in range(explore)]
+    indexes = None
+    if epinet is not None:
+        indexes = torch.zeros(len(groups), epinet.index_dim, device=device)
+        if thompson and explore:
+            indexes[len(widths):] = torch.randn(explore, epinet.index_dim, device=device, generator=generator)
+    out, _ = fv.beam_plans(net, ctx, [g[1] for g in groups], [g[2] for g in groups], [g[3] for g in groups], generator,
+                           epinet=epinet, indexes=indexes)
     plans = {}
-    for w in widths:
-        name = "GOO" if w == 1 else f"beam-{w}"
-        trees, _ = fv.beam_plan(net, ctx, w, all_trees=True)
+    for (name, *_), trees in zip(groups, out):                  # all beams of the query in one batch
         plans[name] = trees[0]
-        if alternatives:
-            plans.update({f"{name} #{i}": t for i, t in enumerate(trees[1:], 1)})
-    for i in range(explore):
-        plans[f"explore-{i}"], _ = fv.beam_plan(net, ctx, widths[-1], noise=sigma, generator=generator)
+        plans.update({f"{name} #{i}": t for i, t in enumerate(trees[1:], 1)})
     if reference:
         s = soft_dp.SubsetStructure(q.neighbour_masks, device)
         est = soft_dp.model_subset_logcards(model, q.data, s.masks, device)
@@ -146,6 +224,20 @@ def main(cfg: DictConfig):
     print(f"Estimator: {cfg.estimator.run} (epoch {epoch}), {sum(p.numel() for p in model.parameters()):,} parameters | "
           f"forest planner {sum(p.numel() for p in net.parameters()):,} parameters (untrained) | degrees of {len(degrees)} predicates",
           flush=True)
+    ecfg = cfg.get("epinet") or {"enabled": False}
+    epi = None
+    if bool(ecfg["enabled"]):
+        epi = fe.ForestEpinet(phi.shape[1], int(fcfg.d), int(ecfg.index_dim), int(ecfg.hidden_dim),
+                                          int(ecfg.prior_hidden_dim)).to(device)
+        sample = start_items(model, [Query(train_dataset[i]) for i in train_pool[:256]], device)
+        epi.set_prior_scale(net.standardise(phi), fe.start_forests(net, sample, device)[4], float(ecfg.prior_scale_target))
+        if str(ecfg.sample_scale) != "auto":
+            epi.scale_card.fill_(float(ecfg.sample_scale)), epi.scale_value.fill_(float(ecfg.sample_scale))
+        n_train = sum(p.numel() for p in epi.trainable())
+        print(f"Epinet: {n_train:,} trainable parameters (+{sum(p.numel() for p in epi.parameters()) - n_train:,} frozen "
+              f"prior) | index dim {ecfg.index_dim} | Thompson exploration {bool(ecfg.thompson)} | select queries "
+              f"top 1/{ecfg.select_pool_factor} to count, top 1/{ecfg.train_select_factor} to train | sample scale "
+              f"{ecfg.sample_scale}", flush=True)
     print(f"Train pool: {len(train_pool):,} connected queries | validation: {len(validation)} "
           f"(sizes {np.bincount([v.n for v in validation]).tolist()})", flush=True)
 
@@ -179,11 +271,14 @@ def main(cfg: DictConfig):
         tasks = list(dict(tasks).items())
         start = time.perf_counter()
         results = count_subsets(tasks, endpoints, float(online.count_timeout_s)) if tasks else {}
+        return store_counts(results), sum(v is None for v in results.values()), time.perf_counter() - start
+
+    def store_counts(results):
         for (key, m), value in results.items():
             counts[key][m] = value
             if value is not None:
                 largest[0] = max(largest[0], value)
-        return len(tasks), sum(v is None for v in results.values()), time.perf_counter() - start
+        return len(results)
 
     # --- validation --------------------------------------------------------------------------------
     reference = {}
@@ -253,16 +348,29 @@ def main(cfg: DictConfig):
             p = summary["planners"][name]["vs_best_round_0"]
             print(f"  {name:18s}" + "".join(f"{p['p' + str(q)]:8.2f}" for q in PERCENTILES)
                   + f"{p['>2x']:8.1%}{p['>10x']:8.1%}", flush=True)
+        if epi is not None:
+            pick = np.random.default_rng(round_index)
+            pairs = []
+            for v in validation:
+                multi = [m for m, c in counts[v.key].items() if c is not None and m & (m - 1)]
+                chosen = pick.choice(len(multi), min(8, len(multi)), replace=False) if multi else []
+                pairs.append((v, {multi[i]: counts[v.key][multi[i]] for i in chosen}))
+            cal = card_calibration(model, net, epi, pairs, device, generator=generator)
+            with open(run_directory / "validation.jsonl", "a") as f:
+                f.write(json.dumps({"round": round_index, "epinet_card_calibration": cal}) + "\n")
+            print(f"  epinet, subset estimates of the validation plans (never trained on): {cal}", flush=True)
+            epi.save(run_directory / f"epinet-{round_index}.pt")
         torch.save(model.state_dict(), run_directory / f"model-{round_index}.pt")
         net.save(run_directory / f"planner-{round_index}.pt")
         with open(run_directory / "counts.pkl", "wb") as f:
             pickle.dump(counts, f)
 
     # --- training ------------------------------------------------------------------------------------
-    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": float(online.lr)},
-                                   {"params": list(net.parameters()), "lr": float(fcfg.lr)}],
-                                  weight_decay=float(online.weight_decay))
-    trainable = list(model.parameters()) + list(net.parameters())
+    groups = [{"params": list(model.parameters()), "lr": float(online.lr)}, {"params": list(net.parameters()), "lr": float(fcfg.lr)}]
+    if epi is not None:
+        groups.append({"params": epi.trainable(), "lr": float(ecfg.lr)})
+    optimizer = torch.optim.AdamW(groups, weight_decay=float(online.weight_decay))
+    trainable = [p for g in groups for p in g["params"]]
     seen: dict[str, Query] = {}
     plans_of: dict[str, list] = {}                       # query -> counted plans (canonical, most recent last)
     parts: dict[str, tuple] = {}                         # query -> (build_query_data part, counts seen, plans seen)
@@ -276,19 +384,40 @@ def main(cfg: DictConfig):
         t0 = time.perf_counter()
         n_revisit = min(int(round(float(online.revisit_fraction) * int(online.queries_per_round))), len(seen))
         batch = [seen[k] for k in rng.choice(list(seen), n_revisit, replace=False)] if n_revisit else []
-        while len(batch) < int(online.queries_per_round):
-            batch.append(Query(train_dataset[train_pool[next_index % len(train_pool)]]))
-            next_index += 1
         model.eval(), net.eval()
-        to_count = []
+        n_new = int(online.queries_per_round) - len(batch)
+        factor = int(ecfg.select_pool_factor) if epi is not None else 1
+        candidates = []
+        while len(candidates) < n_new * factor:
+            candidates.append(Query(train_dataset[train_pool[next_index % len(train_pool)]]))
+            next_index += 1
+        selection = None
+        if factor > 1 and n_new:
+            priority = fe.query_priorities(net, epi, start_items(model, candidates, device), device,
+                                           int(ecfg.n_indexes_priority), generator)
+            top = sorted(torch.topk(priority, n_new).indices.tolist())
+            selection = {"pool": len(candidates), "pool_mean_n": round(float(np.mean([q.n for q in candidates])), 2),
+                         "selected_mean_n": round(float(np.mean([candidates[i].n for i in top])), 2),
+                         "pool_mean_priority": round(float(priority.mean()), 4),
+                         "selected_mean_priority": round(float(priority[top].mean()), 4)}
+            candidates = [candidates[i] for i in top]
+        new_keys = {q.key for q in candidates}
+        batch += candidates
         deployed = f"beam-{int(online.deployed_width)}" if int(online.deployed_width) > 1 else "GOO"
+        stream = CountStream(endpoints, float(online.count_timeout_s))
+        queued = set()
         for q in tqdm(batch, desc="Planning", file=sys.stdout, mininterval=30):
             plans = plan_query(model, net, q, degrees, device, [int(online.deployed_width)], int(online.explore_plans),
-                               float(online.explore_sigma), generator, bool(online.count_beam_alternatives))
+                               float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
+                               epinet=epi, thompson=epi is not None and bool(ecfg.thompson))
             masks = [m for t in plans.values() for m in bushy.internal_masks(t)]
             if bool(fcfg.count_candidates):
                 masks += candidate_masks(plans[deployed], q)
-            to_count.append((q, masks))
+            known = counts.setdefault(q.key, {})
+            tasks = [((q.key, m), count_query(q.patterns, m)) for m in dict.fromkeys(masks)
+                     if m not in known and (q.key, m) not in queued]
+            queued.update(key for key, _ in tasks)
+            stream.add(tasks)                                    # counted while the next queries are planned
             known = plans_of.setdefault(q.key, [])
             for t in plans.values():
                 c = bushy.canonical(t)
@@ -297,7 +426,18 @@ def main(cfg: DictConfig):
                 known.append(c)
             del known[:-int(fcfg.max_plans_per_query)]
         t1 = time.perf_counter()
-        new, failed, count_s = count_missing(to_count)
+        results = stream.finish()
+        new, failed, count_s = store_counts(results), sum(v is None for v in results.values()), stream.seconds
+        count_wait = time.perf_counter() - t1
+        cal_card = cal_value = None
+        if epi is not None:                              # this round's counts: not trained on yet
+            fresh: dict[str, dict] = {}
+            for (key, m), c in results.items():
+                if c is not None and m & (m - 1) and len(fresh.setdefault(key, {})) < 16:
+                    fresh[key][m] = c
+            cal_card = card_calibration(model, net, epi, [(q, fresh.get(q.key, {})) for q in batch], device, generator=generator)
+            if str(ecfg.sample_scale) == "auto":
+                epi.scale_card.fill_(fe.fit_scale(float(epi.scale_card), cal_card))
         for q in batch:
             seen.pop(q.key, None)
             seen[q.key] = q
@@ -312,24 +452,47 @@ def main(cfg: DictConfig):
             if q.key not in parts or parts[q.key][1] != state:
                 parts[q.key] = (fv.build_query_data(q.n, q.neighbour_masks, q.patterns, degrees, plans_of[q.key], counts[q.key],
                                                     failed_bound(counts[q.key], largest[0])), state)
+                if epi is not None:
+                    parts[q.key][0].update(fe.anchor_keys(parts[q.key][0], q.key))
+        priority_w = None
+        if epi is not None:
+            fresh_q = [q for q in batch if q.key in new_keys][:256]
+            cal_value = value_calibration(model, net, epi, fresh_q, [parts[q.key][0] for q in fresh_q], device,
+                                          generator=generator)
+            if str(ecfg.sample_scale) == "auto":
+                epi.scale_value.fill_(fe.fit_scale(float(epi.scale_value), cal_value))
+            if int(ecfg.train_select_factor) > 1:
+                priority_w = fe.query_priorities(net, epi, start_items(model, window, device), device,
+                                                 int(ecfg.n_indexes_priority), generator).cpu().numpy()
         t3 = time.perf_counter()
         model.train(), net.train()
         steps = max(1, int(float(online.gradient_passes_per_round) * len(window) / int(online.queries_per_batch)))
-        stats = {k: [] for k in ("loss", "l1_raw", "l1_bound", "value", "plan", "floor", "consistency", "choice")}
+        stats = {k: [] for k in ("loss", "l1_raw", "l1_bound", "value", "plan", "floor", "consistency", "choice",
+                                 "epinet_card", "epinet_value")}
+        B = min(int(online.queries_per_batch), len(window))
         for _ in range(steps):
-            chosen = [window[k] for k in rng.choice(len(window), min(int(online.queries_per_batch), len(window)), replace=False)]
+            if priority_w is not None:                   # the top B of f x B window queries by priority
+                cand = rng.choice(len(window), min(int(ecfg.train_select_factor) * B, len(window)), replace=False)
+                picked = cand[np.argsort(-priority_w[cand], kind="stable")[:B]]
+            else:
+                picked = rng.choice(len(window), B, replace=False)
+            chosen = [window[k] for k in picked]
             batch_parts = [parts[q.key][0] for q in chosen]
             x = multi_query_batch([(q, p["masks"].to(device)) for q, p in zip(chosen, batch_parts)], device)
             phi_b, l_b = phi_and_direct(model, *x)
             m_all = torch.cat([p["masks"] for p in batch_parts]).to(device)
             exact = torch.cat([history_dp.single_pattern_logcounts(q.data, p["masks"].to(device)) for q, p in zip(chosen, batch_parts)])
             l_b = torch.where((m_all & (m_all - 1)) == 0, exact, l_b)
-            out = fv.forward_batch(net, batch_parts, phi_b, l_b, device, tau)
+            out = fv.forward_batch(net, batch_parts, phi_b, l_b, device, tau, bool(fcfg.stop_gradient), hidden=epi is not None)
             res = fv.losses(out, tau)
             warm = round_index <= int(fcfg.plan_warmup_rounds)      # V learns from its own targets before the plan loss
             loss = sum(w * res[k] for k, w in weights.items() if not (warm and k == "plan"))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if epi is not None:                          # its inputs are detached: a separate, smaller graph
+                eres = fe.losses(epi, net, out, phi_b, float(ecfg.sigma), int(ecfg.n_indexes_train), int(ecfg.max_rows), generator)
+                (float(ecfg.weight) * (eres["card"] + eres["value"])).backward()
+                stats["epinet_card"].append(float(eres["card"])), stats["epinet_value"].append(float(eres["value"]))
             torch.nn.utils.clip_grad_norm_(trainable, float(online.grad_clip))
             optimizer.step()
             stats["loss"].append(float(loss))
@@ -337,16 +500,31 @@ def main(cfg: DictConfig):
                 stats[k].append(float(res[k]))
             stats["choice"].append(res["states_with_choice"] / max(res["states"], 1))
         record = {"round": round_index, "queries": len(batch), "revisited": n_revisit, "counted": new, "failed": failed,
-                  "plan_s": round(t1 - t0, 1), "count_s": round(count_s, 1), "build_s": round(t3 - t2, 1),
+                  "plan_s": round(t1 - t0, 1), "count_s": round(count_s, 1), "count_wait_s": round(count_wait, 1),
+                  "build_s": round(t3 - t2, 1),
                   "train_s": round(time.perf_counter() - t3, 1), "window": len(window), "steps": steps,
-                  **{k: round(float(np.mean(v)), 4) for k, v in stats.items()}}
+                  **{k: round(float(np.mean(v)), 4) for k, v in stats.items() if v}}
+        if epi is not None:
+            record["epinet"] = {"scale_card": round(float(epi.scale_card), 4), "scale_value": round(float(epi.scale_value), 4),
+                                "fresh_card": cal_card, "fresh_value": cal_value, "selection": selection}
         with open(run_directory / "rounds.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
         print(f"[round {round_index}] {new:,} counts ({failed} failed) in {count_s:.0f}s | {steps} steps: L1 {record['l1_raw']:.3f} "
               f"(bounded {record['l1_bound']:.3f}), value {record['value']:.3f}, plan regret {record['plan']:.3f} (floor "
               f"{record['floor']:.3f}), consistency {record['consistency']:.3f}, states with a counted choice "
-              f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s, build {record['build_s']:.0f}s, train "
+              f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s (+{count_wait:.0f}s waiting for counts), build "
+              f"{record['build_s']:.0f}s, train "
               f"{record['train_s']:.0f}s | window {len(window):,}", flush=True)
+        if epi is not None:
+            show = lambda c: "-" if c is None else (f"coverage90 {c['coverage90']:.2f}, Spearman(std, |err|) "
+                                                    f"{c['spearman'] if c['spearman'] is not None else float('nan'):.2f}, "
+                                                    f"mean std {c['mean_std']:.2f} vs |err| {c['mean_abs_error']:.2f}")
+            sel = "" if selection is None else (f" | counted queries: priority {selection['selected_mean_priority']:.3f} "
+                                                f"vs pool {selection['pool_mean_priority']:.3f}, n {selection['selected_mean_n']:.1f} "
+                                                f"vs {selection['pool_mean_n']:.1f}")
+            print(f"[round {round_index} epinet] loss card {record['epinet_card']:.3f} value {record['epinet_value']:.3f} | "
+                  f"fresh subsets: {show(cal_card)} | fresh forests: {show(cal_value)} | sample scale card "
+                  f"{float(epi.scale_card):.2f} value {float(epi.scale_value):.2f}{sel}", flush=True)
         if round_index % int(online.validation.every_rounds) == 0 or round_index == int(online.rounds):
             validate(round_index)
 
