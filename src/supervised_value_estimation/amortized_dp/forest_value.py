@@ -353,7 +353,7 @@ def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, index
 
 @torch.no_grad()
 def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
-               epinet=None, indexes=None):
+               epinet=None, indexes=None, robust=None):
     """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by
     total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far, then by first appearance), with
     N(0, noises[g]) on each candidate's score (exploration). Returns ([trees of group g, cheapest first: all the
@@ -361,7 +361,14 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     the same number of components, so a step is a few tensor operations over every candidate of every group. trace:
     a list that receives (child forest masks, l''(U), V(child)) of every candidate (tests). epinet, indexes [G, D]:
     Thompson sampling (forest_epinet.ForestEpinet): group g plans with l_z(U) = l(U) + epinet.card_shift and
-    W_z = W + epinet.value_shift at its index z_g, one sample for the whole plan; z = 0 is the plain planner."""
+    W_z = W + epinet.value_shift at its index z_g, one sample for the whole plan; z = 0 is the plain planner.
+    robust {"epinet", "indexes" [K, D], "stat" "mean" | "p90"}: risk-aware beams. Every entry carries K worlds, one per
+    sampled model z_k: its own l''_z of each component, log subtree costs and cost so far, with
+    l_z(U) = l(U) + card_shift(phi(U), z_k) through the bound. Candidates are ranked by the statistic over the worlds of
+    total_z(F) = logaddexp(log cost so far_z, V_z(F)), V_z = logaddexp(l_z(Q), W + value_shift(h, z_k)), with W and h
+    from the value net ONCE on the plain (z = 0) tokens. "mean": E_z[total_z] (the expected log cost, as the geomean
+    metric); "p90": the 90% quantile over z (conservative). A finished plan's score is the statistic of its
+    plan_scores. Not combined with indexes (Thompson beams)."""
     G = len(widths)
     noises = list(noises) if noises is not None else [0.0] * G
     all_trees = list(all_trees) if all_trees is not None else [False] * G
@@ -380,6 +387,12 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     nb = torch.tensor(ctx.neighbour_masks, **long)
     touch_s, touch_o, fan = torch.tensor(ctx.touch_s, **long), torch.tensor(ctx.touch_o, **long), ctx.fan.to(device)
     width_t = torch.tensor(widths, **long)
+    if robust is not None:
+        assert epinet is None, "robust beams and Thompson indexes do not mix"
+        r_epi, Zr, stat = robust["epinet"], robust["indexes"].to(device), robust["stat"]
+        assert stat in ("mean", "p90"), stat
+        Kr = len(Zr)
+        lq_r = lq + r_epi.scale_card * r_epi.card_samples(q_std, Zr)[:, 0]               # [K] l_z(Q)
     noise_t = torch.tensor(noises, dtype=torch.float32, device=device)
     all_t = torch.tensor(all_trees, dtype=torch.bool, device=device)
     # beam entries: components sorted by mask; mask, reach, cache row, l'', log subtree cost; per entry the cost so far
@@ -390,6 +403,10 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     cl = ctx.l[rs].expand(G, n).clone()
     cc = torch.full((G, n), NEG, device=device)
     so = torch.full((G,), NEG, device=device)
+    if robust is not None:                               # per entry and world: l'', log subtree cost, cost so far
+        clw = cl[..., None].expand(G, n, Kr).clone()
+        ccw = torch.full((G, n, Kr), NEG, device=device)
+        sow = torch.full((G, Kr), NEG, device=device)
     trees = [list(range(n)) for _ in range(G)]
     for k in range(n, 1, -1):
         I, J = torch.triu_indices(k, k, 1, device=device)
@@ -407,6 +424,17 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
                           _merge_fans(b, a, n, touch_s, touch_o, fan), net.standardise(phi_u), size)
         cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
         so_far = torch.logaddexp(so[e], l2)
+        if robust is not None:
+            phi_std = net.standardise(phi_u)
+            l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
+            Cn = len(e)
+            l2w, _ = net.bound(l_uw.reshape(-1), clw[e, i].reshape(-1), clw[e, j].reshape(-1),
+                               _merge_fans(a, b, n, touch_s, touch_o, fan).repeat_interleave(Kr, 0),
+                               _merge_fans(b, a, n, touch_s, touch_o, fan).repeat_interleave(Kr, 0),
+                               phi_std.repeat_interleave(Kr, 0), size.repeat_interleave(Kr))
+            l2w = l2w.view(Cn, Kr)
+            cost_uw = torch.logaddexp(l2w, torch.logaddexp(ccw[e, i], ccw[e, j]))
+            so_w = torch.logaddexp(sow[e], l2w)
         C, kc = len(e), k - 1
         ar = torch.arange(k, **long)
         old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
@@ -416,6 +444,8 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         if kc == 1:
             V = torch.full_like(l2, NEG)
             total = so_far.double()
+            if robust is not None:
+                total_w = so_w.double()
         else:
             sz_old = _popcount(cm[eo, old], n) / n
             tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
@@ -424,9 +454,15 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
             adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
             query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
             shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
-            V = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
-                           torch.full((C,), kc, **long), w_shift=shift)
+            V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
+                                  torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
             total = torch.logaddexp(so_far.double(), V.double())
+            if robust is not None:
+                Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
+                    lq_r.expand(C, Kr), W[:, None] + r_epi.scale_value * r_epi.value_samples(hv, Zr).T)
+                total_w = torch.logaddexp(so_w.double(), Vw.double())
+        if robust is not None:                           # rank by the statistic over the worlds
+            total = total_w.mean(1) if stat == "mean" else torch.quantile(total_w, 0.9, dim=1)
         if trace is not None:
             trace.extend((tuple(sorted(m)), x, v) for m, x, v in zip(child_m.tolist(), l2.tolist(), V.tolist()))
         if bool((noise_t > 0).any()):
@@ -460,6 +496,11 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         cl = torch.cat([cl[es[:, None], olds], l2[sel][:, None]], 1).gather(1, perm)
         cc = torch.cat([cc[es[:, None], olds], cost_u[sel][:, None]], 1).gather(1, perm)
         so, grp = so_far[sel], gc[sel]
+        if robust is not None:
+            pw = perm[..., None].expand(-1, -1, Kr)
+            clw = torch.cat([clw[es[:, None], olds], l2w[sel][:, None]], 1).gather(1, pw)
+            ccw = torch.cat([ccw[es[:, None], olds], cost_uw[sel][:, None]], 1).gather(1, pw)
+            sow = so_w[sel]
         built = [[trees[ee][x] for x in ol] + [(trees[ee][ii], trees[ee][jj])]
                  for ee, ii, jj, ol in zip(es.tolist(), i[sel].tolist(), j[sel].tolist(), olds.tolist())]
         trees = [[t[x] for x in pm] for t, pm in zip(built, perm.tolist())]

@@ -44,10 +44,11 @@ over this execution's plans T (T_0 the deployed one), total_z(T) = fv.plan_score
 under model z): how much worse the deployed decision is in the sampled worlds; 0 when every sampled model agrees.
 The realized regret is then only logged, with Spearman(D, realized regret) over the executed queries: does the
 decision uncertainty point at the decisions that go wrong?
-With epinet.robust_validation, validation also plans each query with the deployed beam's trees and Thompson beams as
-candidates and picks among them by their scores over epinet.robust_indexes sampled models: "value robust-mean" (the
-expected cost, log mean exp), "value robust-p90" (the 90% quantile), "value cand z=0" (the plain estimate: the
-candidate set alone), and "oracle best cand" (the cheapest by true counts: the ceiling of any choice among them).
+With epinet.robust_validation, validation also plans each query with risk-aware beams (fv.beam_plans robust): every
+decision ranks its candidates by a statistic over epinet.robust_indexes sampled models (the same models every
+validation) of their total_z: "value robust-mean GOO / beam-8" (E_z, the expected log cost) and "value robust-p90
+GOO / beam-8" (the 90% quantile, conservative); "oracle best cand" is the cheapest by true counts among the plain and
+robust beam-8 beams' final trees (the ceiling of any choice among them; epinet.robust_oracle counts them all).
 Validation (round 0, then every validation.every_rounds) on the same 2,000 queries as train_plan_loss: "value GOO /
 beam-4 / beam-8" (this planner) next to GNCE GOO / beam-4 / beam-8, and with forest.reference_planners the current
 cardinality model's plain estimator beam-8 and its lattice DP with the hard degree bound. True C_out, geomean vs
@@ -347,22 +348,22 @@ def main(cfg: DictConfig):
         robust = epi is not None and bool(ecfg.robust_validation)
         oracle = robust and bool(ecfg.robust_oracle)
         candidates: dict[str, list] = {}
-        robust_gen = torch.Generator(device=device.type).manual_seed(int(online.seed) + 7919)   # the same models every validation
+        if robust:                                       # the same sampled models every validation
+            robust_z = torch.randn(int(ecfg.robust_indexes), epi.index_dim, device=device,
+                                   generator=torch.Generator(device=device.type).manual_seed(int(online.seed) + 7919))
         for v in tqdm(validation, desc="Planning (validation)", file=sys.stdout, mininterval=30):
             ours = plan_query(model, net, v, degrees, device, widths, reference=bool(fcfg.reference_planners))
             plans[v.key] = {(k if k.startswith("est") else f"value {k}"): t for k, t in ours.items()} | gnce_plans[v.key]
             if robust:
-                cands, det = plan_query(model, net, v, degrees, device, [widths[-1]], int(ecfg.robust_thompson), 0.0,
-                                        robust_gen, True, epinet=epi, thompson=True, details=True)
-                trees = list(dict.fromkeys(bushy.canonical(t) for t in cands.values()))
-                Z = torch.randn(int(ecfg.robust_indexes), epi.index_dim, device=device, generator=robust_gen)
-                S = fv.plan_scores(net, det["ctx"], trees, epi, Z)
-                plain = fv.plan_scores(net, det["ctx"], trees)[0]
-                expected = torch.logsumexp(S.double(), 0)
-                plans[v.key]["value cand z=0"] = trees[int(plain.argmin())]
-                plans[v.key]["value robust-mean"] = trees[int(expected.argmin())]
-                plans[v.key]["value robust-p90"] = trees[int(torch.quantile(S, 0.9, dim=0).argmin())]
-                candidates[v.key] = trees
+                ctx = fv.QueryContext(v.n, v.neighbour_masks, v.patterns, degrees, encoder(model, v, device))
+                trees = list(fv.beam_plans(net, ctx, [widths[-1]], all_trees=[True])[0][0])
+                for stat in ("mean", "p90"):
+                    (goo, beam), _ = fv.beam_plans(net, ctx, [1, widths[-1]], all_trees=[False, True],
+                                                   robust={"epinet": epi, "indexes": robust_z, "stat": stat})
+                    plans[v.key][f"value robust-{stat} GOO"] = goo[0]
+                    plans[v.key][f"value robust-{stat} beam-{widths[-1]}"] = beam[0]
+                    trees += beam
+                candidates[v.key] = list(dict.fromkeys(bushy.canonical(t) for t in trees))
         planned = time.perf_counter() - start
         extra = {k: [m for t in ts for m in bushy.internal_masks(t)] for k, ts in candidates.items()} if oracle else {}
         new, failed, seconds = count_missing([(v, [m for t in plans[v.key].values() for m in bushy.internal_masks(t)]
@@ -412,21 +413,21 @@ def main(cfg: DictConfig):
                        for v in validation}, f)
         print(f"\n[validation round {round_index}] true C_out, geomean vs GNCE GOO ({new:,} new counts, "
               f"{failed} failed, {seconds:.0f}s; planning {planned:.0f}s):", flush=True)
-        print(f"  {'planner':18s}" + "".join(f"{b:>8s}" for b in BUCKETS) + "  failed*   vs round 0 (all)   >10x better/worse",
+        print(f"  {'planner':26s}" + "".join(f"{b:>8s}" for b in BUCKETS) + "  failed*   vs round 0 (all)   >10x better/worse",
               flush=True)
         for name in names:
             p = summary["planners"][name]
-            line = f"  {name:18s}" + "".join(f"{x:8.3f}" if x is not None else f"{'-':>8s}" for x in p["vs_GNCE_GOO"].values())
+            line = f"  {name:26s}" + "".join(f"{x:8.3f}" if x is not None else f"{'-':>8s}" for x in p["vs_GNCE_GOO"].values())
             line += f"{imputed[name]:9d}"
             if p["vs_round_0"]:
                 line += f"   {p['vs_round_0']['all']:.3f}            {p['vs_round_0_10x'][0]:4d} / {p['vs_round_0_10x'][1]:<4d}"
             print(line, flush=True)
         print("  * plans with a failed count, costed at the query's failed-count bound (2 x its largest count)", flush=True)
         print(f"  per-query C_out / the cheapest plan of any planner at round 0 (fixed reference; the tail):", flush=True)
-        print(f"  {'planner':18s}" + "".join(f"{'p' + str(q):>8s}" for q in PERCENTILES) + f"{'> 2x':>8s}{'> 10x':>8s}", flush=True)
+        print(f"  {'planner':26s}" + "".join(f"{'p' + str(q):>8s}" for q in PERCENTILES) + f"{'> 2x':>8s}{'> 10x':>8s}", flush=True)
         for name in names:
             p = summary["planners"][name]["vs_best_round_0"]
-            print(f"  {name:18s}" + "".join(f"{p['p' + str(q)]:8.2f}" for q in PERCENTILES)
+            print(f"  {name:26s}" + "".join(f"{p['p' + str(q)]:8.2f}" for q in PERCENTILES)
                   + f"{p['>2x']:8.1%}{p['>10x']:8.1%}", flush=True)
         if epi is not None:
             pick = np.random.default_rng(round_index)

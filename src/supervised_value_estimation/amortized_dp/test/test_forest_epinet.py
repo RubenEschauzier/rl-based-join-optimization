@@ -180,3 +180,23 @@ def test_plan_scores_match_the_beam_and_the_training_pass(seed):
     rows = fv.plan_scores(net, ctx, trees, epi, Z)
     assert all(torch.allclose(rows[j], fv.plan_scores(net, ctx, trees, epi, Z[j:j + 1])[0], atol=1e-5) for j in range(3))
     assert torch.allclose(fv.plan_scores(net, ctx, trees, epi, torch.zeros(1, 4))[0], plain, atol=1e-5)
+
+
+@pytest.mark.parametrize("stat", ["mean", "p90"])
+def test_robust_beam(stat):
+    n = 9
+    patterns, nb, degrees = _query(n, 7)
+    encode, _ = _encoder(n, 7)
+    net, epi = _net(7, trained=True), _epinet(7)
+    epi.scale_card.fill_(3.0), epi.scale_value.fill_(2.0)
+    ctx = lambda: fv.QueryContext(n, nb, patterns, degrees, encode)
+    plain = fv.beam_plans(net, ctx(), [1, 8], all_trees=[False, True])[0]
+    same = fv.beam_plans(net, ctx(), [1, 8], all_trees=[False, True],
+                         robust={"epinet": epi, "indexes": torch.zeros(5, 4), "stat": stat})[0]
+    assert same == plain                                       # identical worlds: the plain planner
+    Z = torch.randn(16, 4, generator=torch.Generator().manual_seed(1))
+    trees = fv.beam_plans(net, ctx(), [8], all_trees=[True], robust={"epinet": epi, "indexes": Z, "stat": stat})[0][0]
+    S = fv.plan_scores(net, ctx(), trees, epi, Z)               # the worlds carry each plan's own costs
+    score = S.mean(0) if stat == "mean" else torch.quantile(S, 0.9, dim=0)
+    assert bool((score[1:] >= score[:-1] - 1e-4).all())         # finished trees, cheapest first by the statistic
+    assert all(bushy.is_valid_tree(bushy.canonical(t), n, nb) for t in trees)
