@@ -38,6 +38,16 @@ costs from the counts (the alternatives: beam alternatives, exploration / Thomps
 Training batches and revisits draw queries with p ~ (min(regret, cap) + eps)^alpha, mixed with a uniform floor;
 the training losses weigh each query by its importance weight (N p)^-beta / max (beta annealed to beta_end). A
 query's regret is updated whenever it is executed again. Common offsets of a query (its final result) cancel.
+online.replay.priority "decision" (with the epinet's Thompson beams) uses instead the decision uncertainty
+    D(q) = mean over the Thompson indexes z_j of [ total_zj(T_0) - min_T total_zj(T) ]
+over this execution's plans T (T_0 the deployed one), total_z(T) = fv.plan_scores (the plan's estimated log C_out
+under model z): how much worse the deployed decision is in the sampled worlds; 0 when every sampled model agrees.
+The realized regret is then only logged, with Spearman(D, realized regret) over the executed queries: does the
+decision uncertainty point at the decisions that go wrong?
+With epinet.robust_validation, validation also plans each query with the deployed beam's trees and Thompson beams as
+candidates and picks among them by their scores over epinet.robust_indexes sampled models: "value robust-mean" (the
+expected cost, log mean exp), "value robust-p90" (the 90% quantile), "value cand z=0" (the plain estimate: the
+candidate set alone), and "oracle best cand" (the cheapest by true counts: the ceiling of any choice among them).
 Validation (round 0, then every validation.every_rounds) on the same 2,000 queries as train_plan_loss: "value GOO /
 beam-4 / beam-8" (this planner) next to GNCE GOO / beam-4 / beam-8, and with forest.reference_planners the current
 cardinality model's plain estimator beam-8 and its lattice DP with the hard degree bound. True C_out, geomean vs
@@ -62,6 +72,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from scipy.stats import spearmanr
 from tqdm import tqdm
 
 from src.supervised_value_estimation.amortized_dp import bushy, forest_epinet as fe, forest_value as fv, history_dp, soft_dp
@@ -99,6 +110,12 @@ def realized_regret(deployed, plans, counts, bound):
     if mine is None or not costs:
         return None
     return max(0.0, math.log(max(mine, 1)) - math.log(max(min(costs), 1)))
+
+
+def decision_uncertainty(net, epi, ctx, trees, indexes):
+    """(D, share of indexes whose best plan is not trees[0]): trees[0] the deployed plan, indexes [J, D] Thompson."""
+    S = fv.plan_scores(net, ctx, trees, epi, indexes)                     # [J, T]
+    return float((S[:, 0] - S.min(1).values).mean()), float((S.argmin(1) != 0).float().mean())
 
 
 def replay_probabilities(regrets, alpha, floor, eps, cap):
@@ -177,10 +194,11 @@ def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, gen
 
 @torch.no_grad()
 def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, generator=None, alternatives=False,
-               reference=False, epinet=None, thompson=False):
+               reference=False, epinet=None, thompson=False, details=False):
     """{name: tree} for "beam-w" (with alternatives also "beam-w #i"), "explore-i" and, with reference, the plain
     estimator "est beam-8" and "est DP + bound"; plus the deployed beam's states' candidate merges (masks). With an
-    epinet and thompson, each exploration beam plans with its own epistemic index instead of score noise."""
+    epinet and thompson, each exploration beam plans with its own epistemic index instead of score noise. details:
+    (plans, {"ctx": the QueryContext, "indexes": the exploration beams' indexes [explore, D] or None})."""
     ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, encoder(model, q, device))
     groups = [("GOO" if w == 1 else f"beam-{w}", w, 0.0, alternatives) for w in widths]
     groups += [(f"explore-{i}", widths[-1], 0.0 if thompson else sigma, False) for i in range(explore)]
@@ -203,6 +221,8 @@ def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, gen
         exact = history_dp.single_pattern_logcounts(q.data, s.masks)
         bounded = history_dp.degree_bound(q.patterns, s, torch.where(s.singleton, exact, est).clamp(min=0), degrees)
         plans["est DP + bound"] = soft_dp.hard_plan(s, soft_dp.soft_dp(s, bounded, 0.0)[1])
+    if details:
+        return plans, {"ctx": ctx, "indexes": indexes[len(widths):] if indexes is not None and thompson and explore else None}
     return plans
 
 
@@ -324,12 +344,36 @@ def main(cfg: DictConfig):
         model.eval(), net.eval()
         start = time.perf_counter()
         plans = {}
+        robust = epi is not None and bool(ecfg.robust_validation)
+        oracle = robust and bool(ecfg.robust_oracle)
+        candidates: dict[str, list] = {}
+        robust_gen = torch.Generator(device=device.type).manual_seed(int(online.seed) + 7919)   # the same models every validation
         for v in tqdm(validation, desc="Planning (validation)", file=sys.stdout, mininterval=30):
             ours = plan_query(model, net, v, degrees, device, widths, reference=bool(fcfg.reference_planners))
             plans[v.key] = {(k if k.startswith("est") else f"value {k}"): t for k, t in ours.items()} | gnce_plans[v.key]
+            if robust:
+                cands, det = plan_query(model, net, v, degrees, device, [widths[-1]], int(ecfg.robust_thompson), 0.0,
+                                        robust_gen, True, epinet=epi, thompson=True, details=True)
+                trees = list(dict.fromkeys(bushy.canonical(t) for t in cands.values()))
+                Z = torch.randn(int(ecfg.robust_indexes), epi.index_dim, device=device, generator=robust_gen)
+                S = fv.plan_scores(net, det["ctx"], trees, epi, Z)
+                plain = fv.plan_scores(net, det["ctx"], trees)[0]
+                expected = torch.logsumexp(S.double(), 0)
+                plans[v.key]["value cand z=0"] = trees[int(plain.argmin())]
+                plans[v.key]["value robust-mean"] = trees[int(expected.argmin())]
+                plans[v.key]["value robust-p90"] = trees[int(torch.quantile(S, 0.9, dim=0).argmin())]
+                candidates[v.key] = trees
         planned = time.perf_counter() - start
-        new, failed, seconds = count_missing([(v, [m for t in plans[v.key].values() for m in bushy.internal_masks(t)])
-                                              for v in validation])
+        extra = {k: [m for t in ts for m in bushy.internal_masks(t)] for k, ts in candidates.items()} if oracle else {}
+        new, failed, seconds = count_missing([(v, [m for t in plans[v.key].values() for m in bushy.internal_masks(t)]
+                                               + extra.get(v.key, [])) for v in validation])
+        if oracle:
+            for v in validation:
+                bound = failed_bound(counts[v.key], largest[0])
+                costs = [(plan_cost(t, counts[v.key], bound)[0], i) for i, t in enumerate(candidates[v.key])]
+                costs = [(c, i) for c, i in costs if c is not None]
+                if costs:
+                    plans[v.key]["oracle best cand"] = candidates[v.key][min(costs)[1]]
         names = list(plans[validation[0].key])
         costed = {name: {v.key: plan_cost(plans[v.key][name], counts[v.key], failed_bound(counts[v.key], largest[0]))
                          for v in validation} for name in names}
@@ -420,12 +464,20 @@ def main(cfg: DictConfig):
     prioritized = bool(rcfg.prioritized)
     if prioritized and epi is not None and int(ecfg.train_select_factor) > 1:
         raise ValueError("online.replay.prioritized and epinet.train_select_factor > 1 both choose the training batches")
+    by_decision = prioritized and str(rcfg.priority) == "decision"
+    if by_decision and (epi is None or not bool(ecfg.thompson) or int(online.explore_plans) < 1):
+        raise ValueError("online.replay.priority decision needs the epinet with Thompson exploration beams")
+    if str(rcfg.priority) not in ("decision", "realized"):
+        raise ValueError(f"online.replay.priority: decision or realized, not {rcfg.priority}")
+    decision_of: dict[str, float] = {}                  # query -> decision uncertainty D of its last execution
+    disagree_of: dict[str, float] = {}                  # query -> share of Thompson indexes preferring another plan
     regret_of: dict[str, float] = {}                    # query -> realized regret of its last execution
     deployed_of: dict[str, tuple] = {}                  # query -> its deployed plan in its last execution
 
     def probabilities(keys):
-        top = max(regret_of.values(), default=0.0)       # queries without a regret yet: the largest (seen once)
-        return replay_probabilities([regret_of.get(k, top) for k in keys], float(rcfg.alpha), float(rcfg.floor),
+        table = decision_of if by_decision else regret_of
+        top = max(table.values(), default=0.0)           # queries without a priority yet: the largest (seen once)
+        return replay_probabilities([table.get(k, top) for k in keys], float(rcfg.alpha), float(rcfg.floor),
                                     float(rcfg.eps), float(rcfg.cap))
     tau = float(online.plan_tau)
     next_index = 0
@@ -460,9 +512,12 @@ def main(cfg: DictConfig):
         stream = CountStream(endpoints, float(online.count_timeout_s))
         queued = set()
         for q in tqdm(batch, desc="Planning", file=sys.stdout, mininterval=30):
-            plans = plan_query(model, net, q, degrees, device, [int(online.deployed_width)], int(online.explore_plans),
-                               float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
-                               epinet=epi, thompson=epi is not None and bool(ecfg.thompson))
+            plans, det = plan_query(model, net, q, degrees, device, [int(online.deployed_width)], int(online.explore_plans),
+                                    float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
+                                    epinet=epi, thompson=epi is not None and bool(ecfg.thompson), details=True)
+            if det["indexes"] is not None:                       # decision uncertainty over this execution's plans
+                trees = list(dict.fromkeys([bushy.canonical(plans[deployed])] + [bushy.canonical(t) for t in plans.values()]))
+                decision_of[q.key], disagree_of[q.key] = decision_uncertainty(net, epi, det["ctx"], trees, det["indexes"])
             masks = [m for t in plans.values() for m in bushy.internal_masks(t)]
             if bool(fcfg.count_candidates):
                 masks += candidate_masks(plans[deployed], q)
@@ -503,6 +558,7 @@ def main(cfg: DictConfig):
         while len(seen) > int(online.replay_queries):
             gone = next(iter(seen))
             seen.pop(gone), plans_of.pop(gone, None), parts.pop(gone, None), regret_of.pop(gone, None), deployed_of.pop(gone, None)
+            decision_of.pop(gone, None), disagree_of.pop(gone, None)
 
         t2 = time.perf_counter()
         window = list(seen.values())
@@ -553,7 +609,8 @@ def main(cfg: DictConfig):
             qw = torch.tensor(iw[picked], dtype=torch.float32, device=device) if iw is not None else None
             res = fv.losses(out, tau, qw)
             if prioritized:
-                stats["trained_regret"].append(float(np.mean([regret_of.get(q.key, 0.0) for q in chosen])))
+                stats["trained_regret"].append(float(np.mean([(decision_of if by_decision else regret_of).get(q.key, 0.0)
+                                                              for q in chosen])))
                 stats["is_weight"].append(float(iw[picked].mean()))
             warm = round_index <= int(fcfg.plan_warmup_rounds)      # V learns from its own targets before the plan loss
             loss = sum(w * res[k] for k, w in weights.items() if not (warm and k == "plan"))
@@ -577,6 +634,13 @@ def main(cfg: DictConfig):
                   "build_s": round(t3 - t2, 1),
                   "train_s": round(time.perf_counter() - t3, 1), "window": len(window), "steps": steps,
                   **{k: round(float(np.mean(v)), 4) for k, v in stats.items() if v}}
+        both = [(decision_of[q.key], regret_of[q.key]) for q in batch if q.key in decision_of and q.key in regret_of]
+        if both:
+            d, r = np.array(both).T
+            rho = spearmanr(d, r).statistic if np.std(d) > 0 and np.std(r) > 0 else float("nan")
+            record["decision"] = {"D": round(float(d.mean()), 4), "D>log2": round(float(np.mean(d > math.log(2))), 4),
+                                  "disagree": round(float(np.mean([disagree_of[q.key] for q in batch if q.key in disagree_of])), 4),
+                                  "spearman_D_realized": round(float(rho), 4) if np.isfinite(rho) else None}
         record["executed_regret"] = round(float(np.mean(executed)), 4) if executed else None
         record["executed_regret>log2"] = round(float(np.mean(np.array(executed) > math.log(2))), 4) if executed else None
         if epi is not None:
@@ -593,8 +657,12 @@ def main(cfg: DictConfig):
         if executed:
             replay = (f" | trained on regret {record['trained_regret']:.3f}, importance weight {record['is_weight']:.2f}"
                       if prioritized else "")
+            dec = record.get("decision")
+            dec = "" if dec is None else (f" | decision uncertainty D {dec['D']:.3f} (> log 2 for {dec['D>log2']:.1%}; "
+                                           f"Thompson indexes preferring another plan {dec['disagree']:.1%}), "
+                                           f"Spearman(D, realized regret) {dec['spearman_D_realized'] if dec['spearman_D_realized'] is not None else float('nan'):+.3f}")
             print(f"[round {round_index} regret] executed queries: realized regret {record['executed_regret']:.3f}, "
-                  f"> 2x for {record['executed_regret>log2']:.1%}{replay}", flush=True)
+                  f"> 2x for {record['executed_regret>log2']:.1%}{dec}{replay}", flush=True)
         if epi is not None:
             show = lambda c: "-" if c is None else (f"coverage90 {c['coverage90']:.2f}, Spearman(std, |err|) "
                                                     f"{c['spearman'] if c['spearman'] is not None else float('nan'):.2f}, "

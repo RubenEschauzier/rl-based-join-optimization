@@ -295,6 +295,63 @@ def _merge_fans(a, b, n, touch_s, touch_o, fan):
 
 
 @torch.no_grad()
+def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, indexes=None):
+    """[K, T] the estimated log C_out of finished plans under each index: logsumexp over a tree's joins U of l''_z(U),
+    with l_z(U) = l(U) + epinet.card_shift(phi(U), z) and the bound applied bottom-up along the tree, exactly as the
+    beam does (single patterns: exact counts, not shifted). No index (or z = 0): the planner's own estimate, K = 1.
+    The value net is not involved: it only guides the search; a finished plan's cost is its joins' estimates."""
+    n = ctx.n
+    device = ctx.encoded([1 << i for i in range(n)])[1].device
+    K = 1 if epinet is None or indexes is None else len(indexes)
+    long = dict(dtype=torch.long, device=device)
+    touch_s, touch_o, fan = torch.tensor(ctx.touch_s, **long), torch.tensor(ctx.touch_o, **long), ctx.fan.to(device)
+    node_id: dict = {}                                   # subtree -> node (shared subtrees scored once)
+    nodes = []                                           # (U, child a, child b, height); children -1 = single pattern
+
+    def visit(t):
+        if isinstance(t, int):
+            return ("leaf", t)
+        a, b = visit(t[0]), visit(t[1])
+        key = (a, b)
+        if key not in node_id:
+            ma = 1 << a[1] if a[0] == "leaf" else nodes[a[1]][0]
+            mb = 1 << b[1] if b[0] == "leaf" else nodes[b[1]][0]
+            h = 1 + max(0 if a[0] == "leaf" else nodes[a[1]][3], 0 if b[0] == "leaf" else nodes[b[1]][3])
+            node_id[key] = len(nodes)
+            nodes.append((ma | mb, a, b, h))
+        return ("node", node_id[key])
+    roots = [visit(bushy.canonical(t))[1] for t in trees]
+    singles = ctx.encoded([1 << i for i in range(n)])[1]                   # [n] exact log1p counts
+    l2 = torch.zeros(K, len(nodes), device=device)
+    for h in range(1, max(x[3] for x in nodes) + 1):
+        idx = [i for i, x in enumerate(nodes) if x[3] == h]
+        U = torch.tensor([nodes[i][0] for i in idx], **long)
+        phi_u, l_u = ctx.encoded(U)
+        phi_std = net.standardise(phi_u)
+        l_u = l_u.expand(K, -1)
+        if K > 1 or (epinet is not None and indexes is not None):
+            l_u = l_u + epinet.scale_card * epinet.card_samples(phi_std, indexes.to(device))
+        child = lambda c: singles[c[1]].expand(K) if c[0] == "leaf" else l2[:, c[1]]
+        la = torch.stack([child(nodes[i][1]) for i in idx], 1)
+        lb = torch.stack([child(nodes[i][2]) for i in idx], 1)
+        a = torch.tensor([1 << c[1] if c[0] == "leaf" else nodes[c[1]][0] for c in (nodes[i][1] for i in idx)], **long)
+        b = torch.tensor([1 << c[1] if c[0] == "leaf" else nodes[c[1]][0] for c in (nodes[i][2] for i in idx)], **long)
+        fa, fb = _merge_fans(a, b, n, touch_s, touch_o, fan), _merge_fans(b, a, n, touch_s, touch_o, fan)
+        size = _popcount(U, n) / n
+        out, _ = net.bound(l_u.reshape(-1), la.reshape(-1), lb.reshape(-1), fa.repeat(K, 1), fb.repeat(K, 1),
+                           phi_std.repeat(K, 1), size.repeat(K))
+        l2[:, idx] = out.view(K, len(idx))
+
+    def members_of(i, acc):
+        acc.append(i)
+        for c in (nodes[i][1], nodes[i][2]):
+            if c[0] == "node":
+                members_of(c[1], acc)
+        return acc
+    return torch.stack([torch.logsumexp(l2[:, members_of(r, [])].double(), 1) for r in roots], 1).float()
+
+
+@torch.no_grad()
 def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
                epinet=None, indexes=None):
     """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by

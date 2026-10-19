@@ -30,3 +30,26 @@ def test_replay_probabilities_and_weights():
     w = importance_weights(p, beta=1.0)
     assert np.isclose(w.max(), 1) and np.allclose(w * p, (w * p)[0])   # beta 1: w ~ 1 / p, uniform in expectation
     assert np.allclose(importance_weights(p, beta=0.0), 1)
+
+
+def test_decision_uncertainty():
+    """D is 0 when every index prefers the deployed plan, and the mean log-cost gap to each index's best plan otherwise."""
+    import torch
+    from src.supervised_value_estimation.amortized_dp import forest_value as fv
+    from src.supervised_value_estimation.amortized_dp.online import train_forest_value as t
+    from src.supervised_value_estimation.amortized_dp.test.test_forest_epinet import _epinet
+    from src.supervised_value_estimation.amortized_dp.test.test_forest_value import _encoder, _net, _query
+    n = 8
+    patterns, nb, degrees = _query(n, 1)
+    encode, _ = _encoder(n, 1)
+    net, epi = _net(1, trained=True), _epinet(1)
+    ctx = fv.QueryContext(n, nb, patterns, degrees, encode)
+    trees = fv.beam_plans(net, ctx, [8], all_trees=[True])[0][0]
+    d, share = t.decision_uncertainty(net, epi, ctx, trees, torch.zeros(4, 4))   # z = 0: all agree with the deployed
+    assert d == 0.0 and share == 0.0
+    epi.scale_card.fill_(4.0)
+    Z = torch.randn(6, 4, generator=torch.Generator().manual_seed(0))
+    d, share = t.decision_uncertainty(net, epi, ctx, trees, Z)
+    S = fv.plan_scores(net, ctx, trees, epi, Z)
+    assert math.isclose(d, float((S[:, 0] - S.min(1).values).mean()), rel_tol=1e-6) and d >= 0
+    assert (d > 0) == (share > 0)

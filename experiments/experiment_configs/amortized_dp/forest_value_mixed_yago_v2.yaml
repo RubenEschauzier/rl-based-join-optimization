@@ -14,6 +14,7 @@ online:
   plan_tau: 0.2              # per-step policy temperature over the candidates' log cost-to-go
   replay:                    # regret-based prioritized experience replay (module text of train_forest_value.py)
     prioritized: false
+    priority: decision       # decision: the epinet's decision uncertainty D (needs Thompson beams); realized: true regret
     revisits: true           # also choose the revisited queries by priority (else uniform)
     alpha: 0.6               # p ~ (regret + eps)^alpha
     eps: 0.05                # regret 0 keeps a chance
@@ -49,6 +50,10 @@ epinet:          # forest_epinet.py; off here (forest_value_epinet_mixed_yago_v2
   n_indexes_train: 128       # K (epinet-contrast memory: k ~ 0.80 / sqrt(K) + 0.083)
   max_rows: 2048             # subsets / forests per head per step (a random subset)
   value_target: auto         # value head on W vs W* ("w") or V vs log G ("v"); auto: "w" iff forest.w_loss_weight > 0
+  robust_validation: true    # validation: robust choice among the beam's trees and Thompson plans (module text)
+  robust_thompson: 8         # Thompson beams per validation query for the candidates
+  robust_indexes: 32         # sampled models the candidates are scored under
+  robust_oracle: true        # also count every candidate, for "oracle best cand" (more counts per validation)
   lr: 0.001
   weight: 1.0
   thompson: true             # exploration beams: one epistemic index each instead of N(0, explore_sigma) score noise

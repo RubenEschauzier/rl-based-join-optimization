@@ -147,3 +147,36 @@ def test_value_head_on_the_w_target():
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in epi.value.get_learnable_epinet_params())
     out["g_true"].fill_(float("nan"))                          # V's target plays no part
     assert torch.isfinite(fe.losses(epi, net, out, phi, 0.0, 16, 1000, g, value_target="w")["value"])
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_plan_scores_match_the_beam_and_the_training_pass(seed):
+    n = 8
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    net, epi = _net(seed, trained=True), _epinet(seed)
+    epi.scale_card.fill_(2.0)
+    ctx = fv.QueryContext(n, nb, patterns, degrees, encode)
+    trees = fv.beam_plans(net, ctx, [8], all_trees=[True])[0][0]           # the beam's finished trees, cheapest first
+    plain = fv.plan_scores(net, ctx, trees)[0]
+    assert bool((plain[1:] >= plain[:-1] - 1e-4).all())
+    # the deployed tree's score: logsumexp of l'' over its joins, as the training pass computes them
+    part = fv.build_query_data(n, nb, patterns, degrees, [trees[0]], {}, 10 ** 9)
+    phi, l = encode(part["masks"].tolist())
+    out = fv.forward_batch(net, [part], phi, l, "cpu", 0.5)
+    def joins(i):                                         # the plan's own joins: the root and its descendants
+        return [i] + [j for c in (int(out["node_c1"][i]), int(out["node_c2"][i])) if c >= 0
+                      and int(out["node_height"][c]) >= 1 for j in joins(c)]
+    roots = [i for i in range(len(out["node_mask"])) if int(out["node_mask"][i]) == part["full"]]
+    totals = torch.stack([torch.logsumexp(out["l2"][joins(r)], 0) for r in roots])
+    assert float((totals - plain[0]).abs().min()) < 1e-4
+    # under an index: the Thompson beam's finished trees are in order of their score under that index
+    Z = torch.randn(3, 4, generator=torch.Generator().manual_seed(seed))
+    for j in range(3):
+        tz = fv.beam_plans(net, fv.QueryContext(n, nb, patterns, degrees, encode), [8], all_trees=[True],
+                           epinet=epi, indexes=Z[j:j + 1])[0][0]
+        sz = fv.plan_scores(net, ctx, tz, epi, Z[j:j + 1])[0]
+        assert bool((sz[1:] >= sz[:-1] - 1e-4).all())
+    rows = fv.plan_scores(net, ctx, trees, epi, Z)
+    assert all(torch.allclose(rows[j], fv.plan_scores(net, ctx, trees, epi, Z[j:j + 1])[0], atol=1e-5) for j in range(3))
+    assert torch.allclose(fv.plan_scores(net, ctx, trees, epi, torch.zeros(1, 4))[0], plain, atol=1e-5)
