@@ -197,7 +197,7 @@ def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, gen
 def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, generator=None, alternatives=False,
                reference=False, epinet=None, thompson=False, details=False):
     """{name: tree} for "beam-w" (with alternatives also "beam-w #i"), "explore-i" and, with reference, the plain
-    estimator "est beam-8" and "est DP + bound"; plus the deployed beam's states' candidate merges (masks). With an
+    estimator "est GOO" (greedy, no bound) and "est beam-8", and "est DP + bound"; plus the deployed beam's states' candidate merges (masks). With an
     epinet and thompson, each exploration beam plans with its own epistemic index instead of score noise. details:
     (plans, {"ctx": the QueryContext, "indexes": the exploration beams' indexes [explore, D] or None})."""
     ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, encoder(model, q, device))
@@ -218,7 +218,9 @@ def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, gen
         s = soft_dp.SubsetStructure(q.neighbour_masks, device)
         est = soft_dp.model_subset_logcards(model, q.data, s.masks, device)
         table = dict(zip(s.masks.tolist(), est.tolist()))
-        plans["est beam-8"], _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, lambda ms: [table[m] for m in ms], 8)
+        est_of = lambda ms: [table[m] for m in ms]
+        plans["est GOO"], _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, est_of, 1)
+        plans["est beam-8"], _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, est_of, 8)
         exact = history_dp.single_pattern_logcounts(q.data, s.masks)
         bounded = history_dp.degree_bound(q.patterns, s, torch.where(s.singleton, exact, est).clamp(min=0), degrees)
         plans["est DP + bound"] = soft_dp.hard_plan(s, soft_dp.soft_dp(s, bounded, 0.0)[1])
