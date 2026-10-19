@@ -12,6 +12,15 @@ online:
   l1_weight: 1.0             # the L1 anchor at full weight (run B's 0.1 let the estimates drift)
   plan_weight: 5.0
   plan_tau: 0.2              # per-step policy temperature over the candidates' log cost-to-go
+  replay:                    # regret-based prioritized experience replay (module text of train_forest_value.py)
+    prioritized: false
+    revisits: true           # also choose the revisited queries by priority (else uniform)
+    alpha: 0.6               # p ~ (regret + eps)^alpha
+    eps: 0.05                # regret 0 keeps a chance
+    cap: 4.6                 # regret capped at log 100: failed-count bounds cannot dominate
+    floor: 0.2               # share of the probability spread uniformly
+    beta_start: 0.4          # importance weights (N p)^-beta, beta annealed linearly to beta_end over the rounds
+    beta_end: 1.0
 
 forest:
   degrees: data/term_occurrences/mixed_yago_v2/predicate_degrees.json
@@ -22,6 +31,7 @@ forest:
   bound_hidden: 32
   bound_l1_weight: 1.0       # L1 on the bounded estimates l'' of counted nodes (trains the soft bound)
   value_weight: 1.0          # |V - log G| on forests with a stitched true cost-to-go
+  w_loss_weight: 0.0         # |W - W*|, W* = log(G - (c(Q) + 1)): W's own target (0: off, as before)
   consistency_weight: 0.1    # |V(F) - min over candidates of Q^| (no counts needed)
   plan_warmup_rounds: 2      # no plan regret in the first rounds: V first learns from its own targets
   stop_gradient: true        # the planner reads the backbone's phi and l detached: only L1 trains the backbone
@@ -38,6 +48,7 @@ epinet:          # forest_epinet.py; off here (forest_value_epinet_mixed_yago_v2
   sigma: 0.05                # Gaussian-bootstrap target perturbation, log units
   n_indexes_train: 128       # K (epinet-contrast memory: k ~ 0.80 / sqrt(K) + 0.083)
   max_rows: 2048             # subsets / forests per head per step (a random subset)
+  value_target: auto         # value head on W vs W* ("w") or V vs log G ("v"); auto: "w" iff forest.w_loss_weight > 0
   lr: 0.001
   weight: 1.0
   thompson: true             # exploration beams: one epistemic index each instead of N(0, explore_sigma) score noise

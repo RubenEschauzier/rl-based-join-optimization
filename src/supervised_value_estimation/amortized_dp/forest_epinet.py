@@ -105,10 +105,11 @@ def _anchors(keys, dim, device):
     return anchor_vectors(keys.cpu().numpy(), dim, device=device)
 
 
-def losses(epi, net, out, phi, sigma, n_indexes, max_rows, generator=None):
+def losses(epi, net, out, phi, sigma, n_indexes, max_rows, generator=None, value_target="v"):
     """{"card", "value"}: the epinet losses on a forward_batch(..., hidden=True) result whose parts carry anchor
     keys (anchor_keys); phi the encoder's embeddings it was given. At most max_rows subsets / forests per head (a
-    random subset of them)."""
+    random subset of them). value_target "v": the value head on V_z(F) against log G(F); "w": on W(F) + e_value
+    against W*(F) (out["w_true"]), its own term, when the value net is trained on W* too (forest.w_loss_weight)."""
     device = out["l"].device
     D = epi.index_dim
     Z = torch.randn(n_indexes, D, device=device, generator=generator)
@@ -131,11 +132,15 @@ def losses(epi, net, out, phi, sigma, n_indexes, max_rows, generator=None):
         res["card"] = torch.where(failed, torch.relu(target - pred), (pred - target).abs()).mean()
     else:
         res["card"] = zero
-    known = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
+    truth = out["w_true"] if value_target == "w" else out["g_true"]
+    known = (~torch.isnan(truth) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
     if len(known):
         f = known[pick(len(known))]
-        target = out["g_true"][f] + sigma * (Z @ _anchors(out["forest_keys"][f], D, device).T)
-        pred = forest_value_samples(epi, net, out, phi, f, Z, card_scale=1.0, value_scale=1.0)
+        target = truth[f] + sigma * (Z @ _anchors(out["forest_keys"][f], D, device).T)
+        if value_target == "w":
+            pred = out["W"][f].detach() + epi.value_samples(out["H"][f], Z)
+        else:
+            pred = forest_value_samples(epi, net, out, phi, f, Z, card_scale=1.0, value_scale=1.0)
         res["value"] = (pred - target).abs().mean()
     else:
         res["value"] = zero

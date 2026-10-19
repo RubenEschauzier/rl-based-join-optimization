@@ -129,3 +129,21 @@ def test_value_samples_move_the_query_estimate_with_the_same_index():
     assert bool((w_only >= lq - 1e-5).all())
     joint = fe.forest_value_samples(epi, net, out, phi, f, Z, card_scale=3.0, value_scale=1.0)
     assert bool((joint < lq - 0.1).any())
+
+
+def test_value_head_on_the_w_target():
+    """value_target "w": the value head is fitted to W* and gets a gradient; V's target is not involved."""
+    part, nb, encode = _counted_part(8, 6)
+    part.update(fe.anchor_keys(part, "q"))
+    net, epi = _net(6, trained=True), _epinet(6, trained=False)
+    epi.alpha_value.fill_(0.0)                                 # no prior and a zero last layer: the head adds exactly 0
+    phi, l = encode(part["masks"].tolist())
+    out = fv.forward_batch(net, [part], phi, l, "cpu", 0.5, stop_gradient=True, hidden=True)
+    g = torch.Generator().manual_seed(0)
+    res = fe.losses(epi, net, out, phi, 0.0, 16, 1000, g, value_target="w")
+    ok = ~torch.isnan(out["w_true"])
+    assert torch.isclose(res["value"], (out["W"][ok] - out["w_true"][ok]).abs().mean(), atol=1e-5)
+    res["value"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in epi.value.get_learnable_epinet_params())
+    out["g_true"].fill_(float("nan"))                          # V's target plays no part
+    assert torch.isfinite(fe.losses(epi, net, out, phi, 0.0, 16, 1000, g, value_target="w")["value"])

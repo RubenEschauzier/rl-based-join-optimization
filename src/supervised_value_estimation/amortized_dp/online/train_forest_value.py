@@ -32,6 +32,12 @@ the value; Osband et al. 2023, Wen et al. 2023):
   - training: the epinet losses (forest_epinet.losses, Gaussian bootstrap) next to the planner's, epinet only;
   - calibration: each round on its fresh counts (not yet trained on): coverage of the 90% interval and Spearman of
     std vs |error|, per head; with epinet.sample_scale auto the sample scale is refitted so 90% intervals cover 90%.
+With online.replay.prioritized (regret-based prioritized experience replay, Schaul et al. 2016): after each round's
+counts, every executed query's realized regret = log C_out(its deployed plan) - log min C_out(its counted plans), true
+costs from the counts (the alternatives: beam alternatives, exploration / Thompson plans, earlier rounds' plans).
+Training batches and revisits draw queries with p ~ (min(regret, cap) + eps)^alpha, mixed with a uniform floor;
+the training losses weigh each query by its importance weight (N p)^-beta / max (beta annealed to beta_end). A
+query's regret is updated whenever it is executed again. Common offsets of a query (its final result) cancel.
 Validation (round 0, then every validation.every_rounds) on the same 2,000 queries as train_plan_loss: "value GOO /
 beam-4 / beam-8" (this planner) next to GNCE GOO / beam-4 / beam-8, and with forest.reference_planners the current
 cardinality model's plain estimator beam-8 and its lattice DP with the hard degree bound. True C_out, geomean vs
@@ -82,6 +88,31 @@ def encoder(model, q, device):
     return encode
 
 
+VALUE_CHUNK = 32768        # forests per value-net pass: the fused attention kernel fails above 65,535 in one batch
+
+
+def realized_regret(deployed, plans, counts, bound):
+    """log C_out(deployed) - log min C_out(plans) (true costs from counts; plans include the deployed one), or None."""
+    costs = [plan_cost(t, counts, bound)[0] for t in plans]
+    costs = [c for c in costs if c is not None]
+    mine = plan_cost(deployed, counts, bound)[0]
+    if mine is None or not costs:
+        return None
+    return max(0.0, math.log(max(mine, 1)) - math.log(max(min(costs), 1)))
+
+
+def replay_probabilities(regrets, alpha, floor, eps, cap):
+    """p_i ~ (min(regret_i, cap) + eps)^alpha, mixed with a uniform share `floor`."""
+    pr = (np.clip(np.asarray(regrets, dtype=np.float64), 0.0, cap) + eps) ** alpha
+    return (1 - floor) * pr / pr.sum() + floor / len(pr)
+
+
+def importance_weights(p, beta):
+    """(N p_i)^-beta, normalised by its max (Schaul et al.): corrects non-uniform sampling, never scales up."""
+    w = (len(p) * np.asarray(p)) ** -beta
+    return w / w.max()
+
+
 @torch.no_grad()
 def encode_batch(model, queries, parts, device):
     """The encoder's (phi, l) for the concatenated masks of the parts (single patterns: exact counts)."""
@@ -122,17 +153,23 @@ def card_calibration(model, net, epi, pairs, device, n_indexes=64, generator=Non
 
 
 @torch.no_grad()
-def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, generator=None, chunk=32):
-    """forest_epinet.calibration of the value head on the forests with a stitched G of these parts."""
+def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, generator=None, chunk=32, target="v"):
+    """forest_epinet.calibration of the value head on these parts' forests: target "v" V_z against log G (forests
+    with a stitched G), "w" W + s e_value against W* (forests where W* is defined)."""
     samples, base, true = [], [], []
     Z = torch.randn(n_indexes, epi.index_dim, device=device, generator=generator)
     for s in range(0, len(parts), chunk):
         qs, ps = queries[s:s + chunk], parts[s:s + chunk]
         phi, l = encode_batch(model, qs, ps, device)
-        out = fv.forward_batch(net, ps, phi, l, device, 1.0, True, hidden=True)
-        f = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
-        samples.append(fe.forest_value_samples(epi, net, out, phi, f, Z, float(epi.scale_card), float(epi.scale_value)))
-        base.append(out["V"][f]), true.append(out["g_true"][f])
+        out = fv.forward_batch(net, ps, phi, l, device, 1.0, True, value_chunk=VALUE_CHUNK, hidden=True)
+        if target == "w":
+            f = (~torch.isnan(out["w_true"])).nonzero().squeeze(1)
+            samples.append(out["W"][f] + epi.scale_value * epi.value_samples(out["H"][f], Z))
+            base.append(out["W"][f]), true.append(out["w_true"][f])
+        else:
+            f = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
+            samples.append(fe.forest_value_samples(epi, net, out, phi, f, Z, float(epi.scale_card), float(epi.scale_value)))
+            base.append(out["V"][f]), true.append(out["g_true"][f])
     if not samples:
         return None
     return fe.calibration(torch.cat(samples, 1), torch.cat(base), torch.cat(true))
@@ -374,7 +411,22 @@ def main(cfg: DictConfig):
     plans_of: dict[str, list] = {}                       # query -> counted plans (canonical, most recent last)
     parts: dict[str, tuple] = {}                         # query -> (build_query_data part, counts seen, plans seen)
     weights = {"l1_raw": float(online.l1_weight), "l1_bound": float(fcfg.bound_l1_weight), "value": float(fcfg.value_weight),
-               "plan": float(online.plan_weight), "consistency": float(fcfg.consistency_weight)}
+               "w": float(fcfg.w_loss_weight), "plan": float(online.plan_weight), "consistency": float(fcfg.consistency_weight)}
+    value_target = "v"
+    if epi is not None:
+        value_target = ("w" if float(fcfg.w_loss_weight) > 0 else "v") if str(ecfg.value_target) == "auto" else str(ecfg.value_target)
+        print(f"Epinet value head target: {'W against W*' if value_target == 'w' else 'V against log G'}", flush=True)
+    rcfg = online.replay
+    prioritized = bool(rcfg.prioritized)
+    if prioritized and epi is not None and int(ecfg.train_select_factor) > 1:
+        raise ValueError("online.replay.prioritized and epinet.train_select_factor > 1 both choose the training batches")
+    regret_of: dict[str, float] = {}                    # query -> realized regret of its last execution
+    deployed_of: dict[str, tuple] = {}                  # query -> its deployed plan in its last execution
+
+    def probabilities(keys):
+        top = max(regret_of.values(), default=0.0)       # queries without a regret yet: the largest (seen once)
+        return replay_probabilities([regret_of.get(k, top) for k in keys], float(rcfg.alpha), float(rcfg.floor),
+                                    float(rcfg.eps), float(rcfg.cap))
     tau = float(online.plan_tau)
     next_index = 0
     if online.validation.at_start:
@@ -382,7 +434,9 @@ def main(cfg: DictConfig):
     for round_index in range(1, int(online.rounds) + 1):
         t0 = time.perf_counter()
         n_revisit = min(int(round(float(online.revisit_fraction) * int(online.queries_per_round))), len(seen))
-        batch = [seen[k] for k in rng.choice(list(seen), n_revisit, replace=False)] if n_revisit else []
+        keys = list(seen)
+        p_revisit = probabilities(keys) if prioritized and bool(rcfg.revisits) and keys else None
+        batch = [seen[k] for k in rng.choice(keys, n_revisit, replace=False, p=p_revisit)] if n_revisit else []
         model.eval(), net.eval()
         n_new = int(online.queries_per_round) - len(batch)
         factor = int(ecfg.select_pool_factor) if epi is not None else 1
@@ -417,6 +471,7 @@ def main(cfg: DictConfig):
                      if m not in known and (q.key, m) not in queued]
             queued.update(key for key, _ in tasks)
             stream.add(tasks)                                    # counted while the next queries are planned
+            deployed_of[q.key] = bushy.canonical(plans[deployed])
             known = plans_of.setdefault(q.key, [])
             for t in plans.values():
                 c = bushy.canonical(t)
@@ -428,6 +483,11 @@ def main(cfg: DictConfig):
         results = stream.finish()
         new, failed, count_s = store_counts(results), sum(v is None for v in results.values()), stream.seconds
         count_wait = time.perf_counter() - t1
+        for q in batch:                                  # realized regret of this execution (true costs)
+            r = realized_regret(deployed_of[q.key], plans_of[q.key], counts[q.key], failed_bound(counts[q.key], largest[0]))
+            if r is not None:
+                regret_of[q.key] = r
+        executed = [regret_of[q.key] for q in batch if q.key in regret_of]
         cal_card = cal_value = None
         if epi is not None:                              # this round's counts: not trained on yet
             fresh: dict[str, dict] = {}
@@ -442,7 +502,7 @@ def main(cfg: DictConfig):
             seen[q.key] = q
         while len(seen) > int(online.replay_queries):
             gone = next(iter(seen))
-            seen.pop(gone), plans_of.pop(gone, None), parts.pop(gone, None)
+            seen.pop(gone), plans_of.pop(gone, None), parts.pop(gone, None), regret_of.pop(gone, None), deployed_of.pop(gone, None)
 
         t2 = time.perf_counter()
         window = list(seen.values())
@@ -457,7 +517,7 @@ def main(cfg: DictConfig):
         if epi is not None:
             fresh_q = [q for q in batch if q.key in new_keys][:256]
             cal_value = value_calibration(model, net, epi, fresh_q, [parts[q.key][0] for q in fresh_q], device,
-                                          generator=generator)
+                                          generator=generator, target=value_target)
             if str(ecfg.sample_scale) == "auto":
                 epi.scale_value.fill_(fe.fit_scale(float(epi.scale_value), cal_value))
             if int(ecfg.train_select_factor) > 1:
@@ -466,15 +526,21 @@ def main(cfg: DictConfig):
         t3 = time.perf_counter()
         model.train(), net.train()
         steps = max(1, int(float(online.gradient_passes_per_round) * len(window) / int(online.queries_per_batch)))
-        stats = {k: [] for k in ("loss", "l1_raw", "l1_bound", "value", "plan", "floor", "consistency", "choice",
-                                 "epinet_card", "epinet_value")}
+        stats = {k: [] for k in ("loss", "l1_raw", "l1_bound", "value", "w", "plan", "floor", "consistency", "choice",
+                                 "epinet_card", "epinet_value", "trained_regret", "is_weight")}
         B = min(int(online.queries_per_batch), len(window))
+        p_train = iw = None
+        if prioritized:
+            p_train = probabilities([q.key for q in window])
+            frac = (round_index - 1) / max(int(online.rounds) - 1, 1)
+            beta = float(rcfg.beta_start) + (float(rcfg.beta_end) - float(rcfg.beta_start)) * frac
+            iw = importance_weights(p_train, beta)
         for _ in range(steps):
             if priority_w is not None:                   # the top B of f x B window queries by priority
                 cand = rng.choice(len(window), min(int(ecfg.train_select_factor) * B, len(window)), replace=False)
                 picked = cand[np.argsort(-priority_w[cand], kind="stable")[:B]]
             else:
-                picked = rng.choice(len(window), B, replace=False)
+                picked = rng.choice(len(window), B, replace=False, p=p_train)
             chosen = [window[k] for k in picked]
             batch_parts = [parts[q.key][0] for q in chosen]
             x = multi_query_batch([(q, p["masks"].to(device)) for q, p in zip(chosen, batch_parts)], device)
@@ -482,14 +548,20 @@ def main(cfg: DictConfig):
             m_all = torch.cat([p["masks"] for p in batch_parts]).to(device)
             exact = torch.cat([history_dp.single_pattern_logcounts(q.data, p["masks"].to(device)) for q, p in zip(chosen, batch_parts)])
             l_b = torch.where((m_all & (m_all - 1)) == 0, exact, l_b)
-            out = fv.forward_batch(net, batch_parts, phi_b, l_b, device, tau, bool(fcfg.stop_gradient), hidden=epi is not None)
-            res = fv.losses(out, tau)
+            out = fv.forward_batch(net, batch_parts, phi_b, l_b, device, tau, bool(fcfg.stop_gradient),
+                                   value_chunk=VALUE_CHUNK, hidden=epi is not None)
+            qw = torch.tensor(iw[picked], dtype=torch.float32, device=device) if iw is not None else None
+            res = fv.losses(out, tau, qw)
+            if prioritized:
+                stats["trained_regret"].append(float(np.mean([regret_of.get(q.key, 0.0) for q in chosen])))
+                stats["is_weight"].append(float(iw[picked].mean()))
             warm = round_index <= int(fcfg.plan_warmup_rounds)      # V learns from its own targets before the plan loss
             loss = sum(w * res[k] for k, w in weights.items() if not (warm and k == "plan"))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if epi is not None:                          # its inputs are detached: a separate, smaller graph
-                eres = fe.losses(epi, net, out, phi_b, float(ecfg.sigma), int(ecfg.n_indexes_train), int(ecfg.max_rows), generator)
+                eres = fe.losses(epi, net, out, phi_b, float(ecfg.sigma), int(ecfg.n_indexes_train), int(ecfg.max_rows), generator,
+                                 value_target=value_target)
                 (float(ecfg.weight) * (eres["card"] + eres["value"])).backward()
                 stats["epinet_card"].append(float(eres["card"])), stats["epinet_value"].append(float(eres["value"]))
             torch.nn.utils.clip_grad_norm_(trainable, float(online.grad_clip))
@@ -497,7 +569,7 @@ def main(cfg: DictConfig):
                 torch.nn.utils.clip_grad_norm_(epi.trainable(), float(online.grad_clip))
             optimizer.step()
             stats["loss"].append(float(loss))
-            for k in ("l1_raw", "l1_bound", "value", "plan", "floor", "consistency"):
+            for k in ("l1_raw", "l1_bound", "value", "w", "plan", "floor", "consistency"):
                 stats[k].append(float(res[k]))
             stats["choice"].append(res["states_with_choice"] / max(res["states"], 1))
         record = {"round": round_index, "queries": len(batch), "revisited": n_revisit, "counted": new, "failed": failed,
@@ -505,17 +577,24 @@ def main(cfg: DictConfig):
                   "build_s": round(t3 - t2, 1),
                   "train_s": round(time.perf_counter() - t3, 1), "window": len(window), "steps": steps,
                   **{k: round(float(np.mean(v)), 4) for k, v in stats.items() if v}}
+        record["executed_regret"] = round(float(np.mean(executed)), 4) if executed else None
+        record["executed_regret>log2"] = round(float(np.mean(np.array(executed) > math.log(2))), 4) if executed else None
         if epi is not None:
             record["epinet"] = {"scale_card": round(float(epi.scale_card), 4), "scale_value": round(float(epi.scale_value), 4),
                                 "fresh_card": cal_card, "fresh_value": cal_value, "selection": selection}
         with open(run_directory / "rounds.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
         print(f"[round {round_index}] {new:,} counts ({failed} failed) in {count_s:.0f}s | {steps} steps: L1 {record['l1_raw']:.3f} "
-              f"(bounded {record['l1_bound']:.3f}), value {record['value']:.3f}, plan regret {record['plan']:.3f} (floor "
+              f"(bounded {record['l1_bound']:.3f}), value {record['value']:.3f} (W {record['w']:.3f}), plan regret {record['plan']:.3f} (floor "
               f"{record['floor']:.3f}), consistency {record['consistency']:.3f}, states with a counted choice "
               f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s (+{count_wait:.0f}s waiting for counts), build "
               f"{record['build_s']:.0f}s, train "
               f"{record['train_s']:.0f}s | window {len(window):,}", flush=True)
+        if executed:
+            replay = (f" | trained on regret {record['trained_regret']:.3f}, importance weight {record['is_weight']:.2f}"
+                      if prioritized else "")
+            print(f"[round {round_index} regret] executed queries: realized regret {record['executed_regret']:.3f}, "
+                  f"> 2x for {record['executed_regret>log2']:.1%}{replay}", flush=True)
         if epi is not None:
             show = lambda c: "-" if c is None else (f"coverage90 {c['coverage90']:.2f}, Spearman(std, |err|) "
                                                     f"{c['spearman'] if c['spearman'] is not None else float('nan'):.2f}, "

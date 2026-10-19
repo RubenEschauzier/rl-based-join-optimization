@@ -326,3 +326,32 @@ def test_chunked_value_pass_is_the_same():
         grads.append(torch.cat([p.grad.flatten() for p in net.parameters() if p.grad is not None]))
         grads.append(res["value"].detach())
     assert torch.allclose(grads[0], grads[2], atol=1e-6) and torch.allclose(grads[1], grads[3])
+
+
+def test_w_target_is_the_cost_to_go_without_the_final_result():
+    """W*(F) = log(G(F) - (c(Q) + 1)): with it, logaddexp(log1p c(Q), W*) gives back log G, wherever it is defined."""
+    part, nb, encode = _counted_part(8, 6)
+    assert not math.isnan(float(part["full_true"]))
+    phi, l = encode(part["masks"].tolist())
+    out = fv.forward_batch(_net(6, trained=True), [part], phi, l, "cpu", 0.5)
+    ok = ~torch.isnan(out["w_true"])
+    assert bool(ok.any()) and bool((out["forest_k"][ok] >= 3).all())
+    back = torch.logaddexp(out["forest_full_true"][ok], out["w_true"][ok])
+    assert torch.allclose(back, out["g_true"][ok], atol=1e-4)
+    res = fv.losses(out, 0.5)
+    assert torch.isclose(res["w"], (out["W"][ok] - out["w_true"][ok]).abs().mean())
+
+
+def test_query_weights():
+    """Weights 1 give the unweighted losses; weight 0 on a query gives the losses of the other query alone."""
+    net = _net(2, trained=True)
+    (p1, _, e1), (p2, _, e2) = _counted_part(7, 2), _counted_part(6, 3)
+    phi = torch.cat([e1(p1["masks"].tolist())[0], e2(p2["masks"].tolist())[0]])
+    l = torch.cat([e1(p1["masks"].tolist())[1], e2(p2["masks"].tolist())[1]])
+    both = fv.forward_batch(net, [p1, p2], phi, l, "cpu", 0.5)
+    alone = fv.losses(fv.forward_batch(net, [p1], *e1(p1["masks"].tolist()), "cpu", 0.5), 0.5)
+    plain, ones = fv.losses(both, 0.5), fv.losses(both, 0.5, torch.ones(2))
+    masked = fv.losses(both, 0.5, torch.tensor([1.0, 0.0]))
+    for key in ("l1_raw", "l1_bound", "value", "w", "plan", "consistency"):
+        assert torch.isclose(plain[key], ones[key], atol=1e-6), key
+        assert torch.isclose(masked[key], alone[key], atol=1e-5), key

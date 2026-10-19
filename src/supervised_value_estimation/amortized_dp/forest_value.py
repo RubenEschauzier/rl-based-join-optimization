@@ -32,9 +32,13 @@ Training (losses, on counted plans): per state F on a counted plan, its candidat
    plan     log E_{p}[exp Q] - min Q over the candidates with a known Q,  p = softmax(-Q^ / tau) over them:
             the per-step soft Bellman form of the diff-DP plan loss; gradients reach l'' (backbone, bound) and V
    value    |V(F) - log G(F)| on forests with a known G (3+ components)
+   w        |W(F) - W*(F)|, W*(F) = log( G(F) - (c(Q) + 1) ) the true remaining joins without the final result:
+            W's own target (through V, W gets almost no gradient where the final result dominates G);
+            forests with a known G, a counted Q and G(F) > c(Q) + 1
    l1       |l - log1p count| on counted subsets, and the same on l'' of counted nodes (one-sided for failed counts)
    consistency  |V(F) - min_m Q^(m)| (target detached) on states with 3+ components (no counts needed)
-(build_query_data, forward_batch, losses). Everything is in log1p space, as the cardinality model. With stop_gradient
+(build_query_data, forward_batch, losses; per-query weights, e.g. importance weights of prioritized replay, scale
+each query's terms). Everything is in log1p space, as the cardinality model. With stop_gradient
 the planner reads the encoder's phi and l detached: only the L1 on l trains the encoder.
 """
 from __future__ import annotations
@@ -507,7 +511,8 @@ def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, faile
             "state_forest": state_forest, "cand": cand, "q_true": q_true,
             "raw_index": torch.tensor([index[m] for m in raw_masks], dtype=torch.long),
             "raw_true": torch.tensor([true_of[m] for m in raw_masks]),
-            "raw_failed": torch.tensor([counts[m] is None for m in raw_masks])}
+            "raw_failed": torch.tensor([counts[m] is None for m in raw_masks]),
+            "full_true": torch.tensor(math.log1p(counts[(1 << n) - 1]) if counts.get((1 << n) - 1) is not None else math.nan)}
 
 
 def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=False, value_chunk=None, hidden=False):
@@ -515,8 +520,9 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     for the concatenation of the parts' `masks` (single patterns: exact counts). Returns a dict of tensors.
     stop_gradient: the planner reads phi and l detached, so the plan, value, consistency and bounded-L1 losses stop
     at its inputs and only the L1 on l ("l" in the result) reaches the encoder. value_chunk: V in chunks of this many forests, with gradients under
-    activation checkpointing (same result; memory of one chunk instead of the batch). hidden: also "W" and "H" (the
-    value net's query-token state) per forest, for the epinet; parts' "raw_keys" / "forest_keys" pass through."""
+    activation checkpointing (same result; memory of one chunk instead of the batch; also keeps a pass below the
+    fused attention kernel's batch limit). Always "W" and "w_true" (W*, nan where undefined) per forest; hidden: also
+    "H" (the value net's query-token state), for the epinet; parts' "raw_keys" / "forest_keys" pass through."""
     l_raw = l
     if stop_gradient:
         phi, l = phi.detach(), l.detach()
@@ -524,8 +530,9 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     width = max(p["n"] for p in parts)
     cat = {key: [] for key in ("node_mask", "node_c1", "node_c2", "node_height", "node_size", "fa", "fb",
                                "node_true", "node_failed", "forest_nodes", "forest_adj", "forest_k", "g_true", "forest_q",
-                               "state_forest", "cand", "q_true", "raw_index", "raw_true", "raw_failed", "forest_n")}
-    for p in parts:
+                               "state_forest", "cand", "q_true", "raw_index", "raw_true", "raw_failed", "forest_n",
+                               "forest_full_true", "raw_part", "node_part", "forest_part", "state_part")}
+    for i, p in enumerate(parts):
         N, Fn, n = len(p["node_mask"]), len(p["forest_nodes"]), p["n"]
         cat["node_mask"].append(p["node_mask"] + off_m)
         cat["node_c1"].append(torch.where(p["node_c1"] >= 0, p["node_c1"] + off_n, p["node_c1"]))
@@ -540,6 +547,11 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
         adj[:, :n, :n] = p["forest_adj"]
         cat["forest_adj"].append(adj)
         cat["forest_q"].append(torch.full((Fn,), p["full"] + off_m))
+        cat["forest_full_true"].append(p["full_true"].float().expand(Fn) if "full_true" in p else torch.full((Fn,), math.nan))
+        cat["raw_part"].append(torch.full((len(p["raw_index"]),), i))
+        cat["node_part"].append(torch.full((N,), i))
+        cat["forest_part"].append(torch.full((Fn,), i))
+        cat["state_part"].append(torch.full((len(p["state_forest"]),), i))
         cat["forest_n"].append(torch.full((Fn,), n))
         cat["state_forest"].append(p["state_forest"] + off_f)
         c = p["cand"].clone()
@@ -578,16 +590,19 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     k = b["forest_k"]
     query = torch.cat([phi_std[b["forest_q"]], (l[b["forest_q"]] / 10)[:, None], (k / b["forest_n"])[:, None]], 1)
     args = (tokens, ~valid, b["forest_adj"], query, l[b["forest_q"]], k)
-    call = (lambda *a: net.values(*a, return_hidden=True)) if hidden else net.values
+    call = lambda *a: net.values(*a, return_hidden=True)
     if value_chunk and len(fn) > value_chunk:
         run = (lambda *a: checkpoint(call, *a, use_reentrant=False)) if torch.is_grad_enabled() else call
         outs = [run(*(a[s:s + value_chunk] for a in args)) for s in range(0, len(fn), value_chunk)]
-        res = tuple(torch.cat(t) for t in zip(*outs)) if hidden else torch.cat(outs)
+        V, W, H = (torch.cat(t) for t in zip(*outs))
     else:
-        res = call(*args)
-    V, W, H = res if hidden else (res, None, None)
+        V, W, H = call(*args)
+    b["W"] = W
     if hidden:
-        b["W"], b["H"] = W, H
+        b["H"] = H
+    g, ft = b["g_true"], b["forest_full_true"]                  # W*(F) = log(G(F) - (c(Q) + 1)), where defined
+    ok = ~torch.isnan(g) & ~torch.isnan(ft) & (k >= 3) & (g - ft > 1e-3)
+    b["w_true"] = torch.where(ok, g + torch.log(-torch.expm1(-(g - ft).clamp(min=1e-3))), torch.full_like(g, math.nan))
     for key in ("raw_keys", "forest_keys"):
         if all(key in p for p in parts):
             b[key] = torch.cat([p[key] for p in parts]).to(device)
@@ -605,19 +620,29 @@ def _segment_logsumexp(x, seg, size):
     return safe + torch.log(total)
 
 
-def losses(out, tau):
-    """{l1_raw, l1_bound, value, plan, floor, consistency} means (0 when empty) and coverage counts."""
+def losses(out, tau, weights=None):
+    """{l1_raw, l1_bound, value, w, plan, floor, consistency} means (0 when empty) and coverage counts. weights [P]:
+    per query (part) of the batch, each term a weighted mean over its rows (None: all 1)."""
     zero = out["l"].sum() * 0
     res = {}
 
-    def l1(est, true, failed):
-        err = torch.where(failed, torch.relu(true - est), (est - true).abs())
-        return err.mean() if len(err) else zero
-    res["l1_raw"] = l1(out["l"][out["raw_index"]], out["raw_true"], out["raw_failed"])
+    def mean(x, part):
+        if not len(x):
+            return zero
+        if weights is None:
+            return x.mean()
+        w = weights[part]
+        return (x * w).sum() / w.sum().clamp(min=1e-12)
+
+    def l1(est, true, failed, part):
+        return mean(torch.where(failed, torch.relu(true - est), (est - true).abs()), part)
+    res["l1_raw"] = l1(out["l"][out["raw_index"]], out["raw_true"], out["raw_failed"], out["raw_part"])
     known = ~torch.isnan(out["node_true"])
-    res["l1_bound"] = l1(out["l2"][known], out["node_true"][known], out["node_failed"][known])
+    res["l1_bound"] = l1(out["l2"][known], out["node_true"][known], out["node_failed"][known], out["node_part"][known])
     vk = ~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)
-    res["value"] = (out["V"][vk] - out["g_true"][vk]).abs().mean() if bool(vk.any()) else zero
+    res["value"] = mean((out["V"][vk] - out["g_true"][vk]).abs(), out["forest_part"][vk])
+    wk = ~torch.isnan(out["w_true"])
+    res["w"] = mean((out["W"][wk] - out["w_true"][wk]).abs(), out["forest_part"][wk])
 
     cand = out["cand"]
     S = len(out["state_forest"])
@@ -632,15 +657,16 @@ def losses(out, tau):
         def regret(scores):
             lp = -scores / tau - _segment_logsumexp(-scores / tau, seg, S)[seg]
             return (_segment_logsumexp(lp + qt, seg, S) - best)[has]
-        res["plan"] = regret(qh).mean()
+        part = out["state_part"][has]
+        res["plan"] = mean(regret(qh), part)
         with torch.no_grad():
-            res["floor"] = regret(qt).mean()
+            res["floor"] = mean(regret(qt), part)
     else:
         res["plan"], res["floor"] = zero, zero
     sk = out["forest_k"][out["state_forest"]] >= 3
     if bool(sk.any()):
         target = torch.full((S,), math.inf, device=cand.device).scatter_reduce(0, cand[:, 0], out["q_hat"].detach(), "amin")
-        res["consistency"] = (out["V"][out["state_forest"]][sk] - target[sk]).abs().mean()
+        res["consistency"] = mean((out["V"][out["state_forest"]][sk] - target[sk]).abs(), out["state_part"][sk])
     else:
         res["consistency"] = zero
     res["states_with_choice"] = int((n_known >= 2).sum())
