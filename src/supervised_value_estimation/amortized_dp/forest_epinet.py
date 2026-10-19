@@ -134,13 +134,22 @@ def losses(epi, net, out, phi, sigma, n_indexes, max_rows, generator=None):
     known = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
     if len(known):
         f = known[pick(len(known))]
-        W, lq = out["W"][f].detach(), out["l"][out["forest_q"][f]].detach()
         target = out["g_true"][f] + sigma * (Z @ _anchors(out["forest_keys"][f], D, device).T)
-        pred = torch.logaddexp(lq, W + epi.value_samples(out["H"][f], Z))
+        pred = forest_value_samples(epi, net, out, phi, f, Z, card_scale=1.0, value_scale=1.0)
         res["value"] = (pred - target).abs().mean()
     else:
         res["value"] = zero
     return res
+
+
+def forest_value_samples(epi, net, out, phi, f, Z, card_scale, value_scale):
+    """V_z(F) [K, len(f)] = logaddexp(l_z(Q), W(F) + value_scale * e_value(h_F, z)) with l_z(Q) = l(Q) + card_scale *
+    e_card(phi_Q, z): l(Q) moves with the same z, as in planning (beam_plans), so V_z can fall below l(Q). The
+    subset head's part is detached (the value loss trains only the value head). Unlike planning, the forest's own
+    component estimates are not shifted (W is computed once, not per z)."""
+    q = out["forest_q"][f]
+    lq_z = out["l"][q].detach() + card_scale * epi.card_samples(net.standardise(phi[q]), Z).detach()
+    return torch.logaddexp(lq_z, out["W"][f].detach() + value_scale * epi.value_samples(out["H"][f], Z))
 
 
 @torch.no_grad()
@@ -208,9 +217,10 @@ def scaled_card_samples(epi, net, phi, l, Z):
     return l[None] + epi.scale_card * epi.card_samples(net.standardise(phi), Z)
 
 
-def fit_scale(current, cal, lo=0.5, hi=20.0, step=0.5):
+def fit_scale(current, cal, lo=0.5, hi=5.0, step=0.5):
     """The sample scale after a calibration: a step of `step` in log space from the current scale towards the
-    fitted one (the epinet trains meanwhile, so a full step overshoots), clamped to [lo, hi]."""
+    fitted one (the epinet trains meanwhile, so a full step overshoots), clamped to [lo, hi]. A scale stuck at hi
+    means the head cannot express the spread asked of it (the round log shows it)."""
     if cal is None or not np.isfinite(cal["fitted_scale"]) or cal["fitted_scale"] <= 0:
         return current
     return float(min(max(current * cal["fitted_scale"] ** step, lo), hi))

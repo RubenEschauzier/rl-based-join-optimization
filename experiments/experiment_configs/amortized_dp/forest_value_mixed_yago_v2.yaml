@@ -43,5 +43,6 @@ epinet:          # forest_epinet.py; off here (forest_value_epinet_mixed_yago_v2
   thompson: true             # exploration beams: one epistemic index each instead of N(0, explore_sigma) score noise
   sample_scale: auto         # refit each round on fresh counts towards 90% coverage of 90% intervals (half steps); or a number
   select_pool_factor: 4      # count the top 1/4 of 4x as many new candidate queries by priority (1: no selection)
-  train_select_factor: 2     # train on the top 1/2 of 2x as many window queries per batch (1: uniform)
+  train_select_factor: 1     # f > 1: train on the top 1/f of f x as many window queries per batch. Off: the top-k
+                             # left about half the window untrained while validation is uniform (17-10 run)
   n_indexes_priority: 32

@@ -131,8 +131,7 @@ def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, gen
         phi, l = encode_batch(model, qs, ps, device)
         out = fv.forward_batch(net, ps, phi, l, device, 1.0, True, hidden=True)
         f = (~torch.isnan(out["g_true"]) & (out["forest_k"] >= 3)).nonzero().squeeze(1)
-        lq = out["l"][out["forest_q"][f]]
-        samples.append(torch.logaddexp(lq, out["W"][f] + epi.scale_value * epi.value_samples(out["H"][f], Z)))
+        samples.append(fe.forest_value_samples(epi, net, out, phi, f, Z, float(epi.scale_card), float(epi.scale_value)))
         base.append(out["V"][f]), true.append(out["g_true"][f])
     if not samples:
         return None
@@ -370,7 +369,7 @@ def main(cfg: DictConfig):
     if epi is not None:
         groups.append({"params": epi.trainable(), "lr": float(ecfg.lr)})
     optimizer = torch.optim.AdamW(groups, weight_decay=float(online.weight_decay))
-    trainable = [p for g in groups for p in g["params"]]
+    trainable = list(model.parameters()) + list(net.parameters())   # the epinet is clipped on its own
     seen: dict[str, Query] = {}
     plans_of: dict[str, list] = {}                       # query -> counted plans (canonical, most recent last)
     parts: dict[str, tuple] = {}                         # query -> (build_query_data part, counts seen, plans seen)
@@ -494,6 +493,8 @@ def main(cfg: DictConfig):
                 (float(ecfg.weight) * (eres["card"] + eres["value"])).backward()
                 stats["epinet_card"].append(float(eres["card"])), stats["epinet_value"].append(float(eres["value"]))
             torch.nn.utils.clip_grad_norm_(trainable, float(online.grad_clip))
+            if epi is not None:
+                torch.nn.utils.clip_grad_norm_(epi.trainable(), float(online.grad_clip))
             optimizer.step()
             stats["loss"].append(float(loss))
             for k in ("l1_raw", "l1_bound", "value", "plan", "floor", "consistency"):

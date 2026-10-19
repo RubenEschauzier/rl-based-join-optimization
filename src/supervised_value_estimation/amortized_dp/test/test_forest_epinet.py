@@ -110,3 +110,22 @@ def test_calibration_of_a_calibrated_head():
     assert abs(cal["coverage90"] - 0.9) < 0.03 and abs(cal["fitted_scale"] - 1) < 0.1 and cal["spearman"] > 0.3
     cal = fe.calibration(base + 0.25 * std * torch.randn(K, N, generator=g), base, true)       # 4x too narrow
     assert cal["coverage90"] < 0.5 and abs(fe.fit_scale(1.0, cal, step=1.0) - 4) < 0.5 and abs(fe.fit_scale(1.0, cal) - 2) < 0.3
+
+
+def test_value_samples_move_the_query_estimate_with_the_same_index():
+    """V_z shifts l(Q) with the same z as W (as planning does): at zero scales it is the plain V, and with the subset
+    head on it can fall below l(Q), which a shift of W alone never can."""
+    part, nb, encode = _counted_part(7, 4)
+    net, epi = _net(4, trained=True), _epinet(4)
+    phi, l = encode(part["masks"].tolist())
+    out = fv.forward_batch(net, [part], phi, l, "cpu", 0.5, stop_gradient=True, hidden=True)
+    f = (out["forest_k"] >= 3).nonzero().squeeze(1)
+    assert len(f)
+    Z = torch.randn(64, 4, generator=torch.Generator().manual_seed(0))
+    plain = fe.forest_value_samples(epi, net, out, phi, f, Z, card_scale=0.0, value_scale=0.0)
+    assert torch.allclose(plain, out["V"][f].expand_as(plain), atol=1e-5)
+    lq = out["l"][out["forest_q"][f]]
+    w_only = fe.forest_value_samples(epi, net, out, phi, f, Z, card_scale=0.0, value_scale=5.0)
+    assert bool((w_only >= lq - 1e-5).all())
+    joint = fe.forest_value_samples(epi, net, out, phi, f, Z, card_scale=3.0, value_scale=1.0)
+    assert bool((joint < lq - 0.1).any())
