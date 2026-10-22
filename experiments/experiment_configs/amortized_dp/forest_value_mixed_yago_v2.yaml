@@ -12,6 +12,7 @@ online:
   l1_weight: 1.0             # the L1 anchor at full weight (run B's 0.1 let the estimates drift)
   plan_weight: 5.0
   plan_tau: 0.2              # per-step policy temperature over the candidates' log cost-to-go
+  build_workers: 8           # processes building the training parts of a round's new / changed queries (0: serial)
   replay:                    # regret-based prioritized experience replay (module text of train_forest_value.py)
     prioritized: false
     priority: decision       # decision: the epinet's decision uncertainty D (needs Thompson beams); realized: true regret

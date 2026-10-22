@@ -383,3 +383,27 @@ def test_planning_from_a_forest_on_the_greedy_path_continues_the_greedy_plan(see
         trees[new] = (trees.pop(a), trees.pop(b))
         got, _ = fv.beam_plans(net, ctx(), [1], start=list(trees.values()))
         assert bushy.canonical(got[0][0]) == bushy.canonical(greedy[0])
+
+
+def test_part_builder_workers_match_serial():
+    from src.supervised_value_estimation.amortized_dp.online.train_forest_value import PartBuilder
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks
+    jobs, degrees = [], None
+    for seed, n in enumerate((5, 6, 7, 8)):
+        patterns, nb, degrees = _query(n, seed)
+        trees = [fv.beam_plan(_net(seed), fv.QueryContext(n, nb, patterns, degrees, _encoder(n, seed)[0]), w)[0] for w in (1, 2)]
+        conn = torch.nonzero(connected_masks(nb, "cpu")).squeeze(1).tolist()
+        counts = {m: (None if m % 7 == 0 else random.Random(m).randint(0, 1000)) for m in conn if m & (m - 1)}
+        jobs.append((n, nb, patterns, trees, counts, 10 ** 9))
+    serial, pooled = PartBuilder(degrees, 0).build(jobs), PartBuilder(degrees, 2)
+    try:
+        parallel = pooled.build(jobs)
+    finally:
+        pooled.pool.shutdown()
+    for a, b in zip(serial, parallel):
+        assert a.keys() == b.keys()
+        for k in a:
+            if torch.is_tensor(a[k]):
+                assert a[k].dtype == b[k].dtype and torch.equal(torch.nan_to_num(a[k].double(), nan=-7.0), torch.nan_to_num(b[k].double(), nan=-7.0)), k
+            else:
+                assert a[k] == b[k], k

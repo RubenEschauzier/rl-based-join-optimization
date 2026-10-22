@@ -238,6 +238,42 @@ def candidate_masks(tree, q):
     return out
 
 
+_BUILD_DEGREES = None
+
+
+def _build_init(degrees):
+    global _BUILD_DEGREES
+    _BUILD_DEGREES = degrees
+    torch.set_num_threads(1)
+
+
+def _build_one(args):
+    """A part with numpy arrays: torch would send each of its tensors through its own shared-memory file."""
+    n, neighbour_masks, patterns, plans, counts, failed_count = args
+    part = fv.build_query_data(n, neighbour_masks, patterns, _BUILD_DEGREES, plans, counts, failed_count)
+    return {k: v.numpy() if torch.is_tensor(v) else v for k, v in part.items()}
+
+
+class PartBuilder:
+    """fv.build_query_data over many queries: in `workers` spawned processes (pure CPU work, one query each), or
+    in this process with workers 0. Spawned, not forked: this process holds the CUDA context."""
+
+    def __init__(self, degrees, workers):
+        self.degrees, self.pool = degrees, None
+        if workers > 0:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            self.pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_build_init,
+                                            initargs=(degrees,))
+
+    def build(self, jobs):
+        """jobs [(n, neighbour_masks, patterns, plans, counts, failed_count)] -> their parts, in order."""
+        if self.pool is None or len(jobs) < 2:
+            return [fv.build_query_data(n, nb, pt, self.degrees, pl, c, f) for n, nb, pt, pl, c, f in jobs]
+        parts = self.pool.map(_build_one, jobs, chunksize=max(1, len(jobs) // (8 * self.pool._max_workers)))
+        return [{k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in p.items()} for p in parts]
+
+
 @hydra.main(version_base=None, config_path="../../../../experiments/experiment_configs/amortized_dp",
             config_name="forest_value_mixed_yago_v2.yaml")
 def main(cfg: DictConfig):
@@ -255,6 +291,7 @@ def main(cfg: DictConfig):
     model, epoch = load_backbone(cfg.estimator.config, cfg.estimator.run, cfg.estimator.select, device)
     with open(fcfg.degrees) as f:
         degrees = json.load(f)
+    builder = PartBuilder(degrees, int(online.get("build_workers", 0)))   # before the datasets: light spawned workers
 
     # --- queries: the same seeded selection as train_plan_loss ----------------------------------------
     train_dataset = load_split(cfg.data.train_dir)
@@ -565,13 +602,14 @@ def main(cfg: DictConfig):
 
         t2 = time.perf_counter()
         window = list(seen.values())
-        for q in window:
-            state = (len(counts[q.key]), tuple(plans_of[q.key]))
-            if q.key not in parts or parts[q.key][1] != state:
-                parts[q.key] = (fv.build_query_data(q.n, q.neighbour_masks, q.patterns, degrees, plans_of[q.key], counts[q.key],
-                                                    failed_bound(counts[q.key], largest[0])), state)
-                if epi is not None:
-                    parts[q.key][0].update(fe.anchor_keys(parts[q.key][0], q.key))
+        stale = [(q, (len(counts[q.key]), tuple(plans_of[q.key]))) for q in window]
+        stale = [(q, state) for q, state in stale if q.key not in parts or parts[q.key][1] != state]
+        built = builder.build([(q.n, q.neighbour_masks, q.patterns, plans_of[q.key], counts[q.key],
+                                failed_bound(counts[q.key], largest[0])) for q, _ in stale])
+        for (q, state), part in zip(stale, built):
+            parts[q.key] = (part, state)
+            if epi is not None:
+                parts[q.key][0].update(fe.anchor_keys(parts[q.key][0], q.key))
         priority_w = None
         if epi is not None:
             fresh_q = [q for q in batch if q.key in new_keys][:256]

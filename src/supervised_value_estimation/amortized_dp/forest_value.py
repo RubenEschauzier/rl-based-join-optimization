@@ -645,6 +645,12 @@ def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, faile
             "full_true": torch.tensor(math.log1p(counts[(1 << n) - 1]) if counts.get((1 << n) - 1) is not None else math.nan)}
 
 
+def _take(x, idx):
+    """x[idx] along dim 0 through index_select: its backward is an index_add (atomic adds), where x[idx]'s is a
+    sort-based accumulating index_put, which took most of a training step's GPU time."""
+    return x.index_select(0, idx.reshape(-1)).view(*idx.shape, *x.shape[1:])
+
+
 def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=False, value_chunk=None, hidden=False):
     """Everything the losses need for a batch of build_query_data parts, given the encoder's phi [M, D] and l [M]
     for the concatenation of the parts' `masks` (single patterns: exact counts). Returns a dict of tensors.
@@ -698,7 +704,7 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     phi_std = net.standardise(phi)
 
     # l'' and log subtree cost per node, level by level (single patterns: exact counts, cost 0)
-    l_node = l[b["node_mask"]]
+    l_node = _take(l, b["node_mask"])
     cost = torch.full_like(l_node, NEG)
     l2 = l_node
     for h in range(1, int(b["node_height"].max()) + 1 if len(b["node_height"]) else 1):
@@ -706,20 +712,22 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
         if not len(idx):
             continue
         c1, c2 = b["node_c1"][idx], b["node_c2"][idx]
-        lu, _ = net.bound(l_node[idx], l2[c1], l2[c2], b["fa"][idx], b["fb"][idx], phi_std[b["node_mask"][idx]], b["node_size"][idx])
+        lu, _ = net.bound(_take(l_node, idx), _take(l2, c1), _take(l2, c2), b["fa"][idx], b["fb"][idx],
+                          _take(phi_std, b["node_mask"][idx]), b["node_size"][idx])
         l2 = l2.index_put((idx,), lu)
-        cost = cost.index_put((idx,), torch.logaddexp(lu, torch.logaddexp(cost[c1], cost[c2])))
+        cost = cost.index_put((idx,), torch.logaddexp(lu, torch.logaddexp(_take(cost, c1), _take(cost, c2))))
 
     # V of every forest
     fn = b["forest_nodes"]
     valid = fn >= 0
     safe = fn.clamp(min=0)
     single = b["node_height"][safe] == 0
-    tokens = token_features(phi_std[b["node_mask"][safe]], l2[safe], cost[safe], single, b["node_size"][safe])
+    tokens = token_features(_take(phi_std, b["node_mask"][safe]), _take(l2, safe), _take(cost, safe), single, b["node_size"][safe])
     tokens = tokens * valid[..., None]
     k = b["forest_k"]
-    query = torch.cat([phi_std[b["forest_q"]], (l[b["forest_q"]] / 10)[:, None], (k / b["forest_n"])[:, None]], 1)
-    args = (tokens, ~valid, b["forest_adj"], query, l[b["forest_q"]], k)
+    lq = _take(l, b["forest_q"])
+    query = torch.cat([_take(phi_std, b["forest_q"]), (lq / 10)[:, None], (k / b["forest_n"])[:, None]], 1)
+    args = (tokens, ~valid, b["forest_adj"], query, lq, k)
     call = lambda *a: net.values(*a, return_hidden=True)
     if value_chunk and len(fn) > value_chunk:
         run = (lambda *a: checkpoint(call, *a, use_reentrant=False)) if torch.is_grad_enabled() else call
@@ -739,7 +747,7 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
 
     # per candidate: estimated and true cost-to-go from its state
     cand = b["cand"]
-    q_hat = torch.logaddexp(l2[cand[:, 1]], V[cand[:, 2]])
+    q_hat = torch.logaddexp(_take(l2, cand[:, 1]), _take(V, cand[:, 2]))
     return {"l": l_raw, "l2": l2, "V": V, "q_hat": q_hat, **b}
 
 
