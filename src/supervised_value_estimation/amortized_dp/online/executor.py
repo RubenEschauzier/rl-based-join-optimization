@@ -3,7 +3,12 @@
 Both backends take a list of requests
     {"query": str, "triple_patterns": [str], "plan": [int] | None, "timeout_s": float}
 (plan None = let QLever's own optimizer choose) and return, per request,
-    {"tree": dict, "latency_s": float, "censored": bool, "timeout_s": float, "error": str | None}
+    {"tree": dict, "latency_s": float, "censored": bool, "timeout_s": float, "error": str | None,
+     "planning_ms": float | None, "exec_ms": float | None}
+latency_s is QLever's time.total: its own query planning plus execution (time.computeResult includes the
+planning too). planning_ms is runtimeInformation.meta.time_query_planning (QLever's planning, also paid by a
+forced plan, there only a few ms), exec_ms the root operator's total_time; both None when QLever does not
+report them (timeouts and errors).
 Parsing into observations happens in the trainer (runtime_tree.parse_execution), not in the
 actors, so the parsing rules live in one tested place.
 
@@ -35,23 +40,33 @@ from src.query_environments.qlever.qlever_execute_query_default import QLeverOpt
 from src.supervised_value_estimation.amortized_dp.labels import mask_of, optimal_left_deep_plan
 
 
+def _planning_ms(runtime_info):
+    value = ((runtime_info or {}).get("meta") or {}).get("time_query_planning")
+    return None if value is None else float(value)
+
+
 def _interpret(raw, timeout_s):
-    """Raw QLeverOptimizerClient result (parse_local=False) -> tree, latency, censoring."""
+    """Raw QLeverOptimizerClient result (parse_local=False) -> tree, latency, censoring, planning / execution ms."""
     if raw.get("success"):
-        tree = (raw.get("runtime_info") or {}).get("query_execution_tree", {}) or {}
+        runtime_info = raw.get("runtime_info") or {}
+        tree = runtime_info.get("query_execution_tree", {}) or {}
         latency = QLeverOptimizerClient.decode_to_seconds(raw.get("time_total", "0ms"))
-        return {"tree": tree, "latency_s": latency, "censored": False, "timeout_s": timeout_s, "error": None}
+        exec_ms = tree.get("total_time")
+        return {"tree": tree, "latency_s": latency, "censored": False, "timeout_s": timeout_s, "error": None,
+                "planning_ms": _planning_ms(runtime_info), "exec_ms": None if exec_ms is None else float(exec_ms)}
     error = str(raw.get("error", ""))
-    tree, latency = {}, timeout_s
+    tree, latency, planning_ms = {}, timeout_s, None
     try:
         parsed = json.loads(error)
         tree = parsed.get("runtimeInformation", {}) or {}
         latency = max(float(parsed.get("time", {}).get("total", timeout_s * 1000)) / 1000, timeout_s)
+        planning_ms = _planning_ms(tree)
     except (ValueError, TypeError, AttributeError):
         pass
     # Every failure is treated as censored at its timeout: the plan took at least that long
     # or could not run, which for ranking plans means the same thing.
-    return {"tree": tree, "latency_s": latency, "censored": True, "timeout_s": timeout_s, "error": error[:300]}
+    return {"tree": tree, "latency_s": latency, "censored": True, "timeout_s": timeout_s, "error": error[:300],
+            "planning_ms": planning_ms, "exec_ms": None}
 
 
 class RayPlanExecutor:
@@ -133,7 +148,7 @@ class RayPlanExecutor:
     @staticmethod
     def _failed(timeout_s, error):
         return {"tree": {}, "latency_s": timeout_s, "censored": True, "timeout_s": timeout_s,
-                "error": f"execution failed: {error}"[:300], "failed": True}
+                "error": f"execution failed: {error}"[:300], "failed": True, "planning_ms": None, "exec_ms": None}
 
 
 class SimulatedExecutor:
@@ -189,5 +204,5 @@ class SimulatedExecutor:
             latency_s = request["timeout_s"] if cut_off else total_ms / 1000
             results.append({"tree": node, "latency_s": latency_s, "censored": cut_off,
                             "timeout_s": request["timeout_s"], "error": "Query timed out" if cut_off else None,
-                            "plan_used": plan})
+                            "plan_used": plan, "planning_ms": 0.0, "exec_ms": None if cut_off else total_ms})
         return results

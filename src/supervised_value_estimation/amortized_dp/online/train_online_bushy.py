@@ -61,7 +61,7 @@ from src.supervised_value_estimation.amortized_dp.online.executor import RayPlan
 from src.supervised_value_estimation.amortized_dp.online.observations import ForestObservations
 from src.supervised_value_estimation.amortized_dp.online.runtime_tree import bushy_sparql, parse_bushy_execution
 from src.supervised_value_estimation.amortized_dp.online.train_online import (
-    _endpoints, _geomean_speedup, _summarise_latencies, _time_summary, _timeout,
+    _endpoints, _geomean_speedup, _summarise_latencies, _time_summary, _timeout, _timing_speedups, _timing_summary,
 )
 
 FRESH_HEADS = ("latency_head", "step_head", "latency_statistics", "step_statistics")
@@ -319,14 +319,20 @@ def main(cfg: DictConfig):
         per_query = {v.query: {"n": v.n, "family": v.family} for v in validation}
         for (name, query), result in zip(tags, results):
             per_query[query][name] = {"latency_s": result["latency_s"], "censored": result["censored"],
+                                      "planning_ms": result.get("planning_ms"), "exec_ms": result.get("exec_ms"),
                                       "cout": executed_cout(result["tree"]) if not result["censored"] else None,
                                       "plan": bushy.to_json(plans[name][query]) if plans[name][query] is not None else None}
         queries = [v.query for v in validation]
         summary = {"round": round_index, "planners": {}}
+        results_of = lambda name: [per_query[q][name] for q in queries]
+        model_ms_of = lambda name: planning.get(name)       # None for QLever: its planning is inside its latency
         for name in names:
             lat = [per_query[q][name]["latency_s"] for q in queries]
             summary["planners"][name] = {"latency": _summarise_latencies(lat, [per_query[q][name]["censored"] for q in queries]),
-                                         "speedup_vs_qlever": _geomean_speedup([per_query[q]["QLever"]["latency_s"] for q in queries], lat)}
+                                         "speedup_vs_qlever": _geomean_speedup([per_query[q]["QLever"]["latency_s"] for q in queries], lat),
+                                         "timing": _timing_summary(results_of(name), model_ms_of(name)),
+                                         "speedup_vs_qlever_split": _timing_speedups(results_of("QLever"), results_of(name),
+                                                                                     None, model_ms_of(name))}
             if name in planning:
                 summary["planners"][name]["planning"] = _time_summary(planning[name])
             couts = [(per_query[q][name]["cout"], per_query[q]["QLever"]["cout"]) for q in queries]
@@ -338,6 +344,8 @@ def main(cfg: DictConfig):
             if ours in names:
                 summary["planners"][ours]["speedup_vs_gnce_same_width"] = _geomean_speedup(
                     [per_query[q][theirs]["latency_s"] for q in queries], [per_query[q][ours]["latency_s"] for q in queries])
+                summary["planners"][ours]["speedup_vs_gnce_same_width_split"] = _timing_speedups(
+                    results_of(theirs), results_of(ours), model_ms_of(theirs), model_ms_of(ours))
         with open(run_directory / "validation.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
         with open(run_directory / f"validation-{round_index}.json", "w", encoding="utf-8") as f:
@@ -355,6 +363,17 @@ def main(cfg: DictConfig):
                 line += f" | C_out/QLever {s['cout_geomean_vs_qlever']:.3f}"
             if "planning" in s:
                 line += f" | planning median {s['planning']['median_ms']:.1f} ms"
+            print(line, flush=True)
+            t, split = s["timing"], s["speedup_vs_qlever_split"]
+            qp = t["qlever_planning"]
+            line = (f"  {'':26s} execution only mean {t['execution']['mean_s'] * 1000:7.1f} ms, median "
+                    f"{t['execution']['median_s'] * 1000:6.1f}, p90 {t['execution']['p90_s'] * 1000:7.1f} | QLever planning "
+                    f"median {qp['median_ms'] if qp['n'] else float('nan'):.1f} ms | end to end mean "
+                    f"{t['end_to_end']['mean_s'] * 1000:7.1f} ms | speedup vs QLever: execution {split['execution']:.3f}, "
+                    f"end to end {split['end_to_end']:.3f}")
+            if "speedup_vs_gnce_same_width_split" in s:
+                g = s["speedup_vs_gnce_same_width_split"]
+                line += f"; vs GNCE same width: execution {g['execution']:.3f}, end to end {g['end_to_end']:.3f}"
             print(line, flush=True)
         torch.save({"state_dict": model.state_dict(), "model_kwargs": model_kwargs, "round": round_index},
                    run_directory / f"model-{round_index}.pt")

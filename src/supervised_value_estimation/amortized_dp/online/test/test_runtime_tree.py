@@ -130,3 +130,29 @@ def test_failed_qlever_responses_are_censored_at_their_timeout():
     assert garbage["censored"] and garbage["tree"] == {} and garbage["latency_s"] == 3.0
     ok = _interpret({"success": True, "runtime_info": {"query_execution_tree": tree}, "time_total": "6ms"}, 60)
     assert not ok["censored"] and ok["latency_s"] == pytest.approx(0.006)
+
+
+def test_qlever_planning_and_execution_times_are_split():
+    from src.supervised_value_estimation.amortized_dp.online.executor import _interpret
+
+    tree = dict(_real_tree(), total_time=17)
+    raw = {"success": True, "runtime_info": {"meta": {"time_query_planning": 78}, "query_execution_tree": tree},
+           "time_total": "97ms"}
+    ok = _interpret(raw, 60)
+    assert ok["latency_s"] == pytest.approx(0.097) and ok["planning_ms"] == 78.0 and ok["exec_ms"] == 17.0
+    timed_out = _interpret({"success": False, "error": json.dumps({"time": {"total": 33000}})}, timeout_s=30.0)
+    assert timed_out["censored"] and timed_out["planning_ms"] is None and timed_out["exec_ms"] is None
+
+
+def test_timing_summary_separates_execution_planning_and_end_to_end():
+    from src.supervised_value_estimation.amortized_dp.online.train_online import _timing_speedups, _timing_summary
+
+    native = [{"latency_s": 0.097, "censored": False, "planning_ms": 78.0, "exec_ms": 17.0}]
+    ours = [{"latency_s": 0.020, "censored": False, "planning_ms": 3.0, "exec_ms": 16.0}]
+    censored = [{"latency_s": 30.0, "censored": True, "planning_ms": None, "exec_ms": None}]
+    t = _timing_summary(ours, [10.0])
+    assert t["execution"]["mean_s"] == pytest.approx(0.016) and t["qlever_planning"]["median_ms"] == 3.0
+    assert t["end_to_end"]["mean_s"] == pytest.approx(0.030)              # QLever's total + our planner's 10 ms
+    assert _timing_summary(censored)["execution"]["mean_s"] == 30.0        # censored keeps its timeout
+    s = _timing_speedups(native, ours, None, [10.0])
+    assert s["execution"] == pytest.approx(17 / 16) and s["end_to_end"] == pytest.approx(97 / 30)

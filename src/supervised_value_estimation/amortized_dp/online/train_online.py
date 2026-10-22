@@ -197,6 +197,29 @@ def _summarise_latencies(latencies, censored, native=None):
     return summary
 
 
+def _execution_s(result):
+    """Execution only (the root operator's time); a censored plan keeps its latency (>= its timeout)."""
+    return result["exec_ms"] / 1000 if result.get("exec_ms") is not None else result["latency_s"]
+
+
+def _timing_summary(results, model_ms=None):
+    """One planner's executions split up: execution only, QLever's own planning (a forced plan still pays a few
+    ms of it), and end to end = QLever's time.total + `model_ms` (our planner's ms per query, None for QLever)."""
+    censored = [r["censored"] for r in results]
+    model_ms = [0.0] * len(results) if model_ms is None else model_ms
+    return {"execution": _summarise_latencies([_execution_s(r) for r in results], censored),
+            "qlever_planning": _time_summary([r["planning_ms"] for r in results if r.get("planning_ms") is not None]),
+            "end_to_end": _summarise_latencies([r["latency_s"] + m / 1000 for r, m in zip(results, model_ms)], censored)}
+
+
+def _timing_speedups(baseline, ours, baseline_model_ms=None, our_model_ms=None):
+    """Geomean speedups of `ours` over `baseline` (lists of results of the same queries): execution only, and end
+    to end with each side's model planning added."""
+    add = lambda results, ms: [r["latency_s"] + m / 1000 for r, m in zip(results, ms or [0.0] * len(results))]
+    return {"execution": _geomean_speedup([_execution_s(r) for r in baseline], [_execution_s(r) for r in ours]),
+            "end_to_end": _geomean_speedup(add(baseline, baseline_model_ms), add(ours, our_model_ms))}
+
+
 @hydra.main(version_base=None,
             config_path="../../../../experiments/experiment_configs/epinet_cost_estimation/cost_estimation_yago_mixed",
             config_name="online_amortized_dp_mixed_yago.yaml")
@@ -346,12 +369,14 @@ def main(cfg: DictConfig):
         kinds = (["ours"] + (["robust"] if robust_indexes is not None else [])
                  + (["native"] if validation.include_native else []) + (["dp"] if dp_plans else []))
         requests, tags, our_planning_ms, robust_planning_ms = [], [], [], []
+        model_ms = {"ours": {}, "robust": {}, "dp": dict(zip(dp_plans, dp_planning_ms))}   # query -> planner ms
         shared = {}
         for k, i in enumerate(validation_pool):
             data = val_dataset[i]
             start = time.perf_counter()
             plan = beam_search(Batch.from_data_list([data]), agent, 1)[0]["plan"]
             our_planning_ms.append(1000 * (time.perf_counter() - start))
+            model_ms["ours"][data.query] = our_planning_ms[-1]
             plans = {"ours": [int(p) for p in plan], "native": None, "dp": dp_plans.get(data.query)}
             if robust_indexes is not None:
                 start = time.perf_counter()
@@ -361,6 +386,7 @@ def main(cfg: DictConfig):
                                                       shared=shared)
                 plans["robust"] = [int(p) for p in beam_search(Batch.from_data_list([data]), robust_agent, 1)[0]["plan"]]
                 robust_planning_ms.append(1000 * (time.perf_counter() - start))
+                model_ms["robust"][data.query] = robust_planning_ms[-1]
             rotation = k % len(kinds)
             for kind in kinds[rotation:] + kinds[:rotation]:
                 requests.append({"query": data.query, "triple_patterns": list(data.triple_patterns),
@@ -378,6 +404,12 @@ def main(cfg: DictConfig):
         def censored(kind):
             return [by_kind[kind][q][1]["censored"] for q in queries]
 
+        def results_of(kind):
+            return [by_kind[kind][q][1] for q in queries]
+
+        def model_ms_of(kind):                         # QLever's planning is inside its own latency
+            return None if kind == "native" else [model_ms[kind].get(q, 0.0) for q in queries]
+
         def cout(kind, query):
             plan, result = by_kind[kind][query]
             if kind == "native":
@@ -394,6 +426,7 @@ def main(cfg: DictConfig):
         for kind in kinds:
             planners[kind] = {
                 "latency": _summarise_latencies(latencies(kind), censored(kind)),
+                "timing": _timing_summary(results_of(kind), model_ms_of(kind)),
                 "p_error": ratio_summary([p_error(costs[kind][q], optimum.get(q)) for q in queries]),
             }
             if kind in history:
@@ -421,6 +454,8 @@ def main(cfg: DictConfig):
                 rolling = [np.mean([lat for lat, _ in history[kind][q]]) for q in queries]
                 speedup[f"{prefix}vs_{name}"] = _geomean_speedup(latencies(kind), latencies(mine))
                 speedup[f"{prefix}vs_{name}_rolling"] = _geomean_speedup(rolling, latencies(mine))
+                speedup[f"{prefix}vs_{name}_split"] = _timing_speedups(results_of(kind), results_of(mine),
+                                                                       model_ms_of(kind), model_ms_of(mine))
                 cout_ratio[f"{mine}_vs_{name}"] = ratio_summary(
                     [max(costs[mine][q], 1) / max(costs[kind][q], 1)
                      if costs[mine][q] is not None and costs[kind][q] is not None else None for q in queries])
@@ -457,13 +492,21 @@ def main(cfg: DictConfig):
             if "planning" in planners[kind]:
                 line += f" | planning median {planners[kind]['planning']['median_ms']:.1f} ms"
             print(line)
+            timing = planners[kind]["timing"]
+            print(f"         execution only: mean {timing['execution']['mean_s']*1000:.1f} ms, median "
+                  f"{timing['execution']['median_s']*1000:.1f} ms, p90 {timing['execution']['p90_s']*1000:.1f} ms | "
+                  f"QLever planning median {fmt(timing['qlever_planning'].get('median_ms'), '.1f')} ms, mean "
+                  f"{fmt(timing['qlever_planning'].get('mean_ms'), '.1f')} ms | end to end mean "
+                  f"{timing['end_to_end']['mean_s']*1000:.1f} ms")
         for mine, prefix in (("ours", ""), ("robust", "robust_")):
             for name in ("qlever", "dp_learned_cardinality"):
                 if f"{prefix}vs_{name}" in speedup:
                     ratio = cout_ratio[f"{mine}_vs_{name}"]
                     print(f"  {mine} vs {name}: speedup {fmt(speedup[f'{prefix}vs_{name}'])} "
                           f"(rolling {fmt(speedup[f'{prefix}vs_{name}_rolling'])}), C_out {mine}/{name} geomean "
-                          f"{fmt(ratio.get('geomean'))}, {mine} <= on {fmt(ratio.get('frac_at_most_1'), '.1%')}")
+                          f"{fmt(ratio.get('geomean'))}, {mine} <= on {fmt(ratio.get('frac_at_most_1'), '.1%')} | "
+                          f"speedup execution only {fmt(speedup[f'{prefix}vs_{name}_split']['execution'])}, "
+                          f"end to end (planning included) {fmt(speedup[f'{prefix}vs_{name}_split']['end_to_end'])}")
         if "epinet_card" in summary and summary["epinet_card"].get("n", 0) >= 3:
             diag = summary["epinet_card"]
             print(f"  epinet card uncertainty: Spearman(std, |error|) {diag['spearman_std_vs_error']:.3f}, "
