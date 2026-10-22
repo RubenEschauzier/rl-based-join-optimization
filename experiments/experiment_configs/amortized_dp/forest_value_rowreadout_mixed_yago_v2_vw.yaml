@@ -1,8 +1,9 @@
 # The online forest-value run of model-20 (forest_value/forest-value-17-10-2026-01-49-26) with the row-readout
 # backbone (2026-10-22): run 3 of the readout pretraining (type-attention contextual features + RowReadout,
 # src/models/model_layers/row_readout.py) and its datasets with the readout columns. Everything else as that run:
-# it predates forest.stop_gradient (the plan loss also trained the backbone), hence false here; it was compared at
-# round 20, hence 20 rounds. Needs on the trainer: data/constant_embeddings/yago (the row store, 1.9 GB), the
+# it predates forest.stop_gradient (the plan loss also trained the backbone), hence false here. 40 rounds as that
+# run's config (it stopped at round 20, model-20): round 20 is the matched comparison, round 40 shows whether the new
+# backbone keeps improving (that run's p99 was still falling). Needs on the trainer: data/constant_embeddings/yago (the row store, 1.9 GB), the
 # hll_contextual_attention_rowreadout datasets and the run 3 directory (train_progress.json + epoch-48/model).
 #   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value \
 #     --config-name forest_value_rowreadout_mixed_yago_v2_vw.yaml
@@ -18,9 +19,6 @@ estimator:
 data:
   train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention_rowreadout/dataset_train
   val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention_rowreadout/dataset_val
-
-online:
-  rounds: 20
 
 forest:
   stop_gradient: false

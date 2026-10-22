@@ -1,0 +1,38 @@
+# Zero predictor on the frozen small (query-conditioned) cardinality model
+# (src/supervised_value_estimation/amortized_dp/zero_predictor.py).
+#   python -m src.supervised_value_estimation.amortized_dp.zero_predictor [overrides]
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+seed: 0
+output_directory: experiments/experiment_outputs/mixed_yago_v2/zero_predictor
+
+estimator:
+  config: experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll.yaml
+  run: experiments/experiment_outputs/mixed_yago_v2/pretrained_models/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml-13-10-2026-10-27-43
+  select: val_sub_loss
+
+data:
+  train_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_train
+  val_dir: data/generated_queries/mixed_yago_v2/hll_contextual_attention/dataset_val
+  # True counts of the online plan-loss run ({query: {mask: count}}); the validation queries are its validation-0.json keys.
+  counts: experiments/experiment_outputs/mixed_yago_v2/plan_loss/plan-loss-16-10-2026-00-08-13/counts.pkl
+  validation_keys: experiments/experiment_outputs/mixed_yago_v2/plan_loss/plan-loss-16-10-2026-00-08-13/validation-0.json
+
+# Neighbour types of each constant pattern as an input (index data: profile histograms); null turns it off.
+profiles:
+  directory: data/contextual_embeddings/yago_profiles
+  # its predicate_terms list gives the profiles' predicate ids
+  contextualizer: experiments/experiment_outputs/mixed_yago_v2/contextualizer_profiles_attention_soft/contextualizer.pt
+
+held_out_fraction: 0.05     # training queries kept for model selection
+hidden: 128
+bins: 64                    # learned type bins per variable
+rounds: 6                   # propagation rounds along variable-variable edges (0 = per-variable AND only)
+minimal_weight: 2.0         # extra loss weight of minimal empty subsets (no counted empty proper subset)
+epochs: 15
+max_subsets: 8192           # join subsets per step
+lr: 0.001
+weight_decay: 0.0001
