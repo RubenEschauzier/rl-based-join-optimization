@@ -43,7 +43,9 @@ def test_real_tree_prefix_cardinalities_and_step_times():
 
 def test_real_tree_scans_are_matched_to_their_patterns():
     parsed = parse_execution(_real_tree(), PLAN, PATTERNS)
-    assert parsed["scan_rows"] == {1: 1, 3: 1, 4: 142, 2: 67656, 0: 20724}
+    # pattern 0's lazy scan read 1 of its 72 blocks: 20,724 is what it read, not its cardinality
+    assert parsed["scan_rows"] == {1: 1, 3: 1, 4: 142, 2: 67656}
+    assert parsed["scan_read"] == {1: 1, 3: 1, 4: 142, 2: 67656, 0: 20724}
 
 
 def test_a_wrong_join_count_drops_every_prefix_observation():
@@ -156,3 +158,33 @@ def test_timing_summary_separates_execution_planning_and_end_to_end():
     assert _timing_summary(censored)["execution"]["mean_s"] == 30.0        # censored keeps its timeout
     s = _timing_speedups(native, ours, None, [10.0])
     assert s["execution"] == pytest.approx(17 / 16) and s["end_to_end"] == pytest.approx(97 / 30)
+
+
+def _skipping_tree():
+    """The real execution of ?s <13000104> <6506408> . ?s <13000179> ?o on yago (local QLever, 2026-10-22): the
+    42.4M-triple scan read 33 of its 1,359 blocks, so its result_rows (1,031,250) is what it read."""
+    small = {"description": "IndexScan POS ?s <http://example.com/13000104> <http://example.com/6506408>",
+             "status": "fully materialized completed", "cache_status": "computed", "result_rows": 35,
+             "total_time": 0, "operation_time": 0, "details": None, "children": []}
+    big = {"description": "IndexScan PSO ?s <http://example.com/13000179> ?o", "status": "lazily materialized completed",
+           "cache_status": "computed", "result_rows": 1031250, "total_time": 0, "operation_time": 0,
+           "details": {"num-blocks-all": 1359, "num-blocks-read": 33, "num-elements-read": 1031250}, "children": []}
+    return {"description": "Join on ?s", "status": "fully materialized completed", "cache_status": "computed",
+            "result_rows": 473, "total_time": 4, "operation_time": 4, "details": {"time-for-filtering-blocks": 0},
+            "children": [small, big]}
+
+
+SKIP_PATTERNS = ["?s <http://example.com/13000104> <http://example.com/6506408> .", "?s <http://example.com/13000179> ?o ."]
+
+
+def test_a_scan_that_skipped_blocks_gives_no_row_count_only_what_it_read():
+    from src.supervised_value_estimation.amortized_dp.online.runtime_tree import parse_bushy_execution
+    left_deep = parse_execution(_skipping_tree(), [0, 1], SKIP_PATTERNS)
+    bushy = parse_bushy_execution(_skipping_tree(), [3], SKIP_PATTERNS)
+    for parsed in (left_deep, bushy):
+        assert parsed["scan_rows"] == {0: 35}                    # not 1,031,250 for the 42.4M-triple pattern
+        assert parsed["scan_read"] == {0: 35, 1: 1031250}
+    assert left_deep["prefix_rows"] == {2: 473} and bushy["rows"] == {3: 473}
+    full = copy.deepcopy(_skipping_tree())
+    full["children"][1]["details"]["num-blocks-read"] = 1359      # read in full: its rows are the cardinality
+    assert parse_execution(full, [0, 1], SKIP_PATTERNS)["scan_rows"] == {0: 35, 1: 1031250}

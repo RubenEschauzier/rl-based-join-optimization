@@ -9,7 +9,11 @@ Per prefix this yields
     rows      exact cardinality of the intermediate result      (if the join completed)
     step_ms   time added by that join step: the join's subtree total time minus the previous
               join's, so it includes the new pattern's scan and any sort in between
-and per pattern the scan's row count, matched to the pattern by its terms.
+and per pattern the scan's row count, matched to the pattern by its terms, and what the scan read (scan_read).
+A scan of at least lazy-index-scan-max-size-materialization (1M) estimated rows is read lazily: joined with a
+small side, QLever reads only the index blocks that can match (details num-blocks-read < num-blocks-all), and its
+result_rows is then what it read, not the pattern's cardinality. Such a scan gives no row count, only its read
+elements (num-elements-read); scans read in full give both.
 
 Robustness rules (each observation is dropped, never guessed):
   * joins are nodes whose description starts with one of JOIN_PREFIXES; the existing
@@ -55,6 +59,17 @@ def _collect(node, joins, scans):
     return subtree_cached
 
 
+def _scan_counts(node):
+    """(rows, read) of a finished scan: rows the pattern's cardinality, None when the scan skipped blocks; read
+    the elements it read (num-elements-read, else its rows)."""
+    if not _finished(node) or node.get("result_rows") is None:
+        return None, None
+    details = node.get("details") or {}
+    blocks_read, blocks_all = details.get("num-blocks-read"), details.get("num-blocks-all")
+    skipped = blocks_read is not None and blocks_all is not None and blocks_read < blocks_all
+    return (None if skipped else int(node["result_rows"])), int(details.get("num-elements-read", node["result_rows"]))
+
+
 def _match_scan(description, pattern_terms):
     """Index of the one pattern all of whose terms appear in the scan description."""
     terms = set(TERM_PATTERN.findall(description))
@@ -83,17 +98,21 @@ def parse_execution(tree, plan, triple_patterns):
                 previous_total = float(total)
             previous_timing_valid = timing_valid
     pattern_terms = [TERM_PATTERN.findall(pattern)[:3] for pattern in triple_patterns]
-    scan_rows = {}
+    scan_rows, scan_read = {}, {}
     for node in scans:
         index = _match_scan(str(node.get("description", "")), pattern_terms)
-        if index is not None and _finished(node) and node.get("result_rows") is not None:
-            scan_rows[index] = int(node["result_rows"])
+        rows, read = _scan_counts(node)
+        if index is not None and read is not None:
+            scan_read[index] = read
+            if rows is not None:
+                scan_rows[index] = rows
     return {
         "aligned": aligned,
         "n_join_nodes": len(joins),
         "prefix_rows": prefix_rows,          # prefix length k -> rows of the first k patterns
         "step_ms": step_ms,                  # prefix length k -> time of the step building it
-        "scan_rows": scan_rows,              # pattern index -> rows of its scan
+        "scan_rows": scan_rows,              # pattern index -> rows of its scan (not for scans that skipped blocks)
+        "scan_read": scan_read,              # pattern index -> elements its scan read
         "any_cached": any(cached for _, cached in joins),
     }
 
@@ -124,9 +143,10 @@ def parse_bushy_execution(tree, plan_masks, triple_patterns):
                any sort in between (as the left-deep step times do); the steps of a plan add up
                to its total time. Keyed by the two operand masks (smaller first).
     aligned: the join sets are exactly the plan's. Step times through cached subtrees, or through
-    an operand whose own timing is invalid, are dropped; cardinalities are kept."""
+    an operand whose own timing is invalid, are dropped; cardinalities are kept. Scans as in the module text:
+    scan_rows only from scans read in full, scan_read from every finished scan."""
     pattern_terms = [TERM_PATTERN.findall(pattern)[:3] for pattern in triple_patterns]
-    rows, steps, scan_rows, joins = {}, {}, {}, []
+    rows, steps, scan_rows, scan_read, joins = {}, {}, {}, {}, []
     state = {"unmatched": False, "cached": False}
 
     def walk(node):
@@ -139,8 +159,11 @@ def parse_bushy_execution(tree, plan_masks, triple_patterns):
             if index is None:
                 state["unmatched"] = True
                 return 0, None, cached
-            if _finished(node) and node.get("result_rows") is not None:
-                scan_rows[index] = int(node["result_rows"])
+            scan_count, read = _scan_counts(node)
+            if read is not None:
+                scan_read[index] = read
+                if scan_count is not None:
+                    scan_rows[index] = scan_count
             return 1 << index, None, cached
         mask = 0
         for child_mask, _, _ in children:
@@ -168,4 +191,4 @@ def parse_bushy_execution(tree, plan_masks, triple_patterns):
         walk(tree)
     aligned = not state["unmatched"] and sorted(joins) == sorted(plan_masks)
     return {"aligned": aligned, "n_join_nodes": len(joins), "rows": rows, "steps": steps,
-            "scan_rows": scan_rows, "any_cached": state["cached"]}
+            "scan_rows": scan_rows, "scan_read": scan_read, "any_cached": state["cached"]}
