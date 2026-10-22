@@ -355,3 +355,31 @@ def test_query_weights():
     for key in ("l1_raw", "l1_bound", "value", "w", "plan", "consistency"):
         assert torch.isclose(plain[key], ones[key], atol=1e-6), key
         assert torch.isclose(masked[key], alone[key], atol=1e-5), key
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_planning_from_a_forest_on_the_greedy_path_continues_the_greedy_plan(seed):
+    """start: from the single patterns it is the plain beam; from any forest along greedy's own path greedy finishes
+    with the same plan (the start's l'', subtree costs and cost so far match the beam's own state)."""
+    n = 7 + seed % 3
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    net = _net(seed, trained=True)
+    ctx = lambda: fv.QueryContext(n, nb, patterns, degrees, encode)
+    for w in (1, 4):
+        assert fv.beam_plans(net, ctx(), [w], start=list(range(n)))[0] == fv.beam_plans(net, ctx(), [w])[0]
+    trace = []
+    (greedy,), _ = fv.beam_plans(net, ctx(), [1], trace=trace)
+    trees, so, pos = {1 << i: i for i in range(n)}, -math.inf, 0
+    for _ in range(n - 2):                               # replay greedy's merges from the trace
+        forest = tuple(sorted(trees))
+        step = trace[pos:pos + len(bushy.candidate_merges(forest, nb))]
+        pos += len(step)
+        key = lambda x: (float(torch.logaddexp(torch.logaddexp(torch.tensor(so), torch.tensor(x[1])), torch.tensor(x[2]))),)
+        masks, l2, _ = min(step, key=key)
+        so = float(torch.logaddexp(torch.tensor(so), torch.tensor(l2)))
+        new = (set(masks) - set(forest)).pop()
+        a, b = [m for m in forest if m & new]
+        trees[new] = (trees.pop(a), trees.pop(b))
+        got, _ = fv.beam_plans(net, ctx(), [1], start=list(trees.values()))
+        assert bushy.canonical(got[0][0]) == bushy.canonical(greedy[0])

@@ -1,0 +1,33 @@
+# Row readout, new store only (2026-10-21): plain rdf2vec features + the RowReadout first layer
+# (src/models/model_layers/row_readout.py) on the degree-moment rows; control:
+# pretrain_experiment_triple_conv_hll_subqueries_mixed_yago_v2.yaml.
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/mixed_yago_v2/hll_rowreadout/dataset_train"
+  dataset_val: "data/generated_queries/mixed_yago_v2/hll_rowreadout/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/mixed_yago_v2/model.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll_rowreadout.yaml"
+  occurrences_location: "data/term_occurrences/mixed_yago_v2/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/mixed_yago_v2/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/mixed_yago_v2/multiplicities.json"
+  hll_location: "data/term_occurrences/mixed_yago_v2/hll_sketches.json"
+  feature_type: "predicate_edge_hll"
+  n_epoch: 50
+  # Sub-query training (src/datastructures/subquery_training.py): full queries + their QLever-counted
+  # sub-queries, sliced from the full query as the DP does; censored loss (empty: only predictions
+  # above 0 are wrong; imputed timeout: only predictions below the imputed count are wrong).
+  subquery_labels_train: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_train.json"
+  subquery_labels_val: "data/generated_queries/mixed_yago_v2/subquery_labels/subquery_labels_val.json"
+  censored_loss: true
+  subquery_fraction: 0.35
+  num_workers: 1                     # 1 slicing worker: ~9 GB instead of ~13.5 GB, so two trainings fit            # a fresh 35% of the 797k sub-queries per epoch, plus all 134k full queries
+  batch_size: 64
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/mixed_yago_v2/pretrained_models"
+

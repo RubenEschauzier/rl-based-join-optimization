@@ -295,11 +295,12 @@ def _merge_fans(a, b, n, touch_s, touch_o, fan):
 
 
 @torch.no_grad()
-def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, indexes=None):
+def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, indexes=None, with_root=False):
     """[K, T] the estimated log C_out of finished plans under each index: logsumexp over a tree's joins U of l''_z(U),
     with l_z(U) = l(U) + epinet.card_shift(phi(U), z) and the bound applied bottom-up along the tree, exactly as the
     beam does (single patterns: exact counts, not shifted). No index (or z = 0): the planner's own estimate, K = 1.
-    The value net is not involved: it only guides the search; a finished plan's cost is its joins' estimates."""
+    The value net is not involved: it only guides the search; a finished plan's cost is its joins' estimates.
+    with_root: also [K, T] l'' of each tree's root (trees of 2+ patterns; the start of beam_plans)."""
     n = ctx.n
     device = ctx.encoded([1 << i for i in range(n)])[1].device
     K = 1 if epinet is None or indexes is None else len(indexes)
@@ -348,12 +349,13 @@ def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, index
             if c[0] == "node":
                 members_of(c[1], acc)
         return acc
-    return torch.stack([torch.logsumexp(l2[:, members_of(r, [])].double(), 1) for r in roots], 1).float()
+    scores = torch.stack([torch.logsumexp(l2[:, members_of(r, [])].double(), 1) for r in roots], 1).float()
+    return (scores, l2[:, roots]) if with_root else scores
 
 
 @torch.no_grad()
 def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
-               epinet=None, indexes=None, robust=None):
+               epinet=None, indexes=None, robust=None, start=None, trace_h=None):
     """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by
     total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far, then by first appearance), with
     N(0, noises[g]) on each candidate's score (exploration). Returns ([trees of group g, cheapest first: all the
@@ -368,7 +370,11 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     total_z(F) = logaddexp(log cost so far_z, V_z(F)), V_z = logaddexp(l_z(Q), W + value_shift(h, z_k)), with W and h
     from the value net ONCE on the plain (z = 0) tokens. "mean": E_z[total_z] (the expected log cost, as the geomean
     metric); "p90": the 90% quantile over z (conservative). A finished plan's score is the statistic of its
-    plan_scores. Not combined with indexes (Thompson beams)."""
+    plan_scores. Not combined with indexes (Thompson beams).
+    start: the component trees of a forest to plan from (every group; default the single patterns), each component
+    with its l'' and log subtree cost along its tree as plan_scores computes them. Not combined with robust.
+    trace_h: a list that receives, aligned with trace, the value net's state h of every candidate's child forest (a
+    [d] tensor; None for a complete forest)."""
     G = len(widths)
     noises = list(noises) if noises is not None else [0.0] * G
     all_trees = list(all_trees) if all_trees is not None else [False] * G
@@ -408,7 +414,30 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         ccw = torch.full((G, n, Kr), NEG, device=device)
         sow = torch.full((G, Kr), NEG, device=device)
     trees = [list(range(n)) for _ in range(G)]
-    for k in range(n, 1, -1):
+    if start is not None:
+        assert robust is None, "a start forest is not combined with robust beams"
+        comps = sorted((bushy.tree_mask(t), bushy.canonical(t)) for t in start)
+        masks = torch.tensor([m for m, _ in comps], **long)
+        reach_of = [0] * len(comps)                      # union of the neighbour masks of a component's patterns
+        for idx, (m, _) in enumerate(comps):
+            for p in bushy.members(m):
+                reach_of[idx] |= ctx.neighbour_masks[p]
+        reach = torch.tensor(reach_of, **long)
+        built = [i for i, (m, _) in enumerate(comps) if m & (m - 1)]
+        rows = ctx.rows(masks)                           # first: encoding new masks replaces ctx.l
+        l_start = ctx.l[rows].clone()
+        c_start = torch.full((len(comps),), NEG, device=device)
+        if built:
+            cost, root = plan_scores(net, ctx, [comps[i][1] for i in built], with_root=True)
+            l_start[built], c_start[built] = root[0], cost[0]
+        cm = masks.expand(G, -1).clone()
+        cr = (reach & ~masks).expand(G, -1).clone()
+        crow = rows.expand(G, -1).clone()
+        cl = l_start.expand(G, -1).clone()
+        cc = c_start.expand(G, -1).clone()
+        so = torch.logsumexp(c_start, 0).expand(G).clone() if built else so
+        trees = [[t for _, t in comps] for _ in range(G)]
+    for k in range(len(trees[0]), 1, -1):
         I, J = torch.triu_indices(k, k, 1, device=device)
         e, p = ((cr[:, I] & cm[:, J]) != 0).nonzero(as_tuple=True)            # by entry, then pair (i < j)
         i, j = I[p], J[p]
@@ -443,6 +472,7 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
         if kc == 1:
             V = torch.full_like(l2, NEG)
+            hv = None
             total = so_far.double()
             if robust is not None:
                 total_w = so_w.double()
@@ -465,6 +495,8 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
             total = total_w.mean(1) if stat == "mean" else torch.quantile(total_w, 0.9, dim=1)
         if trace is not None:
             trace.extend((tuple(sorted(m)), x, v) for m, x, v in zip(child_m.tolist(), l2.tolist(), V.tolist()))
+        if trace_h is not None:
+            trace_h.extend([None] * len(l2) if hv is None else list(hv.detach()))
         if bool((noise_t > 0).any()):
             total = total + noise_t[gc] * torch.randn(total.shape, device=device, generator=generator)
 

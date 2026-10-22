@@ -1,0 +1,66 @@
+# t_cv_repr_exact_separate_head_own_embeddings_hll.yaml with a RowReadout first layer
+# (src/models/model_layers/row_readout.py): the query-conditioned readout of the constants' degree-moment rows,
+# 16 features per pattern appended to the edges (edge_dim 137 + 16). Needs a dataset with the readout columns
+# (src/query_featurizers/row_readout_columns.py).
+model:
+  type: GINEConv
+  embedding:
+    layers:
+      - type: RowReadout
+        store: data/constant_embeddings/yago
+        out_dim: 16
+        hidden: 32
+        id: row_readout
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 136
+            out_features: 101
+            id: gine_nn_1_lin_1
+          - type: ReLU
+            id: gine_nn_1_relu_1
+          - type: Linear
+            in_features: 101
+            out_features: 101
+            id: gine_nn_1_lin_2
+        edge_dim: 153
+        id: gine_1
+
+      - type: TripleGINEConv
+        nn:
+          - type: Linear
+            in_features: 101
+            out_features: 100
+            id: gine_nn_2_lin_1
+          - type: ReLU
+            id: gine_nn_2_relu_1
+          - type: Linear
+            in_features: 100
+            out_features: 200
+            id: gine_nn_2_lin_2
+        edge_dim: 153
+        id: gine_2
+
+      - type: SumAggregation
+        id: sum_agg
+
+  heads:
+    - estimation_type: cardinality
+      layers:
+        - type: Linear
+          in_features: 200
+          out_features: 50
+          id: card_nn_lin_1
+        - type: ReLU
+          id: card_nn_relu_1
+        - type: Linear
+          in_features: 50
+          out_features: 1
+          id: card_nn_lin_2
+
+weight_location:
+  directory: ""
+  chkp: true
+
+
