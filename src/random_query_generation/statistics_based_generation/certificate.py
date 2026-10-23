@@ -18,10 +18,19 @@ From the sampled plans:
     spread     = median sampled C_out / max(min_cost, 1): a conservative estimate of
                  median-plan / optimal-plan (the true optimum can only be cheaper).
 
+Every plan scans every pattern once, so scan work is the same for all plans: it does not change
+which plan is best, but it dilutes what a better plan saves. With scan_rows = sum of the
+pattern sizes:
+
+    best_plan_work     = scan_rows + min_cost: the work of the sample's cheapest plan;
+    spread_with_scans  = (scan_rows + median_cost) / (scan_rows + min_cost): the spread of
+                         the total work, near 1 when the scans dominate whatever the order.
+
 Counts come from counting.ExactCounter (exact, in memory): directly for acyclic subsets (all of
 them for star / path / tree / snowflake / path_star), by conditioning on a cycle-breaking
-variable for cyclic ones. Only cyclic subsets whose conditioning domain is too large are
-COUNTed on QLever, with a FORCED join order (smallest pattern first), so how long a count takes depends on
+variable for cyclic ones. Cyclic subsets whose conditioning domain is too large, and subsets
+with a pattern of more than `max_in_memory_rows` matches (message passing through a huge
+predicate is slow and memory-hungry in numpy), are COUNTed on QLever, with a FORCED join order (smallest pattern first), so how long a count takes depends on
 the data, not on QLever's own optimizer. A QLever count that fails or times out is unknown;
 plans needing it are left out of the estimate (`n_unknown_plans`).
 """
@@ -95,8 +104,9 @@ def certificate_masks(triple_patterns, orders, hard_zero=False):
     return sorted(masks)
 
 
-def summarise(triple_patterns, orders, counts, hard_zero=False):
-    """The certificate of one query from its counts {mask: rows or None}."""
+def summarise(triple_patterns, orders, counts, hard_zero=False, sizes=None):
+    """The certificate of one query from its counts {mask: rows or None} (and its pattern sizes,
+    for the scan-inclusive fields)."""
     full = (1 << len(triple_patterns)) - 1
     costs, unknown, heuristic_cost, first_empty = [], 0, None, None
     for position, order in enumerate(orders):
@@ -118,6 +128,11 @@ def summarise(triple_patterns, orders, counts, hard_zero=False):
         result["min_cost"] = int(min(costs))
         result["median_cost"] = float(np.median(costs))
         result["spread"] = float(result["median_cost"] / max(result["min_cost"], 1))
+        if sizes is not None:
+            scan = int(sum(sizes))
+            result["scan_rows"] = scan
+            result["best_plan_work"] = scan + result["min_cost"]
+            result["spread_with_scans"] = float((scan + result["median_cost"]) / max(scan + result["min_cost"], 1))
         # > 1: some random order beat the smallest-first heuristic, i.e. the best plan is not
         # the obvious one. Recorded for analysis, never used to select.
         if heuristic_cost is not None:
@@ -146,9 +161,10 @@ def forced_count_query(triple_patterns, mask, sizes):
     return f"SELECT (COUNT(*) AS ?count) WHERE {nest(order)}"
 
 
-def certify_in_memory(candidate, structured, counter, n_random_plans, rng, max_empty_pairs=0):
-    """In the worker: orders, every count the in-memory counter can do, and the masks left for
-    QLever. Returns False if the candidate is already rejected (a hard-zero candidate with more
+def certify_in_memory(candidate, structured, counter, n_random_plans, rng, max_empty_pairs=0,
+                      max_in_memory_rows=None):
+    """In the worker: orders, every count the in-memory counter can do (subsets whose patterns
+    all match at most max_in_memory_rows triples), and the masks left for QLever. Returns False if the candidate is already rejected (a hard-zero candidate with more
     than max_empty_pairs empty pairs, or a non-empty acyclic result)."""
     patterns = candidate["triple_patterns"]
     orders = plan_orders(patterns, candidate["pattern_sizes"], n_random_plans, rng)
@@ -157,8 +173,13 @@ def certify_in_memory(candidate, structured, counter, n_random_plans, rng, max_e
 
     exact = getattr(counter, "count_exact", None)
 
+    sizes = candidate["pattern_sizes"]
+
     def count(mask):
         subset = [i for i in range(len(patterns)) if mask >> i & 1]
+        if max_in_memory_rows is not None and max(sizes[i] for i in subset) > max_in_memory_rows:
+            remaining.append(mask)
+            return
         if counter.is_acyclic(structured, subset):
             counts[mask] = int(round(counter.count(structured, subset)))
             return
@@ -192,7 +213,7 @@ def finish_certificate(candidate, qlever_counts=None):
     qlever_counts = qlever_counts or {}
     values = {**candidate["counts"], **{mask: qlever_counts.get(mask) for mask in candidate["qlever_masks"]}}
     candidate["certificate"] = summarise(candidate["triple_patterns"], candidate["orders"], values,
-                                         candidate.get("hard_zero", False))
+                                         candidate.get("hard_zero", False), candidate["pattern_sizes"])
     candidate["certificate"]["qlever_counts"] = len(candidate["qlever_masks"])
     del candidate["counts"], candidate["qlever_masks"]
     return candidate

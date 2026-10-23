@@ -8,6 +8,7 @@ from src.random_query_generation.statistics_based_generation.certificate import 
     certificate_masks, connected_pairs, pattern_adjacency, plan_orders, summarise,
 )
 from src.random_query_generation.statistics_based_generation.generate import _accept
+from src.random_query_generation.statistics_based_generation.counting import _Message, _sum_by
 from src.random_query_generation.statistics_based_generation.graph import DataGraph, parse_ntriples
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
 from src.random_query_generation.statistics_based_generation.instantiate import (
@@ -120,6 +121,11 @@ def test_certificate_math():
     cert = summarise(patterns, orders, counts)
     assert cert["plan_costs"] == [14, 1004] and cert["min_cost"] == 14 and cert["heuristic_cost"] == 14
     assert cert["spread"] == pytest.approx(np.median([14, 1004]) / 14)
+    assert "spread_with_scans" not in cert
+    # scans are the same in every plan: 10000 scanned rows dilute the same C_out gap to ~1.05
+    scanned = summarise(patterns, orders, counts, sizes=[5000, 3000, 2000])
+    assert scanned["scan_rows"] == 10000 and scanned["best_plan_work"] == 10014
+    assert scanned["spread_with_scans"] == pytest.approx((10000 + np.median([14, 1004])) / 10014)
     unknown = summarise(patterns, orders, {**counts, mask_of((1, 2)): None})
     assert unknown["n_unknown_plans"] == 1 and unknown["plan_costs"] == [14]
     zero = summarise(patterns, orders, {mask_of((0, 1)): 5, mask_of((1, 2)): 7, 0b111: 0}, hard_zero=True)
@@ -357,3 +363,14 @@ def test_exact_counts_of_cyclic_queries_equal_brute_force():
 def test_spread_classes():
     from src.random_query_generation.statistics_based_generation.generate import spread_class
     assert [spread_class(s, [2, 10]) for s in (1.0, 1.99, 2.0, 9.9, 10.0, 1e6)] == [0, 0, 1, 1, 2, 2]
+
+
+def test_dense_message_paths_match_the_sparse_ones():
+    rng = np.random.default_rng(0)
+    keys = rng.integers(0, 1000, 5000).astype(np.int32)
+    weights = rng.random(5000) + 0.1
+    sparse, dense = _sum_by(keys, weights), _sum_by(keys, weights, n_entities=1000)
+    assert np.array_equal(sparse.ids, dense.ids) and np.allclose(sparse.values, dense.values)
+    message = _Message(np.array([3, 17, 999]), np.array([2.0, 5.0, 7.0]))
+    entities = rng.integers(0, 1000, 500)
+    assert np.array_equal(message.lookup(entities), message.lookup(entities, n_entities=1000))

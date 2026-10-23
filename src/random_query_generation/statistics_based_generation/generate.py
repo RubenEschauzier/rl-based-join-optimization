@@ -91,11 +91,14 @@ def _make_candidate(job):
             return None
         perturbation = instance.perturbation
     patterns = instance.triple_patterns(graph)
+    sizes = instance.pattern_sizes(graph, statistics)
+    if _STATE["max_scan_rows"] is not None and sum(sizes) > _STATE["max_scan_rows"]:
+        return None             # every plan scans more than the work budget: no need to certify
     strata = sorted(instance.plan.constants.values())
     candidate = {
         "shape": kind, "n_patterns": n, "choke_point": choke_name, "hard_zero": hard_zero,
         "perturbation": perturbation, "triple_patterns": patterns,
-        "pattern_sizes": instance.pattern_sizes(graph, statistics),
+        "pattern_sizes": sizes,
         "n_constants": len(instance.plan.constants), "constant_strata": strata,
         "added_constants": len(instance.plan.constants) - planned_constants,
         "template": f"{kind}|{n}|{choke_name}|{'zero' if hard_zero else 'nonzero'}|{'-'.join(strata)}",
@@ -103,15 +106,16 @@ def _make_candidate(job):
         "seed": int(seed),
     }
     if not certify_in_memory(candidate, instance.structured_patterns(), _STATE["counter"],
-                             _STATE["random_plans"], rng, _STATE["max_empty_pairs"]):
+                             _STATE["random_plans"], rng, _STATE["max_empty_pairs"], _STATE["max_in_memory_rows"]):
         return None
     return candidate
 
 
-def _accept(candidate, acceptance, max_empty_pairs=0):
+def _accept(candidate, acceptance, max_empty_pairs=0, measure="spread"):
+    """measure: the certificate's spread that min_spread applies to (spread or spread_with_scans)."""
     certificate = candidate["certificate"]
     result = certificate.get("result")
-    if result is None or "spread" not in certificate:
+    if result is None or measure not in certificate:
         return False, "uncertified"
     if candidate["hard_zero"]:
         empty_pairs = certificate.get("empty_pairs")
@@ -121,10 +125,12 @@ def _accept(candidate, acceptance, max_empty_pairs=0):
         return False, "zero"                    # unplanned zeros: the zero share is controlled
     elif acceptance.max_result is not None and result > acceptance.max_result:
         return False, "result_too_large"
-    if acceptance.min_spread is not None and certificate["spread"] < acceptance.min_spread:
+    if acceptance.min_spread is not None and certificate[measure] < acceptance.min_spread:
         return False, "low_spread"
-    if acceptance.max_min_cost is not None and certificate["min_cost"] > acceptance.max_min_cost:
+    if acceptance.get("max_min_cost") is not None and certificate["min_cost"] > acceptance.max_min_cost:
         return False, "expensive_optimum"
+    if acceptance.get("max_best_plan_work") is not None and certificate["best_plan_work"] > acceptance.max_best_plan_work:
+        return False, "expensive_best_plan"
     return True, "accepted"
 
 
@@ -173,7 +179,9 @@ def _summary(candidates):
             "pairs_nonempty": sum(bool(c.get("pairs_nonempty")) for c in certs) if zero else None,
             "one_empty_pair": sum(c.get("empty_pairs") == 1 for c in certs) if zero else None,
             "spread_q10_25_50_75_90": quantiles([c.get("spread") for c in certs]),
+            "spread_with_scans_q": quantiles([c.get("spread_with_scans") for c in certs]),
             "min_cost_q": quantiles([c.get("min_cost") for c in certs]),
+            "best_plan_work_q": quantiles([c.get("best_plan_work") for c in certs]),
             "result_q": quantiles([c.get("result") for c in certs]),
             "largest_pattern_q": quantiles([max(c_["pattern_sizes"]) for c_ in group]),
             "unknown_plans_mean": float(np.mean([c.get("n_unknown_plans", 0) for c in certs])),
@@ -193,6 +201,8 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     # workload is not only queries whose best order is far better than a typical one.
     strata = gen.get("spread_strata")
     stratify = strata is not None and not pilot
+    # which spread the classes and min_spread use: the joins-only spread or spread_with_scans
+    measure = strata.get("measure", "spread") if strata is not None else "spread"
     class_shares = list(strata.shares) if stratify else [1.0]
     wanted = Counter()
     for n in sizes:                              # non-zero cells: size x choke point x spread class
@@ -258,7 +268,7 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         return c["n_patterns"], c["choke_point"], c["hard_zero"], c["spread_class"]
 
     def resolve(c):
-        spread = c["certificate"].get("spread")
+        spread = c["certificate"].get(measure)
         c["spread_class"] = (spread_class(spread, strata.edges)
                              if stratify and not c["hard_zero"] and spread is not None else None)
         cell = cell_of(c)
@@ -267,7 +277,7 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             kept.append(c)
             accepted[cell].append(c)
             return
-        ok, reason = _accept(c, gen.acceptance, int(gen.hard_zero.max_empty_pairs))
+        ok, reason = _accept(c, gen.acceptance, int(gen.hard_zero.max_empty_pairs), measure)
         reasons[reason] += 1
         if ok and len(accepted[cell]) + reserved[cell] < wanted[cell] and counter.threads:
             reserved[cell] += 1
@@ -398,9 +408,11 @@ def main(cfg: DictConfig):
         counter=ExactCounter(graph, PredicateIndex(graph),
                              max_assignments=int(gen.certificate.get("max_conditioning_values", 2000))),
         random_plans=int(gen.certificate.random_plans),
+        max_in_memory_rows=gen.certificate.get("max_in_memory_rows"),
         max_empty_pairs=int(gen.hard_zero.max_empty_pairs),
         max_result=gen.result_budget.max_result,
         budget_conditioning=int(gen.result_budget.get("max_conditioning", 200)),
+        max_scan_rows=gen.acceptance.get("max_best_plan_work"),
     )
     _STATE["hard_zero"] = HardZeroMaker(graph, statistics, int(settings.max_pattern_matches),
                                         float(gen.hard_zero.anticorrelation_gamma), counter=_STATE["counter"],

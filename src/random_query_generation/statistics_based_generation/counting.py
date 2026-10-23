@@ -43,7 +43,11 @@ class _Message:
     def __init__(self, ids, values):
         self.ids, self.values = ids, values
 
-    def lookup(self, entities):
+    def lookup(self, entities, n_entities=None):
+        if n_entities is not None and len(entities) > n_entities // 8:
+            dense = np.zeros(n_entities)                 # many lookups: no binary searches
+            dense[self.ids] = self.values
+            return dense[entities]
         position = np.searchsorted(self.ids, entities)
         position = np.minimum(position, len(self.ids) - 1) if len(self.ids) else position
         hit = (self.ids[position] == entities) if len(self.ids) else np.zeros(len(entities), bool)
@@ -65,9 +69,15 @@ def _multiply(a, b):
     return a.multiply(b)
 
 
-def _sum_by(keys, weights):
+def _sum_by(keys, weights, n_entities=None):
+    """Per distinct key, the sum of its (positive) weights. Many keys (more than n_entities / 8)
+    are summed into a dense vector over the entities: no sort, and no sort-sized temporaries."""
     if len(keys) == 0:
         return _Message(np.empty(0, np.int64), np.empty(0))
+    if n_entities is not None and len(keys) > n_entities // 8:
+        dense = np.bincount(keys, weights=weights, minlength=n_entities)
+        ids = np.flatnonzero(dense)
+        return _Message(ids, dense[ids])
     ids, inverse = np.unique(keys, return_inverse=True)
     return _Message(ids.astype(np.int64), np.bincount(inverse, weights=weights))
 
@@ -76,7 +86,7 @@ class AcyclicCounter:
     """Counts of connected sub-BGPs of one query, given as patterns
     (subject term, predicate, object term) with a term ("v", node) or ("c", entity)."""
 
-    def __init__(self, graph, predicate_index, small_support=2048, cache_entries=200_000):
+    def __init__(self, graph, predicate_index, small_support=2048, cache_entries=200_000, cache_ids=20_000_000):
         self.graph, self.index = graph, predicate_index
         self.small_support = small_support
         # Messages of unconstrained leaves are the same in every query: the per-predicate
@@ -85,6 +95,9 @@ class AcyclicCounter:
         self._subtree_cache = {}
         self._query_key = None
         self.cache_entries = cache_entries
+        # a bound on the cached messages' total length: with large predicates one message can
+        # have millions of entities
+        self.cache_ids, self._cached_ids = cache_ids, 0
 
     @staticmethod
     def is_acyclic(patterns, subset):
@@ -134,20 +147,22 @@ class AcyclicCounter:
             return self._degree_cache[(predicate, child_is_object)]
         subjects, objects = self.index.triples(predicate)
         child, parent = (objects, subjects) if child_is_object else (subjects, objects)
+        n = self.graph.n_entities
         if message is None:
-            result = _sum_by(parent.astype(np.int64), np.ones(len(child)))
+            result = _sum_by(parent, np.ones(len(child)), n)
             self._degree_cache[(predicate, child_is_object)] = result
             return result
-        weights = np.ones(len(child)) if message is None else message.lookup(child.astype(np.int64))
+        weights = message.lookup(child, n)
         keep = weights != 0
-        return _sum_by(parent[keep].astype(np.int64), weights[keep])
+        return _sum_by(parent[keep], weights[keep], n)
 
     def count(self, patterns, subset):
         """Exact number of solutions of the connected, acyclic sub-BGP `subset`."""
         subset = list(subset)
         key = tuple(patterns)
-        if key != self._query_key or len(self._subtree_cache) > self.cache_entries:
-            self._query_key, self._subtree_cache = key, {}
+        if (key != self._query_key or len(self._subtree_cache) > self.cache_entries
+                or self._cached_ids > self.cache_ids):
+            self._query_key, self._subtree_cache, self._cached_ids = key, {}, 0
         if not self.is_acyclic(patterns, subset):
             raise ValueError("subset has a cycle")
         unary, binary = {}, {}
@@ -197,6 +212,7 @@ class AcyclicCounter:
                 return self._subtree_cache[cache_key]
             result = _compute(node, parent)
             self._subtree_cache[cache_key] = result
+            self._cached_ids += 0 if result is None else len(result.ids)
             return result
 
         def _compute(node, parent):

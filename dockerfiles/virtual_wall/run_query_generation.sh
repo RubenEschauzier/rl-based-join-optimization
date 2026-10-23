@@ -3,6 +3,8 @@
 #
 #   run_query_generation.sh "[cycle]"            # one or more shapes, hydra list syntax
 #   run_query_generation.sh "[path,tree]" 1      # optional seed
+#   OUT_NAME=statistics_based_yago_large run_query_generation.sh "[path]" 1 \
+#       "generation.sizes=[18,20,22]" generation.queries_per_shape=375   # further hydra overrides
 #
 # The generator works in memory (graph + exact counting) on this node's CPU cores; the node's
 # own QLever instances (localhost:7000-7014) only COUNT the few cyclic subsets too large to
@@ -14,11 +16,12 @@
 #       tar -C data/statistics_based_generation -cf - yago/graph.npz yago/statistics.npz | zstd -T0 -3 -o generation_graph.tar.zst
 #     and copied here, e.g. scp from the trainer), extracted into data/statistics_based_generation/,
 #   - a Python environment: created below like the trainer's (uv + requirements.txt).
-# Output: data/generated_queries/statistics_based_yago/<hostname>/statistics_based_<shape>.json
+# Output: data/generated_queries/<OUT_NAME, default statistics_based_yago>/<hostname>/statistics_based_<shape>.json
 set -euo pipefail
 
-SHAPES="${1:?usage: $0 \"[shape,...]\" [seed]}"
+SHAPES="${1:?usage: $0 \"[shape,...]\" [seed] [hydra overrides...]}"
 SEED="${2:-0}"
+shift $(( $# < 2 ? $# : 2 ))
 REPO_DIR="${REPO_DIR:-/users/reschauz/rl-based-join-optimization}"
 cd "$REPO_DIR"
 
@@ -39,11 +42,11 @@ fi
 PHYSICAL=$(lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
 WORKERS=$(( PHYSICAL > 2 ? PHYSICAL - 1 : 1 ))
 PORTS=$(docker ps --filter name=qlever_core -q | wc -l)
-OUT="data/generated_queries/statistics_based_yago/$(hostname -s)"
+OUT="data/generated_queries/${OUT_NAME:-statistics_based_yago}/$(hostname -s)"
 mkdir -p "$OUT"
 echo "Generating $SHAPES with $WORKERS workers, counting on $PORTS local QLever endpoints -> $OUT"
 
 .venv/bin/python -m src.random_query_generation.statistics_based_generation.generate \
   generation.mode=generate "generation.shapes=$SHAPES" generation.seed="$SEED" generation.workers="$WORKERS" \
   "generation.endpoints.endpoint_hosts=[localhost]" generation.endpoints.ports_per_host="$PORTS" \
-  generation.output_directory="$OUT" 2>&1 | grep --line-buffered -v "Counting true cardinalities" | tee "$OUT.log"
+  generation.output_directory="$OUT" "$@" 2>&1 | grep --line-buffered -v "Counting true cardinalities" | tee "$OUT.log"
