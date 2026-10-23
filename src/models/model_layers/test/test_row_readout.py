@@ -80,7 +80,8 @@ class _Query:
         self.triple_patterns = [f"p{i}" for i in range(len(patterns))]
 
 
-def test_query_readout_matches_the_layer_on_every_subset(store):
+@pytest.mark.parametrize("max_pairs", [10, 1, 0])                 # contexts tabled, some per call, all per call
+def test_query_readout_matches_the_layer_on_every_subset(store, max_pairs):
     from src.models.model_layers.row_readout import QueryReadout
     from src.supervised_value_estimation.amortized_dp import soft_dp
     torch.manual_seed(0)
@@ -89,7 +90,7 @@ def test_query_readout_matches_the_layer_on_every_subset(store):
     masks = torch.arange(1, 1 << 4)
     x, ei, ea, _ = soft_dp.subset_batch(q, masks, "cpu")
     ref_x, ref_ea = layer(x, ei, ea)
-    cache = QueryReadout(layer, q, "cpu")
+    cache = QueryReadout(layer, q, "cpu", max_pairs=max_pairs)
     for chunk in (masks, masks[[2, 7, 12]], masks[-1:]):           # one call over all subsets, then a few
         cx, cei, cea, _ = soft_dp.subset_batch(q, chunk, "cpu")
         mx, mea = cache(chunk, cx, cea)
@@ -98,7 +99,8 @@ def test_query_readout_matches_the_layer_on_every_subset(store):
     assert torch.allclose(cache(masks, x, ea)[1], ref_ea, atol=1e-6)
 
 
-def test_query_readout_matches_the_backbone_on_real_queries():
+@pytest.mark.parametrize("max_pairs", [10, 0])
+def test_query_readout_matches_the_backbone_on_real_queries(max_pairs):
     import os
     from src.supervised_value_estimation.amortized_dp import soft_dp
     from src.supervised_value_estimation.amortized_dp.bushy_train import load_split
@@ -116,6 +118,7 @@ def test_query_readout_matches_the_backbone_on_real_queries():
             q = Query(val[i])
             s = soft_dp.SubsetStructure(q.neighbour_masks, "cpu")
             readout = query_readout(model, q.data, "cpu")
+            readout.max_pairs = max_pairs
             for chunk in (s.masks, s.masks[torch.randperm(len(s.masks))[:7]]):
                 batch = soft_dp.subset_batch(q.data, chunk, "cpu")
                 phi_ref, l_ref = phi_and_direct(model, *batch)

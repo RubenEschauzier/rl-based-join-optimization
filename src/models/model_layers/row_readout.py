@@ -159,11 +159,13 @@ class QueryReadout:
     pattern order), so its constant edges, their rows and their pairs (e, e') are those of the full query whose patterns
     are both in the subset. Built once (on the first call, so a timed first call includes it): the rows, the pair MLP
     output and g embedding of every pair of the full query, the entries' keys and values, and the row features rx.
-    Per call: the sum / max of the present pairs, the attention query, the soft read and the output MLP. The same
-    numbers as RowReadout.forward on soft_dp.subset_batch; inference only."""
+    A constant edge's readout depends only on which of its pairs are present (its context), so the readout of every
+    context of every constant edge with at most `max_pairs` pairs is computed once too, and a call computes each
+    constant edge's context from the masks and looks it up; edges with more pairs are read per call. The same numbers
+    as RowReadout.forward on soft_dp.subset_batch; inference only."""
 
-    def __init__(self, module: RowReadout, query, device):
-        self.m, self.query, self.device, self.ready = module, query, device, False
+    def __init__(self, module: RowReadout, query, device, max_pairs: int = 10):
+        self.m, self.query, self.device, self.ready, self.max_pairs = module, query, device, False, max_pairs
 
     @torch.no_grad()
     def _build(self):
@@ -212,42 +214,68 @@ class QueryReadout:
         self.eptr = torch.cumsum(self.ne, 0) - self.ne
         n = torch.where(found, st.n[rows], torch.ones_like(f, dtype=torch.float32))
         self.rx = torch.stack([torch.log1p(n) / 10 * found, (torch.log(n) - st.lavg[f]) * found, found.float()], 1)
+        # contexts: pair b of constant edge c is bit b of c's context; code = bits @ W over the subset's patterns
+        npair = torch.bincount(pe, minlength=self.K)
+        bit = torch.arange(len(pe), device=dev) - (torch.cumsum(npair, 0) - npair)[pe]      # pe is sorted
+        self.W = torch.zeros(self.n, self.K, device=dev).index_put_((self.pat_j, pe), (2.0 ** bit), accumulate=True)
+        self.tabled = npair <= self.max_pairs
+        size = torch.where(self.tabled, 2 ** npair, torch.zeros_like(npair))
+        self.tptr = torch.cumsum(size, 0) - size
+        tc = torch.repeat_interleave(torch.arange(self.K, device=dev), size)             # table row -> constant edge
+        code = torch.arange(len(tc), device=dev) - self.tptr[tc]
+        p_all = _ranges((torch.cumsum(npair, 0) - npair)[tc], npair[tc])                 # (row, pair of its edge)
+        r_all = torch.repeat_interleave(torch.arange(len(tc), device=dev), npair[tc])
+        on = ((code[r_all] >> bit[p_all]) & 1).bool()
+        self.table = self._out(tc, r_all[on], p_all[on])
         self.ready = True
+
+    def _out(self, c_i, pin, p_i):
+        """RowReadout's output for instances (constant edge c_i[r]) whose present pairs are p_i (instance pin)."""
+        m, dev, H, I = self.m, self.device, self.m.hidden, len(c_i)
+        h = self.h[p_i]
+        h_sum = torch.zeros(I, H, device=dev).index_add_(0, pin, h)
+        cnt = torch.bincount(pin, minlength=I)
+        h_max = _segment_max(h, pin, I).clamp_min(0) if len(pin) else torch.zeros(I, H, device=dev)
+        h_max = torch.where(cnt[:, None] > 0, h_max, torch.zeros_like(h_max))
+        q = self.f_e[c_i] + torch.zeros(I, self.g_e.shape[1], device=dev).index_add_(0, pin, self.g_e[p_i]) / \
+            cnt.clamp_min(1)[:, None]
+        q = m.query(q)
+        ne = self.ne[c_i]
+        eo = torch.repeat_interleave(torch.arange(I, device=dev), ne)
+        ix = _ranges(self.eptr[c_i], ne)
+        sc = (self.k[ix] * q[eo]).sum(1, keepdim=True) / H ** 0.5
+        sc = torch.exp(sc - _segment_max(sc, eo, I)[eo])
+        w = sc / torch.zeros(I, 1, device=dev).index_add_(0, eo, sc)[eo]
+        soft = torch.zeros(I, H, device=dev).index_add_(0, eo, w * self.v[ix])
+        return m.out(torch.cat([self.rx[c_i], h_sum, h_max, soft], 1))
 
     @torch.no_grad()
     def __call__(self, masks, x, edge_attr):
         """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x[:, 1:], edge_attr with the readout)."""
         if not self.ready:
             self._build()
-        m, dev = self.m, self.device
+        dev = self.device
         base = edge_attr[:, 1:]
-        readout = torch.zeros(len(edge_attr), m.out_dim, device=dev, dtype=base.dtype)
+        readout = torch.zeros(len(edge_attr), self.m.out_dim, device=dev, dtype=base.dtype)
         if self.K:
-            H = m.hidden
             bits = ((masks.to(dev)[:, None] >> torch.arange(self.n, device=dev)) & 1).bool()
             inst = bits[:, self.pat_c]                                         # [M, K]: constant edge in the subset
             s_i, c_i = torch.nonzero(inst, as_tuple=True)
-            I = len(c_i)
-            inst_id = (torch.cumsum(inst.reshape(-1).long(), 0) - 1).view_as(inst)
-            s_p, p_i = torch.nonzero(inst[:, self.pe] & bits[:, self.pat_j], as_tuple=True)
-            pin = inst_id[s_p, self.pe[p_i]]
-            h = self.h[p_i]
-            h_sum = torch.zeros(I, H, device=dev).index_add_(0, pin, h)
-            cnt = torch.bincount(pin, minlength=I)
-            h_max = _segment_max(h, pin, I).clamp_min(0) if len(pin) else torch.zeros(I, H, device=dev)
-            h_max = torch.where(cnt[:, None] > 0, h_max, torch.zeros_like(h_max))
-            q = self.f_e[c_i] + torch.zeros(I, self.g_e.shape[1], device=dev).index_add_(0, pin, self.g_e[p_i]) / \
-                cnt.clamp_min(1)[:, None]
-            q = m.query(q)
-            ne = self.ne[c_i]
-            eo = torch.repeat_interleave(torch.arange(I, device=dev), ne)
-            ix = _ranges(self.eptr[c_i], ne)
-            sc = (self.k[ix] * q[eo]).sum(1, keepdim=True) / H ** 0.5
-            sc = torch.exp(sc - _segment_max(sc, eo, I)[eo])
-            w = sc / torch.zeros(I, 1, device=dev).index_add_(0, eo, sc)[eo]
-            soft = torch.zeros(I, H, device=dev).index_add_(0, eo, w * self.v[ix])
+            code = (bits.float() @ self.W).long()                              # [M, K] contexts
+            out = self.table[(self.tptr[c_i] + code[s_i, c_i]).clamp_max(max(len(self.table) - 1, 0))] \
+                if len(self.table) else torch.zeros(len(c_i), self.m.out_dim, device=dev)
+            wide = ~self.tabled[c_i]
+            if bool(wide.any()):                                               # too many pairs to table: per call
+                w_s, w_c = s_i[wide], c_i[wide]
+                I = len(w_c)
+                inst_w = torch.full_like(inst, -1, dtype=torch.long)
+                inst_w[w_s, w_c] = torch.arange(I, device=dev)
+                s_p, p_i = torch.nonzero(inst[:, self.pe] & bits[:, self.pat_j], as_tuple=True)
+                pin = inst_w[s_p, self.pe[p_i]]
+                keep = pin >= 0
+                out[wide] = self._out(w_c, pin[keep], p_i[keep])
             edges = bits.repeat_interleave(2, dim=1)                           # [M, 2n], subset_batch's edge order
             pos = (torch.cumsum(edges.reshape(-1).long(), 0) - 1).view_as(edges)
-            readout[pos[s_i, self.eid[c_i]]] = m.out(torch.cat([self.rx[c_i], h_sum, h_max, soft], 1)).to(base.dtype)
+            readout[pos[s_i, self.eid[c_i]]] = out.to(base.dtype)
             readout = readout + readout[torch.arange(len(readout), device=dev) ^ 1]
         return x[:, 1:], torch.cat([base[:, :-1], readout, base[:, -1:]], 1)
