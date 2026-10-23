@@ -150,3 +150,104 @@ class RowReadout(nn.Module):
             readout[eid] = self.out(torch.cat([rx, h_sum, h_max, soft], 1)).to(base.dtype)
             readout = readout + readout[torch.arange(E, device=device) ^ 1]          # both directions of a pattern
         return x, torch.cat([base[:, :-1], readout, base[:, -1:]], 1)
+
+
+class QueryReadout:
+    """RowReadout over the connected subsets of ONE query, with the subset-independent work done once per query.
+
+    A subset's graph keeps the query's patterns in its mask (soft_dp.subset_batch: pattern i's edges 2i, 2i + 1, in
+    pattern order), so its constant edges, their rows and their pairs (e, e') are those of the full query whose patterns
+    are both in the subset. Built once (on the first call, so a timed first call includes it): the rows, the pair MLP
+    output and g embedding of every pair of the full query, the entries' keys and values, and the row features rx.
+    Per call: the sum / max of the present pairs, the attention query, the soft read and the output MLP. The same
+    numbers as RowReadout.forward on soft_dp.subset_batch; inference only."""
+
+    def __init__(self, module: RowReadout, query, device):
+        self.m, self.query, self.device, self.ready = module, query, device, False
+
+    @torch.no_grad()
+    def _build(self):
+        m, dev = self.m, self.device
+        x, ei, ea = self.query.x.to(dev), torch.as_tensor(self.query.edge_index).to(dev), self.query.edge_attr.to(dev)
+        ent, fs = x[:, 0].long(), ea[:, 0].long()
+        src, dst = ei
+        self.n = len(self.query.triple_patterns)
+        eid = torch.nonzero((ent[src] >= 0) & (fs >= 0), as_tuple=True)[0]
+        self.eid, self.K = eid, len(eid)
+        if not self.K:
+            self.ready = True
+            return
+        st = m.store(dev)
+        f = fs[eid]
+        rows, found = st.find(st.dkey, ent[src[eid]] * F + f)
+        order = torch.argsort(src)
+        ss = src[order]
+        lo = torch.searchsorted(ss, dst[eid])
+        cnt = torch.searchsorted(ss, dst[eid], right=True) - lo
+        pe = torch.repeat_interleave(torch.arange(self.K, device=dev), cnt)
+        pj = order[_ranges(lo, cnt)]
+        keep = (pj != (eid[pe] ^ 1)) & (fs[pj] >= 0)
+        pe, pj = pe[keep], pj[keep]
+        g, pf, ok = fs[pj], f[pe], found[pe]
+        e, hit = st.find(st.ekey, rows[pe] * F + g)
+        hit = hit & ok
+        one = torch.ones_like(g, dtype=torch.float32)
+        m0, m1, m2 = (torch.where(hit, v[e], one) for v in (st.e0, st.e1, st.e2))
+        feats = m.moments(st, pf, g, m0, m1, m2, torch.where(ok, st.n[rows[pe]], one)) * hit[:, None]
+        self.h = m.pair(torch.cat([feats, hit[:, None].float(), m.f_emb(pf), m.g_emb(g)], 1))
+        self.g_e = m.g_emb(g)
+        self.pe, self.pat_c, self.pat_j = pe, eid // 2, pj // 2
+        self.f_e = m.f_emb(f)
+        fr = rows[found]
+        owner = torch.nonzero(found, as_tuple=True)[0]
+        ne = st.rptr[fr + 1] - st.rptr[fr]
+        ent_ix = _ranges(st.rptr[fr], ne)
+        eg = st.eg[ent_ix].long()
+        ef = f[torch.repeat_interleave(owner, ne)]
+        kv = m.entry(torch.cat([m.moments(st, ef, eg, st.e0[ent_ix], st.e1[ent_ix], st.e2[ent_ix],
+                                          st.n[torch.repeat_interleave(fr, ne)]), m.g_emb(eg)], 1))
+        self.k, self.v = kv[:, :m.hidden], kv[:, m.hidden:]
+        self.ne = torch.zeros(self.K, dtype=torch.long, device=dev)
+        self.ne[owner] = ne                              # entries per constant edge (0 when its row is missing)
+        self.eptr = torch.cumsum(self.ne, 0) - self.ne
+        n = torch.where(found, st.n[rows], torch.ones_like(f, dtype=torch.float32))
+        self.rx = torch.stack([torch.log1p(n) / 10 * found, (torch.log(n) - st.lavg[f]) * found, found.float()], 1)
+        self.ready = True
+
+    @torch.no_grad()
+    def __call__(self, masks, x, edge_attr):
+        """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x[:, 1:], edge_attr with the readout)."""
+        if not self.ready:
+            self._build()
+        m, dev = self.m, self.device
+        base = edge_attr[:, 1:]
+        readout = torch.zeros(len(edge_attr), m.out_dim, device=dev, dtype=base.dtype)
+        if self.K:
+            H = m.hidden
+            bits = ((masks.to(dev)[:, None] >> torch.arange(self.n, device=dev)) & 1).bool()
+            inst = bits[:, self.pat_c]                                         # [M, K]: constant edge in the subset
+            s_i, c_i = torch.nonzero(inst, as_tuple=True)
+            I = len(c_i)
+            inst_id = (torch.cumsum(inst.reshape(-1).long(), 0) - 1).view_as(inst)
+            s_p, p_i = torch.nonzero(inst[:, self.pe] & bits[:, self.pat_j], as_tuple=True)
+            pin = inst_id[s_p, self.pe[p_i]]
+            h = self.h[p_i]
+            h_sum = torch.zeros(I, H, device=dev).index_add_(0, pin, h)
+            cnt = torch.bincount(pin, minlength=I)
+            h_max = _segment_max(h, pin, I).clamp_min(0) if len(pin) else torch.zeros(I, H, device=dev)
+            h_max = torch.where(cnt[:, None] > 0, h_max, torch.zeros_like(h_max))
+            q = self.f_e[c_i] + torch.zeros(I, self.g_e.shape[1], device=dev).index_add_(0, pin, self.g_e[p_i]) / \
+                cnt.clamp_min(1)[:, None]
+            q = m.query(q)
+            ne = self.ne[c_i]
+            eo = torch.repeat_interleave(torch.arange(I, device=dev), ne)
+            ix = _ranges(self.eptr[c_i], ne)
+            sc = (self.k[ix] * q[eo]).sum(1, keepdim=True) / H ** 0.5
+            sc = torch.exp(sc - _segment_max(sc, eo, I)[eo])
+            w = sc / torch.zeros(I, 1, device=dev).index_add_(0, eo, sc)[eo]
+            soft = torch.zeros(I, H, device=dev).index_add_(0, eo, w * self.v[ix])
+            edges = bits.repeat_interleave(2, dim=1)                           # [M, 2n], subset_batch's edge order
+            pos = (torch.cumsum(edges.reshape(-1).long(), 0) - 1).view_as(edges)
+            readout[pos[s_i, self.eid[c_i]]] = m.out(torch.cat([self.rx[c_i], h_sum, h_max, soft], 1)).to(base.dtype)
+            readout = readout + readout[torch.arange(len(readout), device=dev) ^ 1]
+        return x[:, 1:], torch.cat([base[:, :-1], readout, base[:, -1:]], 1)

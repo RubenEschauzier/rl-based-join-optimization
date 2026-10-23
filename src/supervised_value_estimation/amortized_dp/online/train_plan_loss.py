@@ -92,14 +92,30 @@ def log_cards(model, x, edge_index, edge_attr, batch):
     return next(h["output"] for h in heads if h["output_type"] == "cardinality").reshape(-1)
 
 
-def phi_and_direct(model, x, edge_index, edge_attr, batch):
-    """(pooled embedding phi, log-card estimate) per graph: the cardinality head's input and output."""
-    phi = model.embedding_model.forward(x, edge_index, edge_attr, batch)
+def phi_and_direct(model, x, edge_index, edge_attr, batch, readout=None, masks=None):
+    """(pooled embedding phi, log-card estimate) per graph: the cardinality head's input and output. readout: a
+    row_readout.QueryReadout of the query in place of the backbone's RowReadout layer (masks: the subsets of the batch)."""
+    if readout is None:
+        phi = model.embedding_model.forward(x, edge_index, edge_attr, batch)
+    else:
+        from torch_geometric.nn.conv import MessagePassing
+        x, edge_attr = readout(masks, x, edge_attr)
+        for layer in list(model.embedding_model.children())[1:]:
+            x = layer(x, edge_index, edge_attr) if isinstance(layer, MessagePassing) else layer(x, batch)
+        phi = x
     return phi, model.heads[model.head_types.index("cardinality")](phi).reshape(-1)
 
 
-def subset_phi(model, data, masks, device, chunk=16384):
-    out = [phi_and_direct(model, *soft_dp.subset_batch(data, masks[i:i + chunk], device)) for i in range(0, len(masks), chunk)]
+def query_readout(model, data, device):
+    """A row_readout.QueryReadout of the query when the backbone starts with a RowReadout layer, else None."""
+    from src.models.model_layers.row_readout import QueryReadout, RowReadout
+    first = next(iter(model.embedding_model.children()))
+    return QueryReadout(first, data, device) if isinstance(first, RowReadout) else None
+
+
+def subset_phi(model, data, masks, device, chunk=16384, readout=None):
+    out = [phi_and_direct(model, *soft_dp.subset_batch(data, masks[i:i + chunk], device), readout=readout,
+                          masks=masks[i:i + chunk]) for i in range(0, len(masks), chunk)]
     return torch.cat([o[0] for o in out]), torch.cat([o[1] for o in out])
 
 

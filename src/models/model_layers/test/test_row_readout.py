@@ -72,3 +72,52 @@ def test_exact_entry_moves_the_readout(store):
     layer._store.e1[0] = 600.0                                      # many more g-edges behind the same neighbours
     after = layer(*g)[1][0, 1:5]
     assert not torch.allclose(before, after)
+
+
+class _Query:
+    def __init__(self, patterns):
+        self.x, self.edge_index, self.edge_attr = graph(patterns)
+        self.triple_patterns = [f"p{i}" for i in range(len(patterns))]
+
+
+def test_query_readout_matches_the_layer_on_every_subset(store):
+    from src.models.model_layers.row_readout import QueryReadout
+    from src.supervised_value_estimation.amortized_dp import soft_dp
+    torch.manual_seed(0)
+    layer = RowReadout(store, out_dim=4, hidden=8)
+    q = _Query([(0, 3, 1), (1, 7, 2), (1, 9, 3), (0, 3, 2)])
+    masks = torch.arange(1, 1 << 4)
+    x, ei, ea, _ = soft_dp.subset_batch(q, masks, "cpu")
+    ref_x, ref_ea = layer(x, ei, ea)
+    cache = QueryReadout(layer, q, "cpu")
+    for chunk in (masks, masks[[2, 7, 12]], masks[-1:]):           # one call over all subsets, then a few
+        cx, cei, cea, _ = soft_dp.subset_batch(q, chunk, "cpu")
+        mx, mea = cache(chunk, cx, cea)
+        rx, rea = layer(cx, cei, cea)
+        assert torch.equal(mx, rx) and torch.allclose(mea, rea, atol=1e-6)
+    assert torch.allclose(cache(masks, x, ea)[1], ref_ea, atol=1e-6)
+
+
+def test_query_readout_matches_the_backbone_on_real_queries():
+    import os
+    from src.supervised_value_estimation.amortized_dp import soft_dp
+    from src.supervised_value_estimation.amortized_dp.bushy_train import load_split
+    from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import Query, phi_and_direct, query_readout
+    from src.models.model_instantiator import ModelFactory
+    config = "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll_rowreadout.yaml"
+    data_dir = "data/generated_queries/mixed_yago_v2/hll_contextual_attention_rowreadout/dataset_val"
+    if not (os.path.isdir(data_dir) and os.path.isdir("data/constant_embeddings/yago")):
+        pytest.skip("row-readout dataset or store not available")
+    torch.manual_seed(0)
+    model = ModelFactory(config).load_gine_conv().eval()       # random weights: the computation is what is tested
+    val = load_split(data_dir)
+    with torch.no_grad():
+        for i in range(0, len(val), max(1, len(val) // 25)):
+            q = Query(val[i])
+            s = soft_dp.SubsetStructure(q.neighbour_masks, "cpu")
+            readout = query_readout(model, q.data, "cpu")
+            for chunk in (s.masks, s.masks[torch.randperm(len(s.masks))[:7]]):
+                batch = soft_dp.subset_batch(q.data, chunk, "cpu")
+                phi_ref, l_ref = phi_and_direct(model, *batch)
+                phi, l = phi_and_direct(model, *batch, readout=readout, masks=chunk)
+                assert torch.allclose(phi, phi_ref, rtol=1e-4, atol=1e-4) and torch.allclose(l, l_ref, rtol=1e-4, atol=1e-4)

@@ -83,7 +83,7 @@ from src.supervised_value_estimation.amortized_dp.online.train_online import _en
 from src.supervised_value_estimation.amortized_dp.online.train_online_bushy import connected, neighbour_masks_of
 from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import (BUCKETS, Query, failed_bound,
                                                                                  multi_query_batch, phi_and_direct,
-                                                                                 plan_cost, subset_phi)
+                                                                                 plan_cost, query_readout, subset_phi)
 from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import CountStream, count_query, count_subsets
 
 PERCENTILES = (50, 90, 95, 99)
@@ -91,10 +91,13 @@ PERCENTILES = (50, 90, 95, 99)
 
 def encoder(model, q, device):
     """encode(masks) -> (phi, l) for forest_value.QueryContext: the cardinality model's embedding and estimate,
-    exact counts for single patterns."""
+    exact counts for single patterns. Without autograd, a RowReadout backbone reads through a per-query
+    row_readout.QueryReadout (the same numbers, the query's own work done once)."""
+    readout = query_readout(model, q.data, device)
+
     def encode(masks):
         m = torch.tensor(masks, dtype=torch.long, device=device)
-        phi, l = subset_phi(model, q.data, m, device)
+        phi, l = subset_phi(model, q.data, m, device, readout=None if torch.is_grad_enabled() else readout)
         single = (m & (m - 1)) == 0
         return phi, torch.where(single, history_dp.single_pattern_logcounts(q.data, m), l)
     return encode

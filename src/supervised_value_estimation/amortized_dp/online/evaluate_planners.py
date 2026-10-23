@@ -17,7 +17,8 @@ plan     the run's validation queries (validation-<R>.json, all or N spread over
              value greedy / beam-8          the forest value planner at round R (planner-<R>.pt)
          greedy = GOO / beam-8 = bushy.estimator_beam_plan for the estimators, fv.beam_plans for the value planner;
          DP = exact bushy DP over every connected subset minimising the estimated C_out (soft_dp at tau 0).
-         Every planner builds the cardinality model's input with the same batched builder (soft_dp.subset_batch).
+         Every planner builds the cardinality model's input with the same batched builder (soft_dp.subset_batch); the
+         step-wise planners (greedy, beam-8) read a RowReadout backbone through a per-query row_readout.QueryReadout.
          Planned on the GPU for speed; its timings are not reported. -> plans.json
 time-cpu the same planning on the CPU (--cpu-threads torch threads, default 1 as QLever's single-threaded planner):
          the inference cost, the time inside the network calls only (the cardinality model, its subset-graph
@@ -70,7 +71,8 @@ from src.supervised_value_estimation.amortized_dp.bushy_train import load_backbo
 from src.supervised_value_estimation.amortized_dp.online.runtime_tree import bushy_sparql
 from src.supervised_value_estimation.amortized_dp.online.train_forest_value import encoder
 from src.supervised_value_estimation.amortized_dp.online.train_online_bushy import executed_cout
-from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import Query, failed_bound, plan_cost
+from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import (Query, failed_bound, plan_cost,
+                                                                                 query_readout, subset_phi)
 
 WIDTH = 8
 QUANTILES = (50, 90, 95, 99, 100)
@@ -155,7 +157,8 @@ def plan_all(args, device=None):
     def estimator_plans(est_model, data, q):
         for name, width in (("greedy", 1), (f"beam-{WIDTH}", WIDTH)):
             clock.reset()
-            est = clock.timed(lambda masks: soft_dp.model_subset_logcards(est_model, data, torch.tensor(masks), device)
+            readout = query_readout(est_model, data, device)     # as the value planner's encoder
+            est = clock.timed(lambda masks: subset_phi(est_model, data, torch.tensor(masks), device, readout=readout)[1]
                               .double().cpu().tolist(), count_subsets)
             tree, _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, est, width)
             yield name, tree
