@@ -9,7 +9,7 @@ is the position within a group or the line style. Ratios are per query against Q
     fig_shape_heatmap     geomean speedup and C_out ratio vs QLever per shape and planner
     fig_tails             survival curves: share of queries with C_out error / execution time above x
     fig_cout_vs_latency   execution time against C_out (all plans), and the per-query ratios to QLever
-    fig_planning_cost     inference ms (GPU, CPU) against query size, QLever's own planning for reference
+    fig_planning_cost     CPU inference ms against query size, QLever's own planning for reference
 """
 from __future__ import annotations
 
@@ -310,28 +310,27 @@ def fig_cout_vs_latency(plans, table, names, out):
 def fig_planning_cost(plans, table, names, out):
     keys = list(plans)
     sizes = sorted({plans[k]["n"] for k in keys})
-    has_cpu = any(table[k][names[0]].get("inference_cpu") is not None for k in keys)
-    panels = [("inference", "(a) Inference on the GPU")] + ([("inference_cpu", "(b) Inference on the CPU (1 thread)")] if has_cpu else [])
-    fig, axes = plt.subplots(1, len(panels), figsize=(7.2 if has_cpu else 3.8, 3.3), sharey=True, facecolor=SURFACE)
-    for ax, (field, title) in zip(np.atleast_1d(axes), panels):
-        for name in names:
-            f, colour = ("qlever_planning", HUE["QLever"]) if name == "QLever" else (field, HUE[family(name)])
-            per = [np.array([table[k][name].get(f) if table[k][name].get(f) is not None else np.nan
-                             for k in keys if plans[k]["n"] == s], dtype=float) for s in sizes]
-            med = [np.nanmedian(v) if np.isfinite(v).any() else np.nan for v in per]
-            if name == "QLever":                     # bimodal from ~12 patterns: DP, or greedy past its budget
-                lo = [np.nanpercentile(v, 25) if np.isfinite(v).any() else np.nan for v in per]
-                hi = [np.nanpercentile(v, 75) if np.isfinite(v).any() else np.nan for v in per]
-                ax.fill_between(sizes, np.maximum(lo, 1e-2), np.maximum(hi, 1e-2), color=colour, alpha=0.15, lw=0)
-            ax.plot(sizes, np.maximum(med, 1e-2), color=colour, ls="-" if name == "QLever" else LINE[search(name)],
-                    lw=2.0 if name == "QLever" else 1.3,
-                    label="QLever's own planning (median, interquartile band)" if name == "QLever" else name)
-        ax.set_yscale("log")
-        style(ax, title, "triple patterns", "median ms per query" if ax is np.atleast_1d(axes)[0] else None)
-    handles, labels = np.atleast_1d(axes)[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False, bbox_to_anchor=(0.5, -0.12), labelcolor=INK)
-    fig.text(0.01, -0.2, "Ours: the time inside the network calls only (cardinality model, bound, value net), one query at a "
-             "time. QLever: meta.time_query_planning of its unforced execution; it plans by DP up to 1,500 connected "
+    if all(table[k][name].get("inference") is None for k in keys for name in names if name != "QLever"):
+        return                                           # no CPU timing (inference-cpu.json) yet
+    fig, ax = plt.subplots(figsize=(5.2, 3.6), facecolor=SURFACE)
+    for name in names:
+        f, colour = ("qlever_planning", HUE["QLever"]) if name == "QLever" else ("inference", HUE[family(name)])
+        per = [np.array([table[k][name].get(f) if table[k][name].get(f) is not None else np.nan
+                         for k in keys if plans[k]["n"] == s], dtype=float) for s in sizes]
+        med = [np.nanmedian(v) if np.isfinite(v).any() else np.nan for v in per]
+        if name == "QLever":                     # bimodal from ~12 patterns: DP, or greedy past its budget
+            lo = [np.nanpercentile(v, 25) if np.isfinite(v).any() else np.nan for v in per]
+            hi = [np.nanpercentile(v, 75) if np.isfinite(v).any() else np.nan for v in per]
+            ax.fill_between(sizes, np.maximum(lo, 1e-2), np.maximum(hi, 1e-2), color=colour, alpha=0.15, lw=0)
+        ax.plot(sizes, np.maximum(med, 1e-2), color=colour, ls="-" if name == "QLever" else LINE[search(name)],
+                lw=2.0 if name == "QLever" else 1.3,
+                label="QLever's own planning (median, interquartile band)" if name == "QLever" else name)
+    ax.set_yscale("log")
+    style(ax, "Planning cost on the CPU (1 thread)", "triple patterns", "median ms per query")
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.2), labelcolor=INK)
+    fig.text(0.01, -0.3, "Ours: the time inside the network calls only (cardinality model, bound, value net), one query at a "
+             "time, on one CPU thread. QLever: meta.time_query_planning of its unforced execution; it plans by DP up to 1,500 connected "
              "subgraphs, greedily beyond (query-planning-budget), hence the drop for the largest queries.", fontsize=6.5,
              color=INK2, wrap=True)
     fig.tight_layout()

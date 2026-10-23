@@ -17,12 +17,15 @@ plan     the run's validation queries (validation-<R>.json, all or N spread over
              value greedy / beam-8          the forest value planner at round R (planner-<R>.pt)
          greedy = GOO / beam-8 = bushy.estimator_beam_plan for the estimators, fv.beam_plans for the value planner;
          DP = exact bushy DP over every connected subset minimising the estimated C_out (soft_dp at tau 0).
-         Inference cost per query and planner: the GPU-synchronised time inside the network calls only (cardinality
-         model, bound, value net; the subset-graph construction for the cardinality model included), not the search
-         or DP bookkeeping, one query at a time after a warm-up; plus the number of subsets estimated and forests valued.
-         -> plans.json
-time-cpu the same planning on the CPU (--cpu-threads torch threads, default 1 as QLever's single-threaded planner), for
-         the inference cost only: -> inference-cpu.json (plans.json untouched; a separate, slower run)
+         Every planner builds the cardinality model's input with the same batched builder (soft_dp.subset_batch).
+         Planned on the GPU for speed; its timings are not reported. -> plans.json
+time-cpu the same planning on the CPU (--cpu-threads torch threads, default 1 as QLever's single-threaded planner):
+         the inference cost, the time inside the network calls only (the cardinality model, its subset-graph
+         construction included; for the value planner each beam step's network part as one block: encoding the new
+         subsets, the bound, the value net's tokens and the value net), not the search or DP bookkeeping, one query
+         at a time after a warm-up; plus the number of subsets estimated and forests valued, and the CPU's own plans
+         (the report counts the ones that differ from plans.json). -> inference-cpu.json (plans.json untouched; a
+         separate, slower run)
 execute  every plan forced on QLever (runtime_tree.bushy_sparql) and every query unforced ("QLever"), `--repeats`
          times, the planners' order rotated per query and repetition, one request at a time per endpoint (a thread
          each), QLever's cache cleared before every execution (cmd=clear-cache with the servers' access token, by
@@ -34,13 +37,14 @@ execute  every plan forced on QLever (runtime_tree.bushy_sparql) and every query
 report   per query and planner the median over the uncensored, uncached repeats (if none: the timeout, a lower
          bound, when a repeat timed out, else unmeasured and left out), then per planner quantiles (50 / 90 / 95 / 99 / max) of
              execution ms          and its ratio to QLever's per query (geomean speedup = QLever / planner)
-             end to end ms         QLever's time.total + the planner's inference ms (QLever: its time.total, its own
-                                   planning inside)
+             end to end ms         QLever's time.total + the planner's CPU inference ms (QLever: its time.total, its
+                                   own planning inside)
              C_out error           C_out / the cheapest C_out any planner (QLever included) reached on the query
              C_out vs QLever       C_out / QLever's C_out
-             inference ms          and QLever's own planning ms
+             inference ms          on the CPU (inference-cpu.json; without it inference and end to end are left
+                                   empty), and QLever's own planning ms
          for all queries, empty and non-empty results separately, per query shape, per size and per QLever execution
-         time bucket; with inference-cpu.json also the CPU inference ms. C_out of a censored plan: from the run's counts.pkl where every join is counted, else unknown
+         time bucket. C_out of a censored plan: from the run's counts.pkl where every join is counted, else unknown
          (left out of the C_out quantiles, counted under "C_out unknown"). Plots: C_out against execution time per
          planner, quantile curves of execution time and C_out error, violins of both per query shape, inference cost
          against query size. -> report.md, report.json, *.png
@@ -48,6 +52,7 @@ report   per query and planner the median over the uncensored, uncached repeats 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import pickle
@@ -62,7 +67,6 @@ from omegaconf import OmegaConf
 
 from src.supervised_value_estimation.amortized_dp import bushy, forest_value as fv, history_dp, soft_dp
 from src.supervised_value_estimation.amortized_dp.bushy_train import load_backbone, load_split
-from src.supervised_value_estimation.amortized_dp.labels import model_log_cardinalities
 from src.supervised_value_estimation.amortized_dp.online.runtime_tree import bushy_sparql
 from src.supervised_value_estimation.amortized_dp.online.train_forest_value import encoder
 from src.supervised_value_estimation.amortized_dp.online.train_online_bushy import executed_cout
@@ -80,23 +84,35 @@ def shape_of(data):
 
 
 class InferenceClock:
-    """Sums the GPU-synchronised time of the wrapped network calls and counts their rows."""
+    """Sums the (GPU-synchronised) time of the wrapped network calls and blocks and counts their rows; a call inside
+    a timed block or call is part of it, not counted again."""
 
     def __init__(self, device):
-        self.device, self.ms, self.subsets, self.forests = device, 0.0, 0, 0
+        self.device, self.ms, self.subsets, self.forests, self.depth = device, 0.0, 0, 0, 0
 
     def reset(self):
         self.ms, self.subsets, self.forests = 0.0, 0, 0
 
+    @contextlib.contextmanager
+    def block(self):
+        outer = self.depth == 0
+        if outer and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        self.depth += 1
+        try:
+            yield
+        finally:
+            self.depth -= 1
+            if outer:
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                self.ms += 1000 * (time.perf_counter() - start)
+
     def timed(self, fn, count=None):
         def wrap(*args, **kwargs):
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            out = fn(*args, **kwargs)
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-            self.ms += 1000 * (time.perf_counter() - start)
+            with self.block():
+                out = fn(*args, **kwargs)
             if count is not None:
                 count(self, args)
             return out
@@ -137,9 +153,10 @@ def plan_all(args, device=None):
     net.bound.forward = clock.timed(net.bound.forward)
 
     def estimator_plans(est_model, data, q):
-        est = clock.timed(lambda masks: model_log_cardinalities(est_model, data, masks, device), count_subsets)
         for name, width in (("greedy", 1), (f"beam-{WIDTH}", WIDTH)):
             clock.reset()
+            est = clock.timed(lambda masks: soft_dp.model_subset_logcards(est_model, data, torch.tensor(masks), device)
+                              .double().cpu().tolist(), count_subsets)
             tree, _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, est, width)
             yield name, tree
         clock.reset()
@@ -157,6 +174,7 @@ def plan_all(args, device=None):
         for name, width in (("greedy", 1), (f"beam-{WIDTH}", WIDTH)):
             clock.reset()
             ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, clock.timed(encoder(model, q, device), count_subsets))
+            ctx.step_timer = clock.block                 # each beam step's network part as one call
             yield name, fv.beam_plans(net, ctx, [width])[0][0][0]
 
     plans = {}
@@ -173,9 +191,7 @@ def plan_all(args, device=None):
             if k % 100 == 0:
                 print(f"planned {max(k - 2, 0)} / {len(keys)}", flush=True)
     if device.type == "cpu":
-        timing = {key: {name: {k: v for k, v in r.items() if k != "plan"} for name, r in rec["planners"].items()}
-                  for key, rec in plans.items()}
-        json.dump(timing, open(out / "inference-cpu.json", "w"))
+        json.dump({key: rec["planners"] for key, rec in plans.items()}, open(out / "inference-cpu.json", "w"))
         print(f"{len(plans)} queries, CPU inference ({torch.get_num_threads()} threads) -> {out / 'inference-cpu.json'}")
         return
     json.dump(plans, open(out / "plans.json", "w"))
@@ -297,8 +313,9 @@ def _any_cached(tree):
 
 # --- report --------------------------------------------------------------------------------------
 
-def per_query(plans, executions, counts, timeout_ms):
-    """{key: {planner: {exec, e2e, qlever_planning, inference, cout, censored}}} and {key: empty result?}."""
+def per_query(plans, executions, counts, timeout_ms, cpu):
+    """{key: {planner: {exec, e2e, qlever_planning, inference, cout, censored}}} and {key: empty result?}; inference
+    from `cpu` (inference-cpu.json, {} without it)."""
     by = {}
     for r in executions:
         by.setdefault((r["key"], r["planner"]), []).append(r)
@@ -309,7 +326,7 @@ def per_query(plans, executions, counts, timeout_ms):
         for name in list(rec["planners"]) + ["QLever"]:
             runs = by.get((key, name), [])
             ok = [r for r in runs if not r["censored"] and not r["cached"] and r["exec_ms"] is not None]
-            inference = rec["planners"][name]["inference_ms"] if name != "QLever" else 0.0
+            inference = cpu.get(key, {}).get(name, {}).get("inference_ms") if name != "QLever" else 0.0
             if ok:
                 exec_ms = statistics.median(r["exec_ms"] for r in ok)
                 total_ms = statistics.median(r["latency_ms"] for r in ok)
@@ -325,7 +342,8 @@ def per_query(plans, executions, counts, timeout_ms):
                 cout = None
                 if name != "QLever" and key in counts:
                     cout, _ = plan_cost(bushy.from_json(rec["planners"][name]["plan"]), counts[key], failed_bound(counts[key], largest))
-            row[name] = {"exec": exec_ms, "e2e": None if total_ms is None else total_ms + inference, "qlever_planning": planning,
+            e2e = None if total_ms is None or inference is None else total_ms + inference
+            row[name] = {"exec": exec_ms, "e2e": e2e, "qlever_planning": planning,
                          "inference": inference, "cout": cout, "censored": not ok and exec_ms is not None,
                          "unmeasured": exec_ms is None, "subsets": rec["planners"].get(name, {}).get("subsets"),
                          "forests": rec["planners"].get(name, {}).get("forests")}
@@ -365,7 +383,6 @@ def summarise(table, keys, names):
             "cout_error": qs(err), "cout_error_geomean": geomean(err), "cout_unknown": sum(e is None for e in err),
             "cout_vs_qlever_geomean": geomean(vs_q), "cout_vs_qlever": qs(vs_q),
             "inference_ms": qs(r["inference"] for r in rows) if name != "QLever" else None,
-            "inference_cpu_ms": qs(r.get("inference_cpu") for r in rows) if name != "QLever" else None,
             "qlever_planning_ms": qs(r["qlever_planning"] for r in rows),
             "subsets_mean": float(np.mean([r["subsets"] for r in rows])) if name != "QLever" else None,
             "forests_mean": float(np.mean([r["forests"] for r in rows])) if name != "QLever" else None}
@@ -395,19 +412,18 @@ def markdown(summary):
     for split, (n, s) in summary.items():
         lines.append(f"\n## {split} ({n} queries)\n")
         lines.append("| planner | exec p50 | p90 | p95 | p99 | max | timeouts | exec speedup vs QLever | e2e p50 | e2e p99 | "
-                     "e2e speedup | C_out err p50 | p90 | p95 | p99 | max | C_out vs QLever (geo) | inference p50 / p99 ms | "
-                     "CPU inference p50 / p99 ms | QLever planning p50 ms |")
-        lines.append("|" + "---|" * 21)
+                     "e2e speedup | C_out err p50 | p90 | p95 | p99 | max | C_out vs QLever (geo) | CPU inference p50 / p99 ms | "
+                     "QLever planning p50 ms |")
+        lines.append("|" + "---|" * 20)
         for name, r in s.items():
             e, t, c = r["exec_ms"], r["e2e_ms"], r["cout_error"]
-            inf = "-" if r["inference_ms"] is None else f"{fmt(r['inference_ms']['p50'], '.1f')} / {fmt(r['inference_ms']['p99'], '.1f')}"
-            cpu = r.get("inference_cpu_ms")
+            inf = r["inference_ms"]
+            inf = "-" if not inf or inf["p50"] is None else f"{fmt(inf['p50'], '.1f')} / {fmt(inf['p99'], '.1f')}"
             timeouts = f"{r['timeouts']}" + (f" (+{r['unmeasured']} unmeasured)" if r["unmeasured"] else "")
-            cpu = "-" if not cpu or cpu["p50"] is None else f"{fmt(cpu['p50'], '.1f')} / {fmt(cpu['p99'], '.1f')}"
             lines.append(f"| {name} | {fmt(e['p50'], '.1f')} | {fmt(e['p90'], '.1f')} | {fmt(e['p95'], '.1f')} | {fmt(e['p99'], '.1f')} | "
                          f"{fmt(e['max'], '.0f')} | {timeouts} | {fmt(r['exec_speedup_vs_qlever'], '.3f')} | {fmt(t['p50'], '.1f')} | "
                          f"{fmt(t['p99'], '.1f')} | {fmt(r['e2e_speedup_vs_qlever'], '.3f')} | {fmt(c['p50'])} | {fmt(c['p90'])} | "
-                         f"{fmt(c['p95'])} | {fmt(c['p99'])} | {fmt(c['max'], '.1f')} | {fmt(r['cout_vs_qlever_geomean'], '.3f')} | {inf} | {cpu} | "
+                         f"{fmt(c['p95'])} | {fmt(c['p99'])} | {fmt(c['max'], '.1f')} | {fmt(r['cout_vs_qlever_geomean'], '.3f')} | {inf} | "
                          f"{fmt(r['qlever_planning_ms']['p50'], '.1f')} |")
     return "\n".join(lines)
 
@@ -420,18 +436,21 @@ def report(args):
     plans = json.load(open(out / "plans.json"))
     executions = [json.loads(line) for line in open(out / "executions.jsonl")]
     counts = pickle.load(open(run / "counts.pkl", "rb")) if (run / "counts.pkl").exists() else {}
-    table, empty = per_query(plans, executions, counts, 1000 * args.timeout)
-    if (out / "inference-cpu.json").exists():
-        cpu = json.load(open(out / "inference-cpu.json"))
-        for key, row in table.items():
-            for name, r in row.items():
-                r["inference_cpu"] = cpu.get(key, {}).get(name, {}).get("inference_ms") if name != "QLever" else None
+    cpu = json.load(open(out / "inference-cpu.json")) if (out / "inference-cpu.json").exists() else {}
+    if not cpu:
+        print("no inference-cpu.json (run time-cpu): inference and end-to-end times are left empty")
+    table, empty = per_query(plans, executions, counts, 1000 * args.timeout, cpu)
     names = list(next(iter(plans.values()))["planners"]) + ["QLever"]
     summary = {split: (len(keys), summarise(table, keys, names)) for split, keys in splits(plans, table, empty).items()}
-    json.dump({"per_query": table, "empty": empty, "summary": summary}, open(out / "report.json", "w"))
+    differ = {name: sum(cpu[k][name]["plan"] != rec["planners"][name]["plan"] for k, rec in plans.items()
+                        if "plan" in cpu.get(k, {}).get(name, {})) for name in names[:-1]}
+    json.dump({"per_query": table, "empty": empty, "summary": summary, "cpu_plans_differ": differ},
+              open(out / "report.json", "w"))
+    cpu_note = ("plans that differ from the executed GPU plans: " + ", ".join(f"{n} {c}" for n, c in differ.items())
+                if any("plan" in r for v in cpu.values() for r in v.values()) else "no CPU plans to compare")
     header = (f"# Planner evaluation: {run.name}, round {args.round}\n\nExecution ms: the root operator's time (median of the "
               f"uncensored, uncached repeats; a timeout counts {args.timeout:.0f} s). End to end: QLever's time.total + the "
-              f"planner's inference ms. C_out error: C_out / the cheapest C_out of any planner on the query. Speedups: "
+              f"planner's inference ms on the CPU ({cpu_note}). C_out error: C_out / the cheapest C_out of any planner on the query. Speedups: "
               f"geomean of QLever / planner (1 ms floor).\n")
     open(out / "report.md", "w").write(header + markdown(summary))
     evaluate_plots.plot_all(plans, table, names, out)

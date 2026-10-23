@@ -43,6 +43,7 @@ the planner reads the encoder's phi and l detached: only the L1 on l trains the 
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Callable, Sequence
 
@@ -254,7 +255,8 @@ def token_features(phi_std, l2, cost, single, size):
 
 class QueryContext:
     """One query for planning: the encoder's (phi, l) per subset mask, cached in one table (encode(masks) -> (phi [M, D],
-    l [M]), exact counts for single patterns), and the per-query constants."""
+    l [M]), exact counts for single patterns), and the per-query constants. step_timer: a context manager around each
+    beam step's network part (encode the new subsets, bound, value net; evaluate_planners times it as one call)."""
 
     def __init__(self, n, neighbour_masks, patterns, degrees, encode: Callable):
         self.n, self.neighbour_masks, self.encode = n, list(neighbour_masks), encode
@@ -262,6 +264,7 @@ class QueryContext:
         self.cache: dict[int, int] = {}                  # mask -> row of phi / l
         self.phi = self.l = None
         self.reach: dict[int, int] = {}
+        self.step_timer: Callable = contextlib.nullcontext
 
     def rows(self, masks):
         """[M] rows of phi / l for the masks (list or tensor), encoding the ones not seen yet."""
@@ -443,54 +446,54 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         i, j = I[p], J[p]
         a, b = cm[e, i], cm[e, j]
         U = a | b
-        ru = ctx.rows(U)
-        phi_u, l_u = ctx.phi[ru], ctx.l[ru]
-        gc = grp[e]
-        if epinet is not None:
-            l_u = l_u + epinet.card_shift(net.standardise(phi_u), indexes[gc])
-        size = _popcount(U, n) / n
-        l2, _ = net.bound(l_u, cl[e, i], cl[e, j], _merge_fans(a, b, n, touch_s, touch_o, fan),
-                          _merge_fans(b, a, n, touch_s, touch_o, fan), net.standardise(phi_u), size)
-        cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
-        so_far = torch.logaddexp(so[e], l2)
-        if robust is not None:
+        with ctx.step_timer():                           # the step's network part: encode, bound, value net
+            ru = ctx.rows(U)
+            phi_u, l_u = ctx.phi[ru], ctx.l[ru]
             phi_std = net.standardise(phi_u)
-            l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
-            Cn = len(e)
-            l2w, _ = net.bound(l_uw.reshape(-1), clw[e, i].reshape(-1), clw[e, j].reshape(-1),
-                               _merge_fans(a, b, n, touch_s, touch_o, fan).repeat_interleave(Kr, 0),
-                               _merge_fans(b, a, n, touch_s, touch_o, fan).repeat_interleave(Kr, 0),
-                               phi_std.repeat_interleave(Kr, 0), size.repeat_interleave(Kr))
-            l2w = l2w.view(Cn, Kr)
-            cost_uw = torch.logaddexp(l2w, torch.logaddexp(ccw[e, i], ccw[e, j]))
-            so_w = torch.logaddexp(sow[e], l2w)
-        C, kc = len(e), k - 1
-        ar = torch.arange(k, **long)
-        old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
-        eo = e[:, None]
-        child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
-        child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
-        if kc == 1:
-            V = torch.full_like(l2, NEG)
-            hv = None
-            total = so_far.double()
+            gc = grp[e]
+            if epinet is not None:
+                l_u = l_u + epinet.card_shift(phi_std, indexes[gc])
+            size = _popcount(U, n) / n
+            fa, fb = _merge_fans(torch.cat([a, b]), torch.cat([b, a]), n, touch_s, touch_o, fan).split(len(a))
+            l2, _ = net.bound(l_u, cl[e, i], cl[e, j], fa, fb, phi_std, size)
+            cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
+            so_far = torch.logaddexp(so[e], l2)
             if robust is not None:
-                total_w = so_w.double()
-        else:
-            sz_old = _popcount(cm[eo, old], n) / n
-            tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
-            tok_new = token_features(net.standardise(phi_u), l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
-            tokens = torch.cat([tok_old, tok_new[:, None]], 1)
-            adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
-            query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
-            shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
-            V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
-                                  torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
-            total = torch.logaddexp(so_far.double(), V.double())
-            if robust is not None:
-                Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
-                    lq_r.expand(C, Kr), W[:, None] + r_epi.scale_value * r_epi.value_samples(hv, Zr).T)
-                total_w = torch.logaddexp(so_w.double(), Vw.double())
+                l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
+                Cn = len(e)
+                l2w, _ = net.bound(l_uw.reshape(-1), clw[e, i].reshape(-1), clw[e, j].reshape(-1),
+                                   fa.repeat_interleave(Kr, 0), fb.repeat_interleave(Kr, 0),
+                                   phi_std.repeat_interleave(Kr, 0), size.repeat_interleave(Kr))
+                l2w = l2w.view(Cn, Kr)
+                cost_uw = torch.logaddexp(l2w, torch.logaddexp(ccw[e, i], ccw[e, j]))
+                so_w = torch.logaddexp(sow[e], l2w)
+            C, kc = len(e), k - 1
+            ar = torch.arange(k, **long)
+            old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
+            eo = e[:, None]
+            child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
+            child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
+            if kc == 1:
+                V = torch.full_like(l2, NEG)
+                hv = None
+                total = so_far.double()
+                if robust is not None:
+                    total_w = so_w.double()
+            else:
+                sz_old = _popcount(cm[eo, old], n) / n
+                tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
+                tok_new = token_features(phi_std, l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
+                tokens = torch.cat([tok_old, tok_new[:, None]], 1)
+                adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
+                query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
+                shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
+                V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
+                                      torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
+                total = torch.logaddexp(so_far.double(), V.double())
+                if robust is not None:
+                    Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
+                        lq_r.expand(C, Kr), W[:, None] + r_epi.scale_value * r_epi.value_samples(hv, Zr).T)
+                    total_w = torch.logaddexp(so_w.double(), Vw.double())
         if robust is not None:                           # rank by the statistic over the worlds
             total = total_w.mean(1) if stat == "mean" else torch.quantile(total_w, 0.9, dim=1)
         if trace is not None:
