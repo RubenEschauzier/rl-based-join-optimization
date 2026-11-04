@@ -1,0 +1,13 @@
+# The 22-10 run (forest_value_rowreadout_mixed_yago_v2_vw.yaml) with the beam-aware loss instead of the per-state plan
+# loss (forest_value.py module text; work_2026-11-04/beam_dropout.py: value beam-8 loses the best plan by rank-outs
+# 34%, dedup 46%, final pick 15%): the best known plan must survive each step of the deployed beam; each query's
+# deployed width is drawn from {1, 4, 8}. One build per forest, as that run.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value --config-name forest_value_beamloss_vw.yaml
+defaults:
+  - forest_value_rowreadout_mixed_yago_v2_vw
+  - _self_
+
+forest:
+  beam_loss:
+    enabled: true
+    widths: [1, 4, 8]

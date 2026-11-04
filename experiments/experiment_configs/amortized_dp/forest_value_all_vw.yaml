@@ -1,0 +1,17 @@
+# The three changes of 2026-11-04 together on the 22-10 run (forest_value_rowreadout_mixed_yago_v2_vw.yaml): 2 builds
+# per forest (forest_value_2builds_vw.yaml), the beam-aware loss with the per-query widths {1, 4, 8}
+# (forest_value_beamloss_vw.yaml; its per-forest cut is the same b = 2) and QLever's planning cost with the rows-read
+# head (forest_value_qlever_cost_vw.yaml, and its note: no lazily read pattern on mixed_yago_v2).
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value --config-name forest_value_all_vw.yaml
+defaults:
+  - forest_value_rowreadout_mixed_yago_v2_vw
+  - _self_
+
+forest:
+  builds_per_forest: 2
+  beam_loss:
+    enabled: true
+    widths: [1, 4, 8]
+
+cost:
+  model: qlever

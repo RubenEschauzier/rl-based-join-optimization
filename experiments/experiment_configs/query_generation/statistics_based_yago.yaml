@@ -24,6 +24,10 @@ generation:
     # it nearly every embedding walks along them (400-850M scan rows at size 18-22).
     # The setting of mixed_yago_v2.
     max_pattern_matches: 1000000
+    # Patterns over max_pattern_matches are allowed while together they match at most this many
+    # triples per query (e.g. one 42M-triple pattern between two variables within a 50M quota).
+    # null: none (mixed_yago_v2). For the scale-free rule, a share of acceptance.max_best_plan_work.
+    big_pattern_rows: null
     max_candidates: 2000
     max_restarts: 30
     # Embedding is cheap (milliseconds per attempt); long cycles and multi-petal flowers need

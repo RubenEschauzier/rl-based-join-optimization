@@ -407,3 +407,175 @@ def test_part_builder_workers_match_serial():
                 assert a[k].dtype == b[k].dtype and torch.equal(torch.nan_to_num(a[k].double(), nan=-7.0), torch.nan_to_num(b[k].double(), nan=-7.0)), k
             else:
                 assert a[k] == b[k], k
+
+
+# --- builds per forest, the beam trace, the QLever cost, the beam loss -----------------------------------------
+
+QCOST = {"out": 1.0, "read": 0.7, "sort": 0.3, "lazy_rows": 1000}
+
+
+def _qnet(seed=0, cost=QCOST):
+    torch.manual_seed(seed)
+    net = fv.ForestPlanner(phi_dim=D, d=16, heads=2, layers=2, bound_hidden=8, cost=cost, read_hidden=8)
+    torch.nn.init.normal_(net.value.out[-1].weight, std=0.5)
+    torch.nn.init.normal_(net.bound.gate[-1].weight, std=0.5)
+    torch.nn.init.normal_(net.read.mlp[-1].weight, std=0.5)
+    return net.eval()
+
+
+def _forest_sets(forests):
+    return [tuple(sorted(bushy.tree_mask(t) for t in f)) for f in forests]
+
+
+def test_builds_per_forest_and_the_kept_trace():
+    duplicated = False
+    for seed in range(6):
+        n = 8
+        patterns, nb, degrees = _query(n, seed)
+        encode, _ = _encoder(n, seed)
+        net = _net(seed, trained=True)
+        ctx = lambda: fv.QueryContext(n, nb, patterns, degrees, encode)
+        assert fv.beam_plans(net, ctx(), [4], per_forest=1)[0] == fv.beam_plans(net, ctx(), [4])[0]
+        for b in (1, 2):
+            kept = []
+            groups, _ = fv.beam_plans(net, ctx(), [4, 1], per_forest=b, kept=kept)
+            assert all(bushy.is_valid_tree(t, n, nb) for ts in groups for t in ts)
+            assert len(kept) == n - 1
+            previous = {g: [tuple(range(n))] for g in (0, 1)}
+            for step in kept:
+                for g, width in ((0, 4), (1, 1)):
+                    forests = [t for gg, t in step if gg == g]
+                    assert 1 <= len(forests) <= width
+                    sets = _forest_sets(forests)
+                    assert max(sets.count(x) for x in sets) <= b
+                    builds = [tuple(sorted(map(str, (bushy.canonical(t) for t in f)))) for f in forests]
+                    assert len(set(builds)) == len(builds)          # the same build from two parents: once
+                    duplicated |= len(set(sets)) < len(sets)
+                    parents = [set(x) for x in _forest_sets(previous[g])]
+                    assert all(any(len(set(x) - p) == 1 and len(p - set(x)) == 2 for p in parents) for x in sets)
+                    previous[g] = forests
+            assert [t for g, t in kept[-1] if g == 0][0][0] == groups[0][0]
+    assert duplicated                                   # 2 builds of one forest do occur
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_qlever_cost_with_only_the_result_is_c_out(seed):
+    n = 8
+    patterns, nb, degrees = _query(n, seed)
+    encode, _ = _encoder(n, seed)
+    plain = _net(seed, trained=True)
+    q = fv.ForestPlanner(phi_dim=D, d=16, heads=2, layers=2, bound_hidden=8,
+                         cost={"out": 1.0, "read": 0.0, "sort": 0.0, "lazy_rows": 1}, read_hidden=8).eval()
+    q.load_state_dict(plain.state_dict(), strict=False)
+    for w in (1, 4):
+        a = fv.beam_plans(plain, fv.QueryContext(n, nb, patterns, degrees, encode), [w])[0]
+        b = fv.beam_plans(q, fv.QueryContext(n, nb, patterns, degrees, encode), [w])[0]
+        assert a == b
+
+
+def _sizes(table, n):
+    return [int(round(math.expm1(float(table[1 << i][1])))) for i in range(n)]
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_training_forward_matches_the_planner_with_the_qlever_cost(seed):
+    """As test_training_forward_matches_the_planner, with lazily read patterns, sorts and the rows-read head: V of
+    every candidate's child forest (2 components: the final join's cost) equals the planner's."""
+    n = 7
+    patterns, nb, degrees = _query(n, seed)
+    encode, table = _encoder(n, seed)
+    net = _qnet(seed)
+    trace = []
+    tree, _ = fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), 1, trace=trace)
+    sizes = _sizes(table, n)
+    assert any(s >= QCOST["lazy_rows"] for s in sizes) and any(s < QCOST["lazy_rows"] for s in sizes)
+    counts = {m: int(math.exp(float(table[m][1]))) for m in table if m & (m - 1)}
+    part = fv.build_query_data(n, nb, patterns, degrees, [tree], counts, 10 ** 9, sizes=sizes, reads={},
+                               cost=net.cost)
+    phi, l = encode(part["masks"].tolist())
+    with torch.no_grad():
+        out = fv.forward_batch(net, [part], phi, l, "cpu", 0.3)
+    masks = part["masks"]
+    by_forest = {}
+    for f in range(len(part["forest_nodes"])):
+        ids = [i for i in part["forest_nodes"][f].tolist() if i >= 0]
+        by_forest[tuple(sorted(int(masks[part["node_mask"][i]]) for i in ids))] = float(out["V"][f])
+    for forest, _, V in trace:
+        assert math.isclose(by_forest[forest], V, rel_tol=1e-4, abs_tol=1e-4)
+
+
+def test_qlever_truth_with_every_count_and_read():
+    n = 6
+    patterns, nb, degrees = _query(n, 3)
+    encode, table = _encoder(n, 3)
+    net = _qnet(3)
+    tree, _ = fv.beam_plan(net, fv.QueryContext(n, nb, patterns, degrees, encode), 2)
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks
+    conn = torch.nonzero(connected_masks(nb, "cpu")).squeeze(1).tolist()
+    rng = random.Random(0)
+    counts = {m: rng.randint(0, 10 ** 4) for m in conn if m & (m - 1)}
+    sizes = _sizes(table, n)
+    full = (1 << n) - 1
+    reads = {(o, p): rng.randint(1, max(sizes[p], 1)) for o in conn for p in range(n) if not o >> p & 1}
+    part = fv.build_query_data(n, nb, patterns, degrees, [tree], counts, 10 ** 9, sizes=sizes, reads=reads, cost=net.cost)
+    assert bool((~torch.isnan(part["q_true"])).all())
+    lazy_child = part["node_lazy"][part["node_c1"].clamp(min=0)] & (part["node_c1"] >= 0)
+    assert bool(lazy_child.any()) and not bool(torch.isnan(part["node_read1_true"][lazy_child]).any())
+    phi, l = encode(part["masks"].tolist())
+    res = fv.losses(fv.forward_batch(net, [part], phi, l, "cpu", 0.5), 0.5)
+    assert res["read_labels"] > 0
+    res["l1_read"].backward()
+    assert float(net.read.mlp[-1].weight.grad.abs().sum()) > 0
+    assert full in counts
+
+
+def test_beam_pairs_by_hand():
+    import numpy as np
+    score = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0])
+    pool = np.array([0, 0, 0, 0, 0, 1, 1])
+    sets = np.array([0, 1, 1, 2, 3, 4, 5])
+    on = np.array([False, False, True, False, False, False, True])
+    stars, comps, pools, survived = fv._beam_pairs(score, pool, sets, on, np.array([2, 1]), np.array([1, 1]))
+    # pool 0: c* = 2 (set 1); its forest's other build 1 is ahead (b = 1); the 2nd other passing candidate is 1
+    # pool 1: c* = 6 behind 5 (k = 1)
+    assert stars.tolist() == [2, 2, 6] and comps.tolist() == [1, 1, 5] and pools == 2 and survived == 0
+    stars, comps, pools, survived = fv._beam_pairs(score, pool, sets, on, np.array([2, 2]), np.array([2, 1]))
+    # b = 2: c* passes its forest's cut (no 2nd other build) but 0 and 1 are ahead, k = 2: against 1, out;
+    # pool 1: k = 2, only one other candidate: kept, no term
+    assert stars.tolist() == [2] and comps.tolist() == [1] and pools == 2 and survived == 1
+
+
+@pytest.mark.parametrize("cost", [None, QCOST])
+def test_beam_loss_pools(cost):
+    n = 7
+    patterns, nb, degrees = _query(n, 5)
+    encode, table = _encoder(n, 5)
+    net = _qnet(5, cost) if cost else _net(5, trained=True)
+    kept = []
+    groups, _ = fv.beam_plans(net, fv.QueryContext(n, nb, patterns, degrees, encode), [3], all_trees=[True], kept=kept)
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks
+    conn = torch.nonzero(connected_masks(nb, "cpu")).squeeze(1).tolist()
+    counts = {m: random.Random(m).randint(0, 1000) for m in conn if m & (m - 1)}
+    sizes = _sizes(table, n)
+    reads = {(o, p): random.Random(o * 31 + p).randint(1, max(sizes[p], 1)) for o in conn for p in range(n) if not o >> p & 1}
+    beam = {"width": 3, "kept": [[t for _, t in step] for step in kept]}
+    extra = {"sizes": sizes, "reads": reads, "cost": net.cost} if cost else {}
+    part = fv.build_query_data(n, nb, patterns, degrees, groups[0], counts, 10 ** 9, beam=beam, per_forest=1, **extra)
+    complete = torch.tensor([int((part["forest_k"][part["pool_forest"][part["pool_index"] == p]] == 1).all())
+                             for p in range(len(part["pool_k"]))], dtype=torch.bool)
+    assert len(part["pool_k"]) >= 1 and bool((part["pool_k"] == torch.where(complete, 1, 3)).all())
+    for p in range(len(part["pool_k"])):                # every pool kept has an on-path candidate
+        assert bool(part["pool_on"][part["pool_index"] == p].any())
+    first = part["pool_index"] == 0                      # the first pool: every merge of the single patterns
+    assert int(first.sum()) == len(bushy.candidate_merges(bushy.initial_forest(n), nb))
+    phi, l = encode(part["masks"].tolist())
+    out = fv.forward_batch(net, [part], phi, l, "cpu", 0.5)
+    res = fv.losses(out, 0.5)
+    assert res["pools"] == len(part["pool_k"]) and 0 <= res["pools_kept"] <= res["pools"]
+    assert float(res["beam"]) >= 0
+    if float(res["beam"]) > 0:
+        res["beam"].backward()
+        assert float(net.value.out[-1].weight.grad.abs().sum()) > 0
+    none = fv.build_query_data(n, nb, patterns, degrees, groups[0], counts, 10 ** 9, **extra)
+    assert len(none["pool_forest"]) == 0
+    assert float(fv.losses(fv.forward_batch(net, [none], *encode(none["masks"].tolist()), "cpu", 0.5), 0.5)["beam"]) == 0

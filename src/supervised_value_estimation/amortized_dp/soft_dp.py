@@ -48,10 +48,11 @@ def connected_masks(neighbour_masks: Sequence[int], device) -> torch.Tensor:
     return out
 
 
-def split_pairs(allowed: torch.Tensor, n: int, device):
+def split_pairs(allowed: torch.Tensor, n: int, device, max_elements: int = 1 << 27):
     """{k: (u, s1, s2)} int64 mask tensors of all unordered splits of the allowed subsets of size k into
     two allowed parts (s1 holds u's lowest pattern). With allowed = connected_masks, these are exactly the
-    csg-cmp pairs of DPccp (two connected parts of a connected set are adjacent)."""
+    csg-cmp pairs of DPccp (two connected parts of a connected set are adjacent). The 2^(k-1) candidate splits
+    of a size's subsets are built in chunks of at most max_elements entries (memory at 20+ patterns)."""
     masks = torch.nonzero(allowed).squeeze(1)
     size = torch.zeros_like(masks)
     for i in range(n):
@@ -59,18 +60,23 @@ def split_pairs(allowed: torch.Tensor, n: int, device):
     bit = torch.arange(n, device=device)
     levels = {}
     for k in range(2, n + 1):
-        u = masks[size == k]
-        if not len(u):
+        level = masks[size == k]
+        if not len(level):
             continue
-        bits = (u[:, None] >> bit) & 1
-        pos = torch.argsort(1 - bits, dim=1, stable=True)[:, :k]          # u's set bits, ascending
-        low, others = pos[:, :1], pos[:, 1:]
         j = torch.arange((1 << (k - 1)) - 1, device=device)               # never all others: s2 non-empty
         take = (j[None, :, None] >> torch.arange(k - 1, device=device)) & 1
-        s1 = (1 << low) + (take * (1 << others)[:, None, :]).sum(-1)
-        s2 = u[:, None] ^ s1
-        ok = allowed[s1] & allowed[s2]
-        levels[k] = (u[:, None].expand_as(s1)[ok], s1[ok], s2[ok])
+        rows = max(1, max_elements // (len(j) * max(k - 1, 1)))
+        parts = []
+        for start in range(0, len(level), rows):
+            u = level[start:start + rows]
+            bits = (u[:, None] >> bit) & 1
+            pos = torch.argsort(1 - bits, dim=1, stable=True)[:, :k]      # u's set bits, ascending
+            low, others = pos[:, :1], pos[:, 1:]
+            s1 = (1 << low) + (take * (1 << others)[:, None, :]).sum(-1)
+            s2 = u[:, None] ^ s1
+            ok = allowed[s1] & allowed[s2]
+            parts.append((u[:, None].expand_as(s1)[ok], s1[ok], s2[ok]))
+        levels[k] = tuple(torch.cat(t) for t in zip(*parts))
     return levels
 
 

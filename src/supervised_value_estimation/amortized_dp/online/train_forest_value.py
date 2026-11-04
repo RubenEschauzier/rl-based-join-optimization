@@ -56,8 +56,21 @@ GNCE GOO and vs round 0, plus the queries more than 10x better / worse than roun
 and the tail: percentiles (PERCENTILES) and shares > 2x / > 10x of the per-query C_out over a FIXED reference, the
 cheapest plan any planner (ours or GNCE) found for the query at round 0.
 
+Search and objective options (defaults: the runs before 2026-11-04):
+  - forest.builds_per_forest b: every beam keeps the best b builds of each child forest (fv.beam_plans per_forest),
+    in training, validation and evaluate_planners;
+  - forest.beam_loss.enabled: the per-state plan loss is replaced, at the same weight online.plan_weight, by the
+    beam loss over the pools of the deployed beam (fv's module text: the best known plan must survive each step's
+    selection); each query's deployed beam width is drawn from forest.beam_loss.widths, so the loss sees the
+    states of each width (the exploration beams keep online.deployed_width);
+  - cost.model qlever: the planner plans and trains on QLever's planning cost (work_function.QLeverCost with the
+    weights cost.qlever) instead of C_out: every split with a lazily read pattern operand on a counted plan (and
+    along the deployed plan with forest.count_candidates) gets a ReadTask next to the counts, whose read is the
+    label of the planner's rows-read head (l1_read at cost.read_l1_weight); G, the plan regret and the realized
+    regret are in that cost, and validation also reports it (vs GNCE GOO). C_out only with the epinet.
 Outputs in online.output_directory/forest-value-<time>/: config.yaml, rounds.jsonl, validation.jsonl,
-validation-<round>.json, model-<round>.pt (cardinality model), planner-<round>.pt, epinet-<round>.pt, counts.pkl.
+validation-<round>.json, model-<round>.pt (cardinality model), planner-<round>.pt, epinet-<round>.pt, counts.pkl,
+reads.pkl (QLever cost).
 """
 from __future__ import annotations
 
@@ -84,7 +97,10 @@ from src.supervised_value_estimation.amortized_dp.online.train_online_bushy impo
 from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import (BUCKETS, Query, failed_bound,
                                                                                  multi_query_batch, phi_and_direct,
                                                                                  plan_cost, query_readout, subset_phi)
-from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import CountStream, count_query, count_subsets
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import (CountStream, ReadTask, count_query,
+                                                                                     count_subsets)
+from src.supervised_value_estimation.amortized_dp.work_function import (QLeverCost, lazy_splits, plan_internal_splits,
+                                                                        plan_work, variable_masks)
 
 PERCENTILES = (50, 90, 95, 99)
 
@@ -106,11 +122,12 @@ def encoder(model, q, device):
 VALUE_CHUNK = 32768        # forests per value-net pass: the fused attention kernel fails above 65,535 in one batch
 
 
-def realized_regret(deployed, plans, counts, bound):
-    """log C_out(deployed) - log min C_out(plans) (true costs from counts; plans include the deployed one), or None."""
-    costs = [plan_cost(t, counts, bound)[0] for t in plans]
+def realized_regret(deployed, plans, counts, bound, cost=plan_cost):
+    """log C(deployed) - log min C(plans) (true costs from counts; plans include the deployed one), or None. cost:
+    (tree, counts, bound) -> (cost or None, failed counts used); C_out by default."""
+    costs = [cost(t, counts, bound)[0] for t in plans]
     costs = [c for c in costs if c is not None]
-    mine = plan_cost(deployed, counts, bound)[0]
+    mine = cost(deployed, counts, bound)[0]
     if mine is None or not costs:
         return None
     return max(0.0, math.log(max(mine, 1)) - math.log(max(min(costs), 1)))
@@ -196,23 +213,56 @@ def value_calibration(model, net, epi, queries, parts, device, n_indexes=64, gen
     return fe.calibration(torch.cat(samples, 1), torch.cat(base), torch.cat(true))
 
 
+def pattern_sizes(q):
+    """Rows per pattern of a query (its exact single-pattern counts), cached on the Query."""
+    if getattr(q, "sizes", None) is None:
+        singles = torch.tensor([1 << i for i in range(q.n)])
+        q.sizes = [int(round(math.expm1(float(x)))) for x in history_dp.single_pattern_logcounts(q.data, singles)]
+    return q.sizes
+
+
+def read_tasks(q, splits, cost, known, queued):
+    """ReadTasks for the splits (A, B) with a lazily read pattern operand whose read is not measured yet."""
+    sizes, tasks = pattern_sizes(q), []
+    for a, b in dict.fromkeys(tuple(sorted(x)) for x in lazy_splits(splits, sizes, cost)):
+        need = [(other, m.bit_length() - 1) for m, other in ((a, b), (b, a))
+                if not m & (m - 1) and sizes[m.bit_length() - 1] >= cost.lazy_rows]
+        key = (q.key, "read", a, b)
+        if any(x not in known for x in need) and key not in queued:
+            tasks.append((key, ReadTask(q.patterns, a, b)))
+    return tasks
+
+
+def candidate_splits(tree, q):
+    """Every candidate merge (A, B) at the states along `tree`."""
+    out, forest = [], bushy.initial_forest(q.n)
+    for a, b in bushy.tree_to_merges(tree):
+        out += bushy.candidate_merges(forest, q.neighbour_masks)
+        forest = bushy.merge(forest, a, b)
+    return out
+
+
 @torch.no_grad()
 def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, generator=None, alternatives=False,
-               reference=False, epinet=None, thompson=False, details=False):
+               reference=False, epinet=None, thompson=False, details=False, per_forest=1, explore_width=None,
+               trace_kept=False):
     """{name: tree} for "beam-w" (with alternatives also "beam-w #i"), "explore-i" and, with reference, the plain
     estimator "est GOO" (greedy, no bound) and "est beam-8", and "est DP + bound"; plus the deployed beam's states' candidate merges (masks). With an
     epinet and thompson, each exploration beam plans with its own epistemic index instead of score noise. details:
-    (plans, {"ctx": the QueryContext, "indexes": the exploration beams' indexes [explore, D] or None})."""
+    (plans, {"ctx": the QueryContext, "indexes": the exploration beams' indexes [explore, D] or None, "kept": with
+    trace_kept, per step the component trees of each forest the first beam (widths[0]) kept}). per_forest: builds
+    per forest every beam keeps (fv.beam_plans); explore_width: the exploration beams' width (default widths[-1])."""
     ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, encoder(model, q, device))
     groups = [("GOO" if w == 1 else f"beam-{w}", w, 0.0, alternatives) for w in widths]
-    groups += [(f"explore-{i}", widths[-1], 0.0 if thompson else sigma, False) for i in range(explore)]
+    groups += [(f"explore-{i}", explore_width or widths[-1], 0.0 if thompson else sigma, False) for i in range(explore)]
     indexes = None
     if epinet is not None:
         indexes = torch.zeros(len(groups), epinet.index_dim, device=device)
         if thompson and explore:
             indexes[len(widths):] = torch.randn(explore, epinet.index_dim, device=device, generator=generator)
+    kept = [] if trace_kept else None
     out, _ = fv.beam_plans(net, ctx, [g[1] for g in groups], [g[2] for g in groups], [g[3] for g in groups], generator,
-                           epinet=epinet, indexes=indexes)
+                           epinet=epinet, indexes=indexes, per_forest=per_forest, kept=kept)
     plans = {}
     for (name, *_), trees in zip(groups, out):                  # all beams of the query in one batch
         plans[name] = trees[0]
@@ -228,7 +278,8 @@ def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, gen
         bounded = history_dp.degree_bound(q.patterns, s, torch.where(s.singleton, exact, est).clamp(min=0), degrees)
         plans["est DP + bound"] = soft_dp.hard_plan(s, soft_dp.soft_dp(s, bounded, 0.0)[1])
     if details:
-        return plans, {"ctx": ctx, "indexes": indexes[len(widths):] if indexes is not None and thompson and explore else None}
+        return plans, {"ctx": ctx, "indexes": indexes[len(widths):] if indexes is not None and thompson and explore else None,
+                       "kept": [[t for g, t in step if g == 0] for step in kept] if kept is not None else None}
     return plans
 
 
@@ -252,8 +303,9 @@ def _build_init(degrees):
 
 def _build_one(args):
     """A part with numpy arrays: torch would send each of its tensors through its own shared-memory file."""
-    n, neighbour_masks, patterns, plans, counts, failed_count = args
-    part = fv.build_query_data(n, neighbour_masks, patterns, _BUILD_DEGREES, plans, counts, failed_count)
+    n, neighbour_masks, patterns, plans, counts, failed_count, *extra = args
+    part = fv.build_query_data(n, neighbour_masks, patterns, _BUILD_DEGREES, plans, counts, failed_count,
+                               **(extra[0] if extra else {}))
     return {k: v.numpy() if torch.is_tensor(v) else v for k, v in part.items()}
 
 
@@ -270,9 +322,11 @@ class PartBuilder:
                                             initargs=(degrees,))
 
     def build(self, jobs):
-        """jobs [(n, neighbour_masks, patterns, plans, counts, failed_count)] -> their parts, in order."""
+        """jobs [(n, neighbour_masks, patterns, plans, counts, failed_count[, build_query_data keyword arguments])]
+        -> their parts, in order."""
         if self.pool is None or len(jobs) < 2:
-            return [fv.build_query_data(n, nb, pt, self.degrees, pl, c, f) for n, nb, pt, pl, c, f in jobs]
+            return [fv.build_query_data(n, nb, pt, self.degrees, pl, c, f, **(extra[0] if extra else {}))
+                    for n, nb, pt, pl, c, f, *extra in jobs]
         parts = self.pool.map(_build_one, jobs, chunksize=max(1, len(jobs) // (8 * self.pool._max_workers)))
         return [{k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in p.items()} for p in parts]
 
@@ -318,13 +372,26 @@ def main(cfg: DictConfig):
             if count_connected_subsets(q.neighbour_masks, 1024) <= 1024:
                 phis.append(subset_phi(model, q.data, soft_dp.SubsetStructure(q.neighbour_masks, device).masks, device)[0])
         phi = torch.cat(phis)
-    net = fv.ForestPlanner(phi.shape[1], int(fcfg.d), int(fcfg.heads), int(fcfg.layers), int(fcfg.bound_hidden)).to(device)
+    ccfg = cfg.get("cost") or {"model": "cout"}
+    if str(ccfg["model"]) not in ("cout", "qlever"):
+        raise ValueError(f"cost.model: cout or qlever, not {ccfg['model']}")
+    qcost = QLeverCost(**dict(ccfg["qlever"])) if str(ccfg["model"]) == "qlever" else None
+    per_forest = int(fcfg.get("builds_per_forest", 1))
+    bcfg = fcfg.get("beam_loss") or {"enabled": False}
+    beam_loss = bool(bcfg["enabled"])
+    beam_widths = [int(w) for w in bcfg.get("widths", [int(online.deployed_width)])]
+    net = fv.ForestPlanner(phi.shape[1], int(fcfg.d), int(fcfg.heads), int(fcfg.layers), int(fcfg.bound_hidden),
+                           cost=dict(ccfg["qlever"]) if qcost else None).to(device)
     net.mean.copy_(phi.mean(0)), net.std.copy_(phi.std(0).clamp(min=1e-3))
     print(f"Estimator: {cfg.estimator.run} (epoch {epoch}), {sum(p.numel() for p in model.parameters()):,} parameters | "
           f"forest planner {sum(p.numel() for p in net.parameters()):,} parameters (untrained) | degrees of {len(degrees)} predicates",
           flush=True)
+    print(f"Cost: {'QLever ' + str(qcost) if qcost else 'C_out'} | builds per forest {per_forest} | beam loss "
+          f"{'widths ' + str(beam_widths) if beam_loss else 'off (per-state plan loss)'}", flush=True)
     ecfg = cfg.get("epinet") or {"enabled": False}
     epi = None
+    if bool(ecfg["enabled"]) and qcost is not None:
+        raise ValueError("the epinet scores plans by C_out (fv.plan_scores): not with cost.model qlever")
     if bool(ecfg["enabled"]):
         epi = fe.ForestEpinet(phi.shape[1], int(fcfg.d), int(ecfg.index_dim), int(ecfg.hidden_dim),
                                           int(ecfg.prior_hidden_dim)).to(device)
@@ -362,19 +429,39 @@ def main(cfg: DictConfig):
                 largest[0] = max([largest[0], *counts[key].values()])
         print(f"Seeded counts from {seed_cache}: {sum(len(t) for t in counts.values()):,}", flush=True)
 
-    def count_missing(pairs):
+    reads: dict[str, dict] = {}                          # query -> {(other operand, pattern): rows read or None}
+
+    def true_cost(q):
+        """(tree, counts, bound) -> (true cost, failed counts used) in the run's cost: C_out, or the QLever cost."""
+        if qcost is None:
+            return plan_cost
+        sizes, var_masks = pattern_sizes(q), variable_masks(q.patterns)
+        return lambda t, c, bound=None: plan_work(t, c, sizes, var_masks, reads.get(q.key, {}), qcost, bound)
+
+    def count_missing(pairs, splits=None):
+        """Counts of the masks of [(query, masks)] not known yet; with a QLever cost also the reads of the splits
+        {query key: [(A, B)]} with a lazily read pattern operand."""
         tasks = []
         for q, masks in pairs:
             known = counts.setdefault(q.key, {})
             tasks += [((q.key, m), count_query(q.patterns, m)) for m in dict.fromkeys(masks) if m not in known]
+            if qcost is not None and splits:
+                tasks += read_tasks(q, splits.get(q.key, []), qcost, reads.setdefault(q.key, {}), set())
         tasks = list(dict(tasks).items())
         start = time.perf_counter()
         results = count_subsets(tasks, endpoints, float(online.count_timeout_s)) if tasks else {}
         return store_counts(results), sum(v is None for v in results.values()), time.perf_counter() - start
 
     def store_counts(results):
-        for (key, m), value in results.items():
-            counts[key][m] = value
+        for key, value in results.items():
+            if len(key) == 4:                            # a ReadTask (query, "read", A, B): reads of its patterns
+                table = reads.setdefault(key[0], {})
+                for m, other in ((key[2], key[3]), (key[3], key[2])):
+                    if not m & (m - 1):
+                        table[(other, m.bit_length() - 1)] = None if value is None else value.get(m.bit_length() - 1)
+                continue
+            q_key, m = key
+            counts[q_key][m] = value
             if value is not None:
                 largest[0] = max(largest[0], value)
         return len(results)
@@ -394,7 +481,8 @@ def main(cfg: DictConfig):
             robust_z = torch.randn(int(ecfg.robust_indexes), epi.index_dim, device=device,
                                    generator=torch.Generator(device=device.type).manual_seed(int(online.seed) + 7919))
         for v in tqdm(validation, desc="Planning (validation)", file=sys.stdout, mininterval=30):
-            ours = plan_query(model, net, v, degrees, device, widths, reference=bool(fcfg.reference_planners))
+            ours = plan_query(model, net, v, degrees, device, widths, reference=bool(fcfg.reference_planners),
+                              per_forest=per_forest)
             plans[v.key] = {(k if k.startswith("est") else f"value {k}"): t for k, t in ours.items()} | gnce_plans[v.key]
             if robust:
                 ctx = fv.QueryContext(v.n, v.neighbour_masks, v.patterns, degrees, encoder(model, v, device))
@@ -409,7 +497,9 @@ def main(cfg: DictConfig):
         planned = time.perf_counter() - start
         extra = {k: [m for t in ts for m in bushy.internal_masks(t)] for k, ts in candidates.items()} if oracle else {}
         new, failed, seconds = count_missing([(v, [m for t in plans[v.key].values() for m in bushy.internal_masks(t)]
-                                               + extra.get(v.key, [])) for v in validation])
+                                               + extra.get(v.key, [])) for v in validation],
+                                             {v.key: [x for t in plans[v.key].values() for x in plan_internal_splits(t)]
+                                              for v in validation} if qcost is not None else None)
         if oracle:
             for v in validation:
                 bound = failed_bound(counts[v.key], largest[0])
@@ -447,11 +537,20 @@ def main(cfg: DictConfig):
             rb = np.array([max(cost[name][v.key], 1) / best0[v.key] for v in validation if cost[name][v.key] is not None])
             summary["planners"][name]["vs_best_round_0"] = {**{f"p{q}": round(float(np.percentile(rb, q)), 3) for q in PERCENTILES},
                                                             ">2x": round(float(np.mean(rb > 2)), 4), ">10x": round(float(np.mean(rb > 10)), 4)}
+        work = {}
+        if qcost is not None:                            # the run's own cost: QLever's, vs GNCE GOO
+            work = {name: {v.key: true_cost(v)(plans[v.key][name], counts[v.key], failed_bound(counts[v.key], largest[0]))[0]
+                           for v in validation} for name in names}
+            for name in names:
+                r = [math.log(max(work[name][k], 1) / max(work["GNCE GOO"][k], 1)) for k in work[name]
+                     if work[name][k] is not None and work["GNCE GOO"][k] is not None]
+                summary["planners"][name]["work_vs_GNCE_GOO"] = round(float(np.exp(np.mean(r))), 4) if r else None
         with open(run_directory / "validation.jsonl", "a") as f:
             f.write(json.dumps(summary) + "\n")
         with open(run_directory / f"validation-{round_index}.json", "w") as f:
             json.dump({v.key: {"n": v.n, "family": v.family, **{name: {"plan": bushy.to_json(plans[v.key][name]),
-                       "true_cout": cost[name][v.key], "failed_counts": costed[name][v.key][1]} for name in names}}
+                       "true_cout": cost[name][v.key], "failed_counts": costed[name][v.key][1],
+                       **({"true_work": work[name][v.key]} if work else {})} for name in names}}
                        for v in validation}, f)
         print(f"\n[validation round {round_index}] true C_out, geomean vs GNCE GOO ({new:,} new counts, "
               f"{failed} failed, {seconds:.0f}s; planning {planned:.0f}s):", flush=True)
@@ -465,6 +564,9 @@ def main(cfg: DictConfig):
                 line += f"   {p['vs_round_0']['all']:.3f}            {p['vs_round_0_10x'][0]:4d} / {p['vs_round_0_10x'][1]:<4d}"
             print(line, flush=True)
         print("  * plans with a failed count, costed at the query's failed-count bound (2 x its largest count)", flush=True)
+        if work:
+            print("  QLever cost (the run's objective), geomean vs GNCE GOO: " + ", ".join(
+                f"{name} {summary['planners'][name]['work_vs_GNCE_GOO']}" for name in names), flush=True)
         print(f"  per-query C_out / the cheapest plan of any planner at round 0 (fixed reference; the tail):", flush=True)
         print(f"  {'planner':26s}" + "".join(f"{'p' + str(q):>8s}" for q in PERCENTILES) + f"{'> 2x':>8s}{'> 10x':>8s}", flush=True)
         for name in names:
@@ -487,6 +589,9 @@ def main(cfg: DictConfig):
         net.save(run_directory / f"planner-{round_index}.pt")
         with open(run_directory / "counts.pkl", "wb") as f:
             pickle.dump(counts, f)
+        if qcost is not None:
+            with open(run_directory / "reads.pkl", "wb") as f:
+                pickle.dump(reads, f)
 
     # --- training ------------------------------------------------------------------------------------
     groups = [{"params": list(model.parameters()), "lr": float(online.lr)}, {"params": list(net.parameters()), "lr": float(fcfg.lr)}]
@@ -498,7 +603,12 @@ def main(cfg: DictConfig):
     plans_of: dict[str, list] = {}                       # query -> counted plans (canonical, most recent last)
     parts: dict[str, tuple] = {}                         # query -> (build_query_data part, counts seen, plans seen)
     weights = {"l1_raw": float(online.l1_weight), "l1_bound": float(fcfg.bound_l1_weight), "value": float(fcfg.value_weight),
-               "w": float(fcfg.w_loss_weight), "plan": float(online.plan_weight), "consistency": float(fcfg.consistency_weight)}
+               "w": float(fcfg.w_loss_weight), "plan": 0.0 if beam_loss else float(online.plan_weight),
+               "consistency": float(fcfg.consistency_weight),
+               "beam": float(online.plan_weight) if beam_loss else 0.0,          # replaces the per-state plan loss
+               "l1_read": float(ccfg.get("read_l1_weight", 1.0)) if qcost is not None else 0.0}
+    beams_of: dict[str, dict] = {}                      # query -> its last deployed beam's trace (the beam loss)
+    beam_version: dict[str, int] = {}
     value_target = "v"
     if epi is not None:
         value_target = ("w" if float(fcfg.w_loss_weight) > 0 else "v") if str(ecfg.value_target) == "auto" else str(ecfg.value_target)
@@ -551,13 +661,15 @@ def main(cfg: DictConfig):
             candidates = [candidates[i] for i in top]
         new_keys = {q.key for q in candidates}
         batch += candidates
-        deployed = f"beam-{int(online.deployed_width)}" if int(online.deployed_width) > 1 else "GOO"
         stream = CountStream(endpoints, float(online.count_timeout_s))
         queued = set()
         for q in tqdm(batch, desc="Planning", file=sys.stdout, mininterval=30):
-            plans, det = plan_query(model, net, q, degrees, device, [int(online.deployed_width)], int(online.explore_plans),
+            width = int(rng.choice(beam_widths)) if beam_loss else int(online.deployed_width)   # the beam loss: per query
+            deployed = f"beam-{width}" if width > 1 else "GOO"
+            plans, det = plan_query(model, net, q, degrees, device, [width], int(online.explore_plans),
                                     float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
-                                    epinet=epi, thompson=epi is not None and bool(ecfg.thompson), details=True)
+                                    epinet=epi, thompson=epi is not None and bool(ecfg.thompson), details=True,
+                                    per_forest=per_forest, explore_width=int(online.deployed_width), trace_kept=beam_loss)
             if det["indexes"] is not None:                       # decision uncertainty over this execution's plans
                 trees = list(dict.fromkeys([bushy.canonical(plans[deployed])] + [bushy.canonical(t) for t in plans.values()]))
                 decision_of[q.key], disagree_of[q.key] = decision_uncertainty(net, epi, det["ctx"], trees, det["indexes"])
@@ -567,9 +679,17 @@ def main(cfg: DictConfig):
             known = counts.setdefault(q.key, {})
             tasks = [((q.key, m), count_query(q.patterns, m)) for m in dict.fromkeys(masks)
                      if m not in known and (q.key, m) not in queued]
+            if qcost is not None:                                # reads of the splits with a lazily read pattern
+                splits = [x for t in plans.values() for x in plan_internal_splits(t)]
+                if bool(fcfg.count_candidates):
+                    splits += candidate_splits(plans[deployed], q)
+                tasks += read_tasks(q, splits, qcost, reads.setdefault(q.key, {}), queued)
             queued.update(key for key, _ in tasks)
             stream.add(tasks)                                    # counted while the next queries are planned
             deployed_of[q.key] = bushy.canonical(plans[deployed])
+            if beam_loss:
+                beams_of[q.key] = {"width": width, "kept": det["kept"]}
+                beam_version[q.key] = beam_version.get(q.key, 0) + 1
             known = plans_of.setdefault(q.key, [])
             for t in plans.values():
                 c = bushy.canonical(t)
@@ -582,7 +702,8 @@ def main(cfg: DictConfig):
         new, failed, count_s = store_counts(results), sum(v is None for v in results.values()), stream.seconds
         count_wait = time.perf_counter() - t1
         for q in batch:                                  # realized regret of this execution (true costs)
-            r = realized_regret(deployed_of[q.key], plans_of[q.key], counts[q.key], failed_bound(counts[q.key], largest[0]))
+            r = realized_regret(deployed_of[q.key], plans_of[q.key], counts[q.key], failed_bound(counts[q.key], largest[0]),
+                                true_cost(q))
             if r is not None:
                 regret_of[q.key] = r
         executed = [regret_of[q.key] for q in batch if q.key in regret_of]
@@ -601,14 +722,20 @@ def main(cfg: DictConfig):
         while len(seen) > int(online.replay_queries):
             gone = next(iter(seen))
             seen.pop(gone), plans_of.pop(gone, None), parts.pop(gone, None), regret_of.pop(gone, None), deployed_of.pop(gone, None)
+            beams_of.pop(gone, None), beam_version.pop(gone, None)
             decision_of.pop(gone, None), disagree_of.pop(gone, None)
 
         t2 = time.perf_counter()
         window = list(seen.values())
-        stale = [(q, (len(counts[q.key]), tuple(plans_of[q.key]))) for q in window]
+        stale = [(q, (len(counts[q.key]), tuple(plans_of[q.key]), len(reads.get(q.key, {})), beam_version.get(q.key, 0)))
+                 for q in window]
         stale = [(q, state) for q, state in stale if q.key not in parts or parts[q.key][1] != state]
         built = builder.build([(q.n, q.neighbour_masks, q.patterns, plans_of[q.key], counts[q.key],
-                                failed_bound(counts[q.key], largest[0])) for q, _ in stale])
+                                failed_bound(counts[q.key], largest[0]),
+                                {"sizes": pattern_sizes(q) if qcost is not None else None,
+                                 "reads": reads.get(q.key) if qcost is not None else None, "cost": qcost,
+                                 "beam": beams_of.get(q.key) if beam_loss else None, "per_forest": per_forest})
+                               for q, _ in stale])
         for (q, state), part in zip(stale, built):
             parts[q.key] = (part, state)
             if epi is not None:
@@ -627,7 +754,8 @@ def main(cfg: DictConfig):
         model.train(), net.train()
         steps = max(1, int(float(online.gradient_passes_per_round) * len(window) / int(online.queries_per_batch)))
         stats = {k: [] for k in ("loss", "l1_raw", "l1_bound", "value", "w", "plan", "floor", "consistency", "choice",
-                                 "epinet_card", "epinet_value", "trained_regret", "is_weight")}
+                                 "epinet_card", "epinet_value", "trained_regret", "is_weight", "beam", "pools_kept",
+                                 "l1_read")}
         B = min(int(online.queries_per_batch), len(window))
         p_train = iw = None
         if prioritized:
@@ -657,7 +785,7 @@ def main(cfg: DictConfig):
                                                               for q in chosen])))
                 stats["is_weight"].append(float(iw[picked].mean()))
             warm = round_index <= int(fcfg.plan_warmup_rounds)      # V learns from its own targets before the plan loss
-            loss = sum(w * res[k] for k, w in weights.items() if not (warm and k == "plan"))
+            loss = sum(w * res[k] for k, w in weights.items() if not (warm and k in ("plan", "beam")))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if epi is not None:                          # its inputs are detached: a separate, smaller graph
@@ -673,6 +801,12 @@ def main(cfg: DictConfig):
             for k in ("l1_raw", "l1_bound", "value", "w", "plan", "floor", "consistency"):
                 stats[k].append(float(res[k]))
             stats["choice"].append(res["states_with_choice"] / max(res["states"], 1))
+            if beam_loss:
+                stats["beam"].append(float(res["beam"]))
+                if res["pools"]:
+                    stats["pools_kept"].append(res["pools_kept"] / res["pools"])
+            if qcost is not None and res["read_labels"]:
+                stats["l1_read"].append(float(res["l1_read"]))
         record = {"round": round_index, "queries": len(batch), "revisited": n_revisit, "counted": new, "failed": failed,
                   "plan_s": round(t1 - t0, 1), "count_s": round(count_s, 1), "count_wait_s": round(count_wait, 1),
                   "build_s": round(t3 - t2, 1),
@@ -698,6 +832,11 @@ def main(cfg: DictConfig):
               f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s (+{count_wait:.0f}s waiting for counts), build "
               f"{record['build_s']:.0f}s, train "
               f"{record['train_s']:.0f}s | window {len(window):,}", flush=True)
+        if beam_loss or qcost is not None:
+            parts_line = [f"beam loss {record.get('beam', float('nan')):.3f} (the plan regret above is not trained), best "
+                          f"plan kept by the beam's scores in {record.get('pools_kept', float('nan')):.1%} of pools"] if beam_loss else []
+            parts_line += [f"rows-read L1 {record.get('l1_read', float('nan')):.3f}"] if qcost is not None else []
+            print(f"[round {round_index}] " + " | ".join(parts_line), flush=True)
         if executed:
             replay = (f" | trained on regret {record['trained_regret']:.3f}, importance weight {record['is_weight']:.2f}"
                       if prioritized else "")

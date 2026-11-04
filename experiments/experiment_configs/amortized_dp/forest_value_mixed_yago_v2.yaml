@@ -40,6 +40,19 @@ forest:
   count_candidates: false    # also count every candidate merge along the deployed plan (more counts per query)
   max_plans_per_query: 16    # counted plans kept per query for training (most recent)
   reference_planners: true   # validation: the plain estimator beam-8 and the lattice DP + hard bound
+  builds_per_forest: 1       # builds of the same child forest every beam keeps (1: one per forest, as before)
+  beam_loss:                 # the beam-aware loss instead of the per-state plan loss (forest_value.py module text)
+    enabled: false
+    widths: [1, 4, 8]        # each query's deployed beam width, drawn per query (the loss's k)
+
+cost:                        # the planning cost (work_function.py module text)
+  model: cout                # cout | qlever
+  qlever:                    # QLeverCost: per-row weights relative to out (fitted, work_2026-11-04), lazy threshold
+    out: 1.0
+    read: 0.98
+    sort: 0.33
+    lazy_rows: 1000000
+  read_l1_weight: 1.0        # L1 of the rows-read head on measured reads (qlever)
 
 epinet:          # forest_epinet.py; off here (forest_value_epinet_mixed_yago_v2_vw.yaml turns it on)
   enabled: false

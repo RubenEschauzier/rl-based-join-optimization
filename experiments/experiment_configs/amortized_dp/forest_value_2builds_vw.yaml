@@ -1,0 +1,11 @@
+# The 22-10 run (forest_value_rowreadout_mixed_yago_v2_vw.yaml, forest-value-22-10-2026-11-13-52) with every beam
+# keeping the best 2 builds of each child forest instead of 1 (work_2026-11-04/beam_dedup_test.py: on that run's
+# round-40 planner, -11% log regret against the best known plan, beam-16 no gain), in training, validation and
+# evaluation. Everything else as that run.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value --config-name forest_value_2builds_vw.yaml
+defaults:
+  - forest_value_rowreadout_mixed_yago_v2_vw
+  - _self_
+
+forest:
+  builds_per_forest: 2

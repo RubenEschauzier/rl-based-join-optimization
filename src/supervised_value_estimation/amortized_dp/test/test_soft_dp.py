@@ -143,3 +143,14 @@ def test_subset_batch_matches_reduced_form_queries():
     assert torch.equal(torch.bincount(mine[3]), torch.bincount(ref.batch))            # same nodes per subset
     assert _edge_sets(*mine) == _edge_sets(ref.x, ref.edge_index, ref.edge_attr, ref.batch)
     assert sorted(map(tuple, mine[0].tolist())) == sorted(map(tuple, ref.x.tolist()))
+
+
+def test_split_pairs_in_chunks_equal_the_unchunked_ones():
+    import torch
+    from src.supervised_value_estimation.amortized_dp.soft_dp import connected_masks, split_pairs
+    neighbours = [0b0000110, 0b0001101, 0b0010011, 0b0100010, 0b1001000, 0b0010000, 0b0001000]   # 7 patterns
+    allowed = connected_masks(neighbours, "cpu")
+    whole, chunked = split_pairs(allowed, 7, "cpu"), split_pairs(allowed, 7, "cpu", max_elements=7)
+    assert whole.keys() == chunked.keys()
+    for k in whole:
+        assert all(torch.equal(a, b) for a, b in zip(whole[k], chunked[k]))

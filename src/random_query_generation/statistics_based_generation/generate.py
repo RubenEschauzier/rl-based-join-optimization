@@ -403,7 +403,8 @@ def main(cfg: DictConfig):
         graph=graph, statistics=statistics, choke_points=_choke_points(gen.choke_points),
         instantiators={kind: Instantiator(graph, statistics, int(settings.max_pattern_matches),
                                           int(settings.max_candidates),
-                                          int(by_shape.get(kind, settings.max_restarts)))
+                                          int(by_shape.get(kind, settings.max_restarts)),
+                                          big_pattern_rows=settings.get("big_pattern_rows"))
                        for kind in gen.shapes},
         counter=ExactCounter(graph, PredicateIndex(graph),
                              max_assignments=int(gen.certificate.get("max_conditioning_values", 2000))),

@@ -7,6 +7,11 @@ subset is counted once with
 spread over the QLever endpoints, one request in flight per endpoint, and cached on disk
 (query string -> {subset mask: rows, None if the count failed or timed out}). The cache is
 extended, never rebuilt, so later runs on the same validation queries count nothing.
+
+ReadTask measures what a lazily read pattern operand reads (the QLever planning cost, work_function.QLeverCost):
+the join of a split (A, B) runs with A and B as separate groups, so a single pattern is a scan directly under the
+join; its num-elements-read in the runtime tree is the label. Count tasks and read tasks run on the same workers
+(count_subsets, CountStream: a task's query is a SPARQL count string or a ReadTask).
 """
 from __future__ import annotations
 
@@ -41,6 +46,41 @@ def count_on_endpoint(session, endpoint, query, timeout_s):
     return int(bindings[0]["count"]["value"]) if bindings else 0
 
 
+class ReadTask:
+    """The split (a, b) of a join: run(session, endpoint, timeout_s) -> {pattern index: rows read} for its operands
+    that are single patterns (num-elements-read of their scans, under the join), or None if the query failed."""
+
+    def __init__(self, triple_patterns, a, b):
+        self.a, self.b = a, b
+        self.members = list(members(a)) + list(members(b))
+        self.patterns = [triple_patterns[i] for i in self.members]
+
+        def group(mask):
+            return "{ " + " ".join(p.strip() if p.strip().endswith(".") else p.strip() + " ."
+                                   for p in (triple_patterns[i] for i in members(mask))) + " }"
+        self.query = f"SELECT * WHERE {{ {group(a)} {group(b)} }}"
+
+    def run(self, session, endpoint, timeout_s):
+        from src.supervised_value_estimation.amortized_dp.online.runtime_tree import parse_bushy_execution
+        response = session.post(endpoint, params={"timeout": f"{int(timeout_s)}s", "send": 0}, data=self.query,
+                                headers={"Accept": "application/qlever-results+json",
+                                         "Content-Type": "application/sparql-query"}, timeout=timeout_s + 30)
+        if response.status_code != 200:
+            return None
+        tree = (response.json().get("runtimeInformation") or {}).get("query_execution_tree") or {}
+        read = parse_bushy_execution(tree, [], self.patterns)["scan_read"]
+        singles = [m.bit_length() - 1 for m in (self.a, self.b) if not m & (m - 1)]
+        out = {p: read[self.members.index(p)] for p in singles if self.members.index(p) in read}
+        return out if len(out) == len(singles) else None
+
+
+def run_task(session, endpoint, query, timeout_s):
+    """A count string -> rows; a ReadTask -> its reads."""
+    if isinstance(query, ReadTask):
+        return query.run(session, endpoint, timeout_s)
+    return count_on_endpoint(session, endpoint, query, timeout_s)
+
+
 def count_subsets(tasks, endpoints, timeout_s):
     """tasks: [(key, sparql count query)] -> {key: rows or None}. One thread per endpoint,
     so each single-core QLever instance runs one count at a time."""
@@ -58,7 +98,7 @@ def count_subsets(tasks, endpoints, timeout_s):
             except queue.Empty:
                 return
             try:
-                value = count_on_endpoint(session, endpoint, query, timeout_s)
+                value = run_task(session, endpoint, query, timeout_s)
             except (requests.RequestException, ValueError, KeyError):
                 value = None
             with lock:
@@ -93,7 +133,7 @@ class CountStream:
         while (task := self.work.get()) is not None:
             key, query = task
             try:
-                value = count_on_endpoint(session, endpoint, query, self.timeout_s)
+                value = run_task(session, endpoint, query, self.timeout_s)
             except (requests.RequestException, ValueError, KeyError):
                 value = None
             with self.lock:

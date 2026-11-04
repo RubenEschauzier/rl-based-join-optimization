@@ -374,3 +374,22 @@ def test_dense_message_paths_match_the_sparse_ones():
     message = _Message(np.array([3, 17, 999]), np.array([2.0, 5.0, 7.0]))
     entities = rng.integers(0, 1000, 500)
     assert np.array_equal(message.lookup(entities), message.lookup(entities, n_entities=1000))
+
+
+def test_big_patterns_fit_the_row_quota(data):
+    graph, statistics, _ = data
+    cap, quota = 100, 400                    # every predicate of the fixture matches more than the cap
+    assert (statistics.counts[statistics.counts > 0] > cap).all()
+    instantiator = Instantiator(graph, statistics, max_pattern_matches=cap, max_restarts=300, big_pattern_rows=quota)
+    rng = np.random.default_rng(2)
+    with_big = 0
+    for kind in ("star", "path", "tree", "cycle"):
+        for choke_point in (ChokePoint("random"), ChokePoint("a", n_constants=(2, 3))):
+            shape = build_shape(kind, 5, rng)
+            instance = instantiator.embed(shape, binding_plan(shape, choke_point, rng), choke_point, rng)
+            if instance is None:
+                continue
+            over = [size for size in instance.pattern_sizes(graph, statistics) if size > cap]
+            assert sum(over) <= quota
+            with_big += bool(over)
+    assert with_big >= 1

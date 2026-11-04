@@ -24,7 +24,19 @@ with G predicted by the value network instead of being left out. Three parts:
    per head between components that share a variable. W starts at 0 (last layer zero): V is then constant within
    a query and the planner is the estimator beam with the bound.
 3. Planner: beam over forests by total(F) (beam_plan); width 1 is greedy. beam_plans runs several beams of one query
-   (the deployed beam and the exploration beams, or the validation widths) as one batch.
+   (the deployed beam and the exploration beams, or the validation widths) as one batch. Several candidates can
+   build the same child forest (the same component sets, built in another order); the beam keeps the best
+   `per_forest` of them (1: one per forest).
+4. Cost (ForestPlanner.cost): None is C_out, the cost of a join U = A |><| B is its result, c^(U) = l''(U). With a
+   work_function.QLeverCost the cost is QLever's planning cost in rows of C_out (work_function's module text):
+       c^(U) = logsumexp( log out + l''(U),  log read + r^(S, p) for an operand p that is a lazily read pattern
+                          (its exact count >= lazy_rows) joined with the other operand S,
+                          log sort + log(n log2 n) for an operand that is a join result whose join variables differ
+                          from this join's (n from its l'') )                                      (join_cost)
+   r^(S, p) = log1p |p| + logsigmoid(h(phi(S), phi(p), l''(S), log1p |p|)) is a learned rows-read head (ReadHead):
+   at most the whole scan, starting at about all of it. Costs so far, subtree costs and G are then in these rows,
+   and a forest with 2 components has V = c^ of its final join. C_out only: epinet, robust beams, start forests and
+   plan_scores.
 
 Training (losses, on counted plans): per state F on a counted plan, its candidate merges m with child forests F_m
        Q^(m) = logaddexp( l''(U_m), V(F_m) )          estimated cost-to-go of F through m
@@ -37,6 +49,18 @@ Training (losses, on counted plans): per state F on a counted plan, its candidat
             forests with a known G, a counted Q and G(F) > c(Q) + 1
    l1       |l - log1p count| on counted subsets, and the same on l'' of counted nodes (one-sided for failed counts)
    consistency  |V(F) - min_m Q^(m)| (target detached) on states with 3+ components (no counts needed)
+   l1_read  |r^(S, p) - log1p rows read| on joins with a lazily read pattern and a measured read (cost QLever)
+   beam     the beam-aware loss (build_query_data's `beam`: a traced beam of width k, beam_plans `kept`): per step of
+            that beam, the POOL of every candidate of every forest it kept, scored as the planner does,
+            total^ = logaddexp(log cost so far^, V). A candidate is ON PATH when its true cost so far plus its
+            stitched G equals the best stitched plan of the query (some best known plan still goes through it).
+            In a pool with an on-path candidate, its best-scored one c* must survive the beam's selection:
+              its own forest's builds   tau softplus((total^(c*) - total^(b-th best other build)) / tau)
+              the pool                  tau softplus((total^(c*) - total^(k-th best other kept candidate)) / tau)
+            (b = per_forest; the k-th among the candidates that pass the per-forest cut; a term only when there
+            are that many). At the last step (complete plans, the cheapest is deployed) k = 1 and every plan is its
+            own forest. Pools after the best plan left the beam have no on-path candidate (Daume and Marcu,
+            LaSO, 2005; Wiseman and Rush 2016, beam search optimization).
 (build_query_data, forward_batch, losses; per-query weights, e.g. importance weights of prioritized replay, scale
 each query's terms). Everything is in log1p space, as the cardinality model. With stop_gradient
 the planner reads the encoder's phi and l detached: only the L1 on l trains the encoder.
@@ -54,6 +78,8 @@ from torch.utils.checkpoint import checkpoint
 
 from src.supervised_value_estimation.amortized_dp import bushy
 from src.supervised_value_estimation.amortized_dp.labels import members
+from src.supervised_value_estimation.amortized_dp.work_function import (QLeverCost, WorkStitchTable, join_work,
+                                                                        variable_masks)
 
 NEG = -1e4        # log of a zero cost (a single pattern costs nothing; nothing left to build)
 BIG = 1e4         # log degree of a side with no bound
@@ -208,14 +234,35 @@ class ForestValue(nn.Module):
         return (W, h) if return_hidden else W
 
 
-class ForestPlanner(nn.Module):
-    """The bound and the value network, with the phi standardisation (set from a sample of subsets)."""
+class ReadHead(nn.Module):
+    """r^(S, p) [M]: log1p rows a lazily read pattern p reads when joined with S (module text, part 4), from
+    standardised phi(S), phi(p) and l''(S), log1p |p|: log1p |p| + logsigmoid(h), at most the whole scan; h starts at
+    4 (reads ~ all of it)."""
 
-    def __init__(self, phi_dim=200, d=64, heads=4, layers=2, bound_hidden=32):
+    def __init__(self, phi_dim=200, hidden=64):
         super().__init__()
-        self.config = {"phi_dim": phi_dim, "d": d, "heads": heads, "layers": layers, "bound_hidden": bound_hidden}
+        self.mlp = nn.Sequential(nn.Linear(2 * phi_dim + 2, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, 1))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.constant_(self.mlp[-1].bias, 4.0)
+
+    def forward(self, phi_s, phi_p, l_s, l_p):
+        h = self.mlp(torch.cat([phi_s, phi_p, (l_s / 10)[:, None], (l_p / 10)[:, None]], 1)).squeeze(1)
+        return l_p + F.logsigmoid(h)
+
+
+class ForestPlanner(nn.Module):
+    """The bound and the value network, with the phi standardisation (set from a sample of subsets). cost: None
+    (C_out) or the fields of a work_function.QLeverCost (module text, part 4), with the rows-read head."""
+
+    def __init__(self, phi_dim=200, d=64, heads=4, layers=2, bound_hidden=32, cost=None, read_hidden=64):
+        super().__init__()
+        self.config = {"phi_dim": phi_dim, "d": d, "heads": heads, "layers": layers, "bound_hidden": bound_hidden,
+                       "cost": dict(cost) if cost else None, "read_hidden": read_hidden}
         self.bound = SoftBound(phi_dim, bound_hidden)
         self.value = ForestValue(phi_dim, d, heads, layers)
+        self.cost = QLeverCost(**cost) if cost else None
+        self.read = ReadHead(phi_dim, read_hidden) if cost else None
         self.register_buffer("mean", torch.zeros(phi_dim))
         self.register_buffer("std", torch.ones(phi_dim))
 
@@ -244,6 +291,36 @@ class ForestPlanner(nn.Module):
         return net.to(device)
 
 
+def _log_weight(w):
+    return math.log(w) if w > 0 else NEG
+
+
+def sort_log(l):
+    """log(n log2 n) of sorting n = expm1(l) rows (l in log1p space; at least 1 row)."""
+    ln = torch.log(torch.expm1(l.clamp(max=80.0)).clamp(min=1.0))
+    return ln + torch.log((ln / math.log(2)).clamp(min=1.0))
+
+
+def join_cost(net, l2, la, lb, lazy_a, lazy_b, ra, rb, sort_a, sort_b):
+    """log c^(U) [M] of joins U = A |><| B (module text, part 4): l''(U) for C_out (net.cost None); with a QLeverCost
+    the logsumexp of log out + l''(U), log read + ra / rb (r^ of A read against B / of B against A) where A / B is
+    a lazily read pattern, log sort + log(n log2 n) from l''(A) / l''(B) where that operand is sorted first."""
+    c = net.cost
+    if c is None:
+        return l2
+    neg = torch.full_like(l2, NEG)
+    terms = [l2 + _log_weight(c.out),
+             torch.where(lazy_a, ra + _log_weight(c.read), neg), torch.where(lazy_b, rb + _log_weight(c.read), neg),
+             torch.where(sort_a, sort_log(la) + _log_weight(c.sort), neg),
+             torch.where(sort_b, sort_log(lb) + _log_weight(c.sort), neg)]
+    return torch.logsumexp(torch.stack(terms), 0)
+
+
+def operand_reads(net, phi_a, phi_b, la, lb):
+    """(r^(B, A), r^(A, B)) [M]: the rows read by A read against B and by B against A (standardised phi)."""
+    return net.read(phi_b, phi_a, lb, la), net.read(phi_a, phi_b, la, lb)
+
+
 def token_features(phi_std, l2, cost, single, size):
     """[.., D+4] component tokens: standardised phi, l'' / 10, log subtree cost / 10 (0 for a single pattern),
     single-pattern flag, |C| / n."""
@@ -261,6 +338,7 @@ class QueryContext:
     def __init__(self, n, neighbour_masks, patterns, degrees, encode: Callable):
         self.n, self.neighbour_masks, self.encode = n, list(neighbour_masks), encode
         self.touch_s, self.touch_o, self.fan = pattern_fanouts(patterns, degrees)
+        self.var_masks = variable_masks(patterns)       # per pattern its variables (the QLever cost's sort rule)
         self.cache: dict[int, int] = {}                  # mask -> row of phi / l
         self.phi = self.l = None
         self.reach: dict[int, int] = {}
@@ -304,6 +382,8 @@ def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, index
     beam does (single patterns: exact counts, not shifted). No index (or z = 0): the planner's own estimate, K = 1.
     The value net is not involved: it only guides the search; a finished plan's cost is its joins' estimates.
     with_root: also [K, T] l'' of each tree's root (trees of 2+ patterns; the start of beam_plans)."""
+    if net.cost is not None:
+        raise NotImplementedError("plan_scores scores C_out; the planner has a QLever cost")
     n = ctx.n
     device = ctx.encoded([1 << i for i in range(n)])[1].device
     K = 1 if epinet is None or indexes is None else len(indexes)
@@ -358,7 +438,7 @@ def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, index
 
 @torch.no_grad()
 def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
-               epinet=None, indexes=None, robust=None, start=None, trace_h=None):
+               epinet=None, indexes=None, robust=None, start=None, trace_h=None, per_forest=1, kept=None):
     """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by
     total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far, then by first appearance), with
     N(0, noises[g]) on each candidate's score (exploration). Returns ([trees of group g, cheapest first: all the
@@ -377,8 +457,15 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     start: the component trees of a forest to plan from (every group; default the single patterns), each component
     with its l'' and log subtree cost along its tree as plan_scores computes them. Not combined with robust.
     trace_h: a list that receives, aligned with trace, the value net's state h of every candidate's child forest (a
-    [d] tensor; None for a complete forest)."""
+    [d] tensor; None for a complete forest).
+    per_forest: per group and child forest the best this many candidates (builds) are kept, instead of one; the
+    final step keeps one complete plan per group either way (or all, with all_trees). kept: a list that receives,
+    per step, [(group, component trees)] of every forest the beams keep (the beam loss's pools, build_query_data).
+    With a QLever cost (net.cost) the joins cost join_cost (module text, part 4); not with epinet, robust or start."""
     G = len(widths)
+    qcost = net.cost is not None
+    if qcost and (epinet is not None or robust is not None or start is not None):
+        raise NotImplementedError("beam_plans with a QLever cost: no epinet, robust beams or start forest")
     noises = list(noises) if noises is not None else [0.0] * G
     all_trees = list(all_trees) if all_trees is not None else [False] * G
     n = ctx.n
@@ -417,6 +504,12 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         ccw = torch.full((G, n, Kr), NEG, device=device)
         sow = torch.full((G, Kr), NEG, device=device)
     trees = [list(range(n)) for _ in range(G)]
+    if per_forest > 1:                                   # per component a hash of its tree: the same build twice
+        ch = torch.tensor([(i + 1) * 0x9E3779B97F4A7C15 % (1 << 62) for i in range(n)], **long).expand(G, n).clone()
+    if qcost:                                            # per component its variables and sort key (-1: a scan)
+        lazy_l = math.log1p(net.cost.lazy_rows)
+        cv = torch.tensor(ctx.var_masks, **long).expand(G, n).clone()
+        cs = torch.full((G, n), -1, **long)
     if start is not None:
         assert robust is None, "a start forest is not combined with robust beams"
         comps = sorted((bushy.tree_mask(t), bushy.canonical(t)) for t in start)
@@ -456,8 +549,16 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
             size = _popcount(U, n) / n
             fa, fb = _merge_fans(torch.cat([a, b]), torch.cat([b, a]), n, touch_s, touch_o, fan).split(len(a))
             l2, _ = net.bound(l_u, cl[e, i], cl[e, j], fa, fb, phi_std, size)
-            cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
-            so_far = torch.logaddexp(so[e], l2)
+            c_u = l2
+            if qcost:
+                jv = cv[e, i] & cv[e, j]
+                sort_a, sort_b = (cs[e, i] >= 0) & (cs[e, i] != jv), (cs[e, j] >= 0) & (cs[e, j] != jv)
+                lazy_a, lazy_b = ((a & (a - 1)) == 0) & (cl[e, i] >= lazy_l), ((b & (b - 1)) == 0) & (cl[e, j] >= lazy_l)
+                ra, rb = operand_reads(net, net.standardise(ctx.phi[crow[e, i]]), net.standardise(ctx.phi[crow[e, j]]),
+                                       cl[e, i], cl[e, j])
+                c_u = join_cost(net, l2, cl[e, i], cl[e, j], lazy_a, lazy_b, ra, rb, sort_a, sort_b)
+            cost_u = torch.logaddexp(c_u, torch.logaddexp(cc[e, i], cc[e, j]))
+            so_far = torch.logaddexp(so[e], c_u)
             if robust is not None:
                 l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
                 Cn = len(e)
@@ -473,6 +574,12 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
             eo = e[:, None]
             child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
             child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
+            if qcost:
+                child_v = torch.cat([cv[eo, old], (cv[e, i] | cv[e, j])[:, None]], 1)
+                child_s = torch.cat([cs[eo, old], jv[:, None]], 1)
+            if per_forest > 1:                           # symmetric in the two parts (int64 arithmetic wraps)
+                lo, hi = torch.minimum(ch[e, i], ch[e, j]), torch.maximum(ch[e, i], ch[e, j])
+                child_h = torch.cat([ch[eo, old], ((lo * 1000003) ^ (hi * 998244353) ^ (lo + hi))[:, None]], 1)
             if kc == 1:
                 V = torch.full_like(l2, NEG)
                 hv = None
@@ -487,8 +594,18 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
                 adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
                 query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
                 shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
-                V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
+                lq_v = lq_g[gc] + _log_weight(net.cost.out) if qcost else lq_g[gc]
+                V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_v,
                                       torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
+                if qcost and kc == 2:                    # the cost of the final join of the two components
+                    rows2 = torch.cat([crow[eo, old], ru[:, None]], 1)
+                    l2c = torch.cat([cl[eo, old], l2[:, None]], 1)
+                    jq = child_v[:, 0] & child_v[:, 1]
+                    sq = (child_s >= 0) & (child_s != jq[:, None])
+                    lz = ((child_m & (child_m - 1)) == 0) & (l2c >= lazy_l)
+                    r0, r1 = operand_reads(net, net.standardise(ctx.phi[rows2[:, 0]]), net.standardise(ctx.phi[rows2[:, 1]]),
+                                           l2c[:, 0], l2c[:, 1])
+                    V = join_cost(net, lq_g[gc], l2c[:, 0], l2c[:, 1], lz[:, 0], lz[:, 1], r0, r1, sq[:, 0], sq[:, 1])
                 total = torch.logaddexp(so_far.double(), V.double())
                 if robust is not None:
                     Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
@@ -518,6 +635,16 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         o = o[torch.sort(so_far[win[o]], stable=True).indices]
         o = o[torch.sort(total[win[o]], stable=True).indices]                     # by (total, so far, first appearance)
         win = win[o]
+        if per_forest > 1 and kc > 1:                    # the best per_forest builds of each child forest
+            _, inv_b = torch.unique(torch.cat([gc[:, None], child_m.sort(1).values, child_h.sum(1)[:, None]], 1),
+                                    dim=0, return_inverse=True)
+            first_b = torch.full((int(inv_b.max()) + 1,), C, **long).scatter_reduce(0, inv_b[order], idx, "amin")
+            ordered = order[torch.sort(first_b).values]  # the best candidate of each distinct build, in order
+            g_ord = inv[ordered]
+            srt = torch.sort(g_ord, stable=True).indices
+            rank = torch.empty_like(srt)
+            rank[srt] = torch.arange(len(srt), **long) - torch.searchsorted(g_ord[srt], g_ord[srt])
+            win = ordered[rank < per_forest]                                        # by (total, so far, index)
         win = win[torch.sort(gc[win], stable=True).indices]
         gw = gc[win]
         counts = torch.bincount(gw, minlength=G)
@@ -531,6 +658,11 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         cl = torch.cat([cl[es[:, None], olds], l2[sel][:, None]], 1).gather(1, perm)
         cc = torch.cat([cc[es[:, None], olds], cost_u[sel][:, None]], 1).gather(1, perm)
         so, grp = so_far[sel], gc[sel]
+        if qcost:
+            cv = child_v[sel].gather(1, perm)
+            cs = child_s[sel].gather(1, perm)
+        if per_forest > 1:
+            ch = child_h[sel].gather(1, perm)
         if robust is not None:
             pw = perm[..., None].expand(-1, -1, Kr)
             clw = torch.cat([clw[es[:, None], olds], l2w[sel][:, None]], 1).gather(1, pw)
@@ -539,40 +671,53 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         built = [[trees[ee][x] for x in ol] + [(trees[ee][ii], trees[ee][jj])]
                  for ee, ii, jj, ol in zip(es.tolist(), i[sel].tolist(), j[sel].tolist(), olds.tolist())]
         trees = [[t[x] for x in pm] for t, pm in zip(built, perm.tolist())]
+        if kept is not None:
+            kept.append([(g, tuple(t)) for g, t in zip(grp.tolist(), trees)])
     out = [[] for _ in range(G)]
     for g, t in zip(grp.tolist(), trees):
         out[g].append(t[0])
     return [ts if keep else ts[:1] for ts, keep in zip(out, all_trees)], len(ctx.cache)
 
 
-def beam_plan(net: ForestPlanner, ctx: QueryContext, width: int, all_trees=False, noise=0.0, generator=None, trace=None):
+def beam_plan(net: ForestPlanner, ctx: QueryContext, width: int, all_trees=False, noise=0.0, generator=None, trace=None,
+              per_forest=1):
     """One beam (beam_plans): (the best tree, or with all_trees the beam's final trees, cheapest first, as
     bushy.estimator_beam_plan; number of subsets encoded). Width 1 is greedy."""
-    groups, encoded = beam_plans(net, ctx, [width], [noise], [all_trees], generator, trace)
+    groups, encoded = beam_plans(net, ctx, [width], [noise], [all_trees], generator, trace, per_forest=per_forest)
     return (groups[0] if all_trees else groups[0][0]), encoded
 
 
 # --- training data -------------------------------------------------------------------------------------------
 
-def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, failed_count):
+def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, failed_count, sizes=None, reads=None,
+                     cost=None, beam=None, per_forest=1):
     """The CPU tensors of one counted query for forward_batch: every subtree of the plans and of their candidate
     merges is a NODE (l'' depends on how a set was built); every forest on a plan is a STATE, with its candidate
     merges and their child forests (FORESTS = states and children, deduplicated). counts: {mask: count or None
-    (failed: costs `failed_count`)}. True values: log1p counts, G stitched from the counted subsets."""
+    (failed: costs `failed_count`)}. True values: log1p counts, G stitched from the counted subsets.
+    cost: None (C_out) or a work_function.QLeverCost: true join costs and G in its rows (WorkStitchTable), with
+    sizes (rows per pattern) and reads ({(other operand mask, pattern index): rows read or None}); every node with a
+    lazily read pattern operand carries that read (log1p, nan unknown) for the l1_read loss. beam: {"width": k,
+    "kept": beam_plans' kept of one group (per step its forests' component trees)} adds the beam loss's pools
+    (module text), with b = per_forest."""
     touch_s, touch_o, fan = pattern_fanouts(patterns, degrees)
+    var_masks = variable_masks(patterns)
     nodes: dict = {}
     node_rows = []                                       # (mask, c1, c2, height)
+    node_vars = []                                       # variables of the node's patterns (bitmask)
 
     def node(tree):
         key = bushy.canonical(tree)
         if key not in nodes:
             if bushy.is_leaf(key):
-                row = (1 << key, -1, -1, 0)
+                row, v = (1 << key, -1, -1, 0), var_masks[key]
             else:
                 i1, i2 = node(key[0]), node(key[1])
                 row = (node_rows[i1][0] | node_rows[i2][0], i1, i2, 1 + max(node_rows[i1][3], node_rows[i2][3]))
+                v = node_vars[i1] | node_vars[i2]
             nodes[key] = len(node_rows)
             node_rows.append(row)
+            node_vars.append(v)
         return nodes[key]
 
     forests: dict = {}                                   # sorted node ids -> forest id
@@ -599,20 +744,72 @@ def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, faile
                     child = forest([i for m, i in ids.items() if m not in (x, y)] + [c])
                     cand_rows.append((states[f], c, child))
             trees[a | b] = (trees.pop(a), trees.pop(b))
+    pools = []                                           # per beam step: (child forest ids, their component sets)
+    if beam is not None:
+        for parents in [[tuple(range(n))]] + list(beam["kept"]):
+            if len(parents[0]) < 2:
+                break
+            children, sets, seen = [], [], set()
+            for comps in parents:
+                trees = {bushy.tree_mask(t): t for t in comps}
+                ids = {m: node(t) for m, t in trees.items()}
+                for x, y in bushy.candidate_merges(tuple(sorted(trees)), neighbour_masks):
+                    child = forest([i for m, i in ids.items() if m not in (x, y)] + [node((trees[x], trees[y]))])
+                    if child not in seen:                # the same build from two parents: one candidate
+                        seen.add(child)
+                        children.append(child)
+                        sets.append(tuple(sorted([m for m in trees if m not in (x, y)] + [x | y])))
+            if len(parents[0]) == 2:                     # the last step: complete plans, the cheapest is deployed
+                sets = [(t,) for t in range(len(children))]
+            pools.append((children, sets))
 
     true_of = {m: math.log1p(failed_count if v is None else v) for m, v in counts.items()}
-    stitch = bushy.StitchTable(list(true_of), true_of)
+    N = len(node_rows)
+    node_jv = [node_vars[r[1]] & node_vars[r[2]] if r[1] >= 0 else -1 for r in node_rows]
+    node_true = torch.tensor([true_of.get(r[0], math.nan) if r[1] >= 0 else math.nan for r in node_rows])
+    node_failed = torch.tensor([r[1] >= 0 and r[0] in counts and counts[r[0]] is None for r in node_rows])
+    node_lazy = torch.zeros(N, dtype=torch.bool)
+    read1, read2 = torch.full((N,), math.nan), torch.full((N,), math.nan)
+    if cost is None:
+        stitch = bushy.StitchTable(list(true_of), true_of)
+        sorted_by = None
+        join_true = node_true                            # a join costs its result
+    else:
+        assert sizes is not None, "a QLever cost needs the patterns' sizes"
+        reads = {k: v for k, v in (reads or {}).items() if v is not None}
+        stitch = WorkStitchTable(list(true_of), true_of, sizes, var_masks, reads, cost)
+        node_lazy = torch.tensor([r[1] < 0 and sizes[r[0].bit_length() - 1] >= cost.lazy_rows for r in node_rows])
+        sorted_by = {}
+        join_true = torch.full((N,), math.nan)
+        for j, (m, c1, c2, _) in enumerate(node_rows):
+            if c1 < 0:
+                continue
+            m1, m2 = node_rows[c1][0], node_rows[c2][0]
+            for c, other, out in ((c1, m2, read1), (c2, m1, read2)):
+                if node_lazy[c] and (other, node_rows[c][0].bit_length() - 1) in reads:
+                    out[j] = math.log1p(reads[(other, node_rows[c][0].bit_length() - 1)])
+            if m not in true_of:
+                continue
+            operands = [(node_rows[c][0], math.expm1(true_of[node_rows[c][0]]) if node_rows[c][0] in true_of else None,
+                         node_rows[c][1] >= 0 and node_jv[c] != node_jv[j]) for c in (c1, c2)]
+            w = join_work(cost, math.exp(true_of[m]), operands, reads, sizes)
+            if w is not None:
+                join_true[j] = math.log(w)
+
+    def cost_to_go(ids):
+        masks = [node_rows[i][0] for i in ids]
+        if sorted_by is None:
+            return stitch.cost_to_go(masks)
+        return stitch.cost_to_go(masks, {node_rows[i][0]: node_jv[i] for i in ids if node_rows[i][1] >= 0})
+
     masks_needed = sorted({r[0] for r in node_rows} | {(1 << n) - 1})
     index = {m: i for i, m in enumerate(masks_needed)}
-    N = len(node_rows)
     fa = torch.full((N, 3), BIG)
     fb = torch.full((N, 3), BIG)
     for j, (m, c1, c2, _) in enumerate(node_rows):
         if c1 >= 0:
             fa[j] = merge_fan(node_rows[c1][0], node_rows[c2][0], touch_s, touch_o, fan)
             fb[j] = merge_fan(node_rows[c2][0], node_rows[c1][0], touch_s, touch_o, fan)
-    node_true = torch.tensor([true_of.get(r[0], math.nan) if r[1] >= 0 else math.nan for r in node_rows])
-    node_failed = torch.tensor([r[1] >= 0 and r[0] in counts and counts[r[0]] is None for r in node_rows])
     Fn = len(forest_rows)
     forest_nodes = torch.full((Fn, n), -1, dtype=torch.long)
     forest_adj = torch.zeros(Fn, n, n, dtype=torch.bool)
@@ -620,28 +817,69 @@ def build_query_data(n, neighbour_masks, patterns, degrees, plans, counts, faile
     g_true = torch.full((Fn,), math.nan)
     needed = set(states)
     for s_id, c, child in cand_rows:
-        if not math.isnan(float(node_true[c])):
+        if not math.isnan(float(join_true[c])):
             needed.add(child)
     for f, ids in enumerate(forest_rows):
         forest_nodes[f, :len(ids)] = torch.tensor(ids)
         forest_adj[f] = forest_adjacency([node_rows[i][0] for i in ids], neighbour_masks, n)
         if f in needed:
-            g = stitch.cost_to_go([node_rows[i][0] for i in ids])
+            g = cost_to_go(ids)
             g_true[f] = NEG if g == bushy.NEG_INF else (math.nan if g == math.inf else g)
     cand = torch.tensor(cand_rows, dtype=torch.long).reshape(-1, 3)
     q_true = torch.full((len(cand_rows),), math.nan)
     for j, (_, c, child) in enumerate(cand_rows):
-        if not math.isnan(float(node_true[c])) and not math.isnan(float(g_true[child])):
-            q_true[j] = float(torch.logaddexp(node_true[c], g_true[child]))
+        if not math.isnan(float(join_true[c])) and not math.isnan(float(g_true[child])):
+            q_true[j] = float(torch.logaddexp(join_true[c], g_true[child]))
+
+    pool_forest, pool_index, pool_set, pool_on, pool_k = [], [], [], [], []
+    if pools:                                            # on path: true cost so far + G(child) = the best plan's
+        best = stitch.cost_to_go(bushy.initial_forest(n))
+        subtree: dict = {}                               # node -> true cost of its subtree (rows; nan unknown)
+
+        def subtree_cost(i):
+            if i not in subtree:
+                r = node_rows[i]
+                subtree[i] = 0.0 if r[1] < 0 else math.exp(float(join_true[i])) + subtree_cost(r[1]) + subtree_cost(r[2])
+            return subtree[i]
+        limit = math.exp(best) * (1 + 1e-6) if math.isfinite(best) else -1.0
+        sets_seen = n_pools = 0
+        for children, sets in pools:
+            on = []
+            for child in children:
+                so_far = sum(subtree_cost(i) for i in forest_rows[child])
+                ok = False
+                if so_far <= limit:                      # nan compares False
+                    if math.isnan(float(g_true[child])):
+                        g = cost_to_go(forest_rows[child])
+                        g_true[child] = NEG if g == bushy.NEG_INF else (math.nan if g == math.inf else g)
+                    g = float(g_true[child])
+                    ok = not math.isnan(g) and so_far + (0.0 if g <= NEG / 2 else math.exp(g)) <= limit
+                on.append(ok)
+            if not any(on):
+                continue
+            ids = {key: sets_seen + t for t, key in enumerate(dict.fromkeys(sets))}
+            sets_seen += len(ids)
+            pool_forest += children
+            pool_index += [n_pools] * len(children)
+            pool_set += [ids[key] for key in sets]
+            pool_on += on
+            pool_k.append(1 if forest_rows[children[0]] and len(forest_rows[children[0]]) == 1 else int(beam["width"]))
+            n_pools += 1
     state_forest = torch.tensor(sorted(states, key=states.get), dtype=torch.long)
     raw_masks = [m for m in masks_needed if m & (m - 1) and m in counts]
     return {"n": n, "masks": torch.tensor(masks_needed, dtype=torch.long), "full": index[(1 << n) - 1],
             "node_mask": torch.tensor([index[r[0]] for r in node_rows]), "node_c1": torch.tensor([r[1] for r in node_rows]),
             "node_c2": torch.tensor([r[2] for r in node_rows]), "node_height": torch.tensor([r[3] for r in node_rows]),
             "node_size": torch.tensor([bin(r[0]).count("1") / n for r in node_rows]), "fa": fa, "fb": fb,
-            "node_true": node_true, "node_failed": node_failed,
+            "node_true": node_true, "node_failed": node_failed, "node_join_true": join_true,
+            "node_vars": torch.tensor(node_vars, dtype=torch.long), "node_jv": torch.tensor(node_jv, dtype=torch.long),
+            "node_lazy": node_lazy, "node_read1_true": read1, "node_read2_true": read2,
             "forest_nodes": forest_nodes, "forest_adj": forest_adj, "forest_k": k, "g_true": g_true,
             "state_forest": state_forest, "cand": cand, "q_true": q_true,
+            "pool_forest": torch.tensor(pool_forest, dtype=torch.long), "pool_index": torch.tensor(pool_index, dtype=torch.long),
+            "pool_set": torch.tensor(pool_set, dtype=torch.long), "pool_on": torch.tensor(pool_on, dtype=torch.bool),
+            "pool_k": torch.tensor(pool_k, dtype=torch.long),
+            "pool_b": torch.full((len(pool_k),), int(per_forest), dtype=torch.long),
             "raw_index": torch.tensor([index[m] for m in raw_masks], dtype=torch.long),
             "raw_true": torch.tensor([true_of[m] for m in raw_masks]),
             "raw_failed": torch.tensor([counts[m] is None for m in raw_masks]),
@@ -667,18 +905,27 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
         phi, l = phi.detach(), l.detach()
     off_m = off_n = off_f = off_s = 0
     width = max(p["n"] for p in parts)
-    cat = {key: [] for key in ("node_mask", "node_c1", "node_c2", "node_height", "node_size", "fa", "fb",
-                               "node_true", "node_failed", "forest_nodes", "forest_adj", "forest_k", "g_true", "forest_q",
+    node_keys = ("node_height", "node_size", "fa", "fb", "node_true", "node_failed", "node_join_true", "node_vars",
+                 "node_jv", "node_lazy", "node_read1_true", "node_read2_true")
+    cat = {key: [] for key in ("node_mask", "node_c1", "node_c2", *node_keys,
+                               "forest_nodes", "forest_adj", "forest_k", "g_true", "forest_q",
                                "state_forest", "cand", "q_true", "raw_index", "raw_true", "raw_failed", "forest_n",
-                               "forest_full_true", "raw_part", "node_part", "forest_part", "state_part")}
+                               "forest_full_true", "raw_part", "node_part", "forest_part", "state_part",
+                               "pool_forest", "pool_index", "pool_set", "pool_on", "pool_k", "pool_b", "pool_part")}
+    off_p = off_set = 0
     for i, p in enumerate(parts):
         N, Fn, n = len(p["node_mask"]), len(p["forest_nodes"]), p["n"]
         cat["node_mask"].append(p["node_mask"] + off_m)
         cat["node_c1"].append(torch.where(p["node_c1"] >= 0, p["node_c1"] + off_n, p["node_c1"]))
         cat["node_c2"].append(torch.where(p["node_c2"] >= 0, p["node_c2"] + off_n, p["node_c2"]))
-        for key in ("node_height", "node_size", "fa", "fb", "node_true", "node_failed", "forest_k", "g_true", "q_true",
-                    "raw_true", "raw_failed"):
+        for key in (*node_keys, "forest_k", "g_true", "q_true", "raw_true", "raw_failed", "pool_on", "pool_k", "pool_b"):
             cat[key].append(p[key])
+        cat["pool_forest"].append(p["pool_forest"] + off_f)
+        cat["pool_index"].append(p["pool_index"] + off_p)
+        cat["pool_set"].append(p["pool_set"] + off_set)
+        cat["pool_part"].append(torch.full((len(p["pool_k"]),), i))
+        off_p += len(p["pool_k"])
+        off_set += int(p["pool_set"].max()) + 1 if len(p["pool_set"]) else 0
         fn = torch.full((Fn, width), -1, dtype=torch.long)
         fn[:, :n] = torch.where(p["forest_nodes"] >= 0, p["forest_nodes"] + off_n, p["forest_nodes"])
         cat["forest_nodes"].append(fn)
@@ -706,10 +953,14 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     b = {key: torch.cat(v).to(device) for key, v in cat.items()}
     phi_std = net.standardise(phi)
 
-    # l'' and log subtree cost per node, level by level (single patterns: exact counts, cost 0)
+    # l'' and log subtree cost per node, level by level (single patterns: exact counts, cost 0); jc the log cost of
+    # the node's own join (l'' for C_out; join_cost with the rows-read head for a QLever cost)
+    qcost = net.cost is not None
     l_node = _take(l, b["node_mask"])
     cost = torch.full_like(l_node, NEG)
     l2 = l_node
+    jc = l_node
+    read1 = read2 = torch.full_like(l_node, NEG)
     for h in range(1, int(b["node_height"].max()) + 1 if len(b["node_height"]) else 1):
         idx = torch.nonzero(b["node_height"] == h).squeeze(1)
         if not len(idx):
@@ -718,7 +969,17 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
         lu, _ = net.bound(_take(l_node, idx), _take(l2, c1), _take(l2, c2), b["fa"][idx], b["fb"][idx],
                           _take(phi_std, b["node_mask"][idx]), b["node_size"][idx])
         l2 = l2.index_put((idx,), lu)
-        cost = cost.index_put((idx,), torch.logaddexp(lu, torch.logaddexp(_take(cost, c1), _take(cost, c2))))
+        ju = lu
+        if qcost:
+            jv = b["node_jv"][idx]
+            sort1 = (b["node_jv"][c1] >= 0) & (b["node_jv"][c1] != jv)
+            sort2 = (b["node_jv"][c2] >= 0) & (b["node_jv"][c2] != jv)
+            r1, r2 = operand_reads(net, _take(phi_std, b["node_mask"][c1]), _take(phi_std, b["node_mask"][c2]),
+                                   _take(l2, c1), _take(l2, c2))
+            ju = join_cost(net, lu, _take(l2, c1), _take(l2, c2), b["node_lazy"][c1], b["node_lazy"][c2], r1, r2, sort1, sort2)
+            read1, read2 = read1.index_put((idx,), r1), read2.index_put((idx,), r2)
+        jc = jc.index_put((idx,), ju)
+        cost = cost.index_put((idx,), torch.logaddexp(ju, torch.logaddexp(_take(cost, c1), _take(cost, c2))))
 
     # V of every forest
     fn = b["forest_nodes"]
@@ -730,7 +991,7 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
     k = b["forest_k"]
     lq = _take(l, b["forest_q"])
     query = torch.cat([_take(phi_std, b["forest_q"]), (lq / 10)[:, None], (k / b["forest_n"])[:, None]], 1)
-    args = (tokens, ~valid, b["forest_adj"], query, lq, k)
+    args = (tokens, ~valid, b["forest_adj"], query, lq + _log_weight(net.cost.out) if qcost else lq, k)
     call = lambda *a: net.values(*a, return_hidden=True)
     if value_chunk and len(fn) > value_chunk:
         run = (lambda *a: checkpoint(call, *a, use_reentrant=False)) if torch.is_grad_enabled() else call
@@ -738,6 +999,18 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
         V, W, H = (torch.cat(t) for t in zip(*outs))
     else:
         V, W, H = call(*args)
+    if qcost:                                            # 2 components: V is the cost of their final join
+        two = torch.nonzero(k == 2).squeeze(1)
+        if len(two):
+            n0, n1 = fn[two, 0], fn[two, 1]
+            jq = b["node_vars"][n0] & b["node_vars"][n1]
+            s0 = (b["node_jv"][n0] >= 0) & (b["node_jv"][n0] != jq)
+            s1 = (b["node_jv"][n1] >= 0) & (b["node_jv"][n1] != jq)
+            r0, r1 = operand_reads(net, _take(phi_std, b["node_mask"][n0]), _take(phi_std, b["node_mask"][n1]),
+                                   _take(l2, n0), _take(l2, n1))
+            final = join_cost(net, _take(lq, two), _take(l2, n0), _take(l2, n1), b["node_lazy"][n0], b["node_lazy"][n1],
+                              r0, r1, s0, s1)
+            V = V.index_put((two,), final)
     b["W"] = W
     if hidden:
         b["H"] = H
@@ -750,8 +1023,15 @@ def forward_batch(net: ForestPlanner, parts, phi, l, device, tau, stop_gradient=
 
     # per candidate: estimated and true cost-to-go from its state
     cand = b["cand"]
-    q_hat = torch.logaddexp(_take(l2, cand[:, 1]), _take(V, cand[:, 2]))
-    return {"l": l_raw, "l2": l2, "V": V, "q_hat": q_hat, **b}
+    q_hat = torch.logaddexp(_take(jc, cand[:, 1]), _take(V, cand[:, 2]))
+    # per pool candidate (beam loss): the planner's score total^ = logaddexp(log cost so far^, V)
+    pool_score = None
+    if len(b["pool_forest"]):
+        pf = fn[b["pool_forest"]]
+        sub = torch.where(pf >= 0, _take(cost, pf.clamp(min=0)), torch.full_like(pf, NEG, dtype=cost.dtype))
+        pool_score = torch.logaddexp(torch.logsumexp(sub, 1), _take(V, b["pool_forest"]))
+    return {"l": l_raw, "l2": l2, "V": V, "q_hat": q_hat, "jc": jc, "read1": read1, "read2": read2,
+            "pool_score": pool_score, **b}
 
 
 def _segment_logsumexp(x, seg, size):
@@ -761,9 +1041,40 @@ def _segment_logsumexp(x, seg, size):
     return safe + torch.log(total)
 
 
+def _beam_pairs(score, pool, sets, on, k_of, b_of):
+    """The beam loss's (c*, comparator) index pairs (module text) from detached scores, as numpy arrays: per pool
+    with an on-path candidate, c* its best-scored one, against the b-th best other build of c*'s forest and the k-th
+    best other candidate passing the per-forest cut. Also (pools with an on-path candidate, pools where c* survives
+    the beam's selection under these scores)."""
+    import numpy as np
+    order = np.lexsort((np.arange(len(score)), score, pool))            # by pool, then score, then index
+    groups = np.split(order, np.flatnonzero(np.diff(pool[order])) + 1) if len(order) else []
+    stars, comps, n_pools, survived = [], [], 0, 0
+    for grp in groups:
+        on_g = on[grp]
+        if not on_g.any():
+            continue
+        n_pools += 1
+        k, b = int(k_of[pool[grp[0]]]), int(b_of[pool[grp[0]]])
+        pos = int(np.argmax(on_g))
+        sets_g = sets[grp]
+        rank, seen = np.zeros(len(grp), dtype=np.int64), {}
+        for t, st in enumerate(sets_g.tolist()):
+            rank[t] = seen.get(st, 0)
+            seen[st] = rank[t] + 1
+        same = [t for t in range(len(grp)) if sets_g[t] == sets_g[pos] and t != pos]
+        if len(same) >= b:
+            stars.append(grp[pos]), comps.append(grp[same[b - 1]])
+        passing = [t for t in range(len(grp)) if rank[t] < b and t != pos]
+        if len(passing) >= k:
+            stars.append(grp[pos]), comps.append(grp[passing[k - 1]])
+        survived += int(rank[pos] < b and sum(t < pos for t in passing) < k)
+    return np.array(stars, dtype=np.int64), np.array(comps, dtype=np.int64), n_pools, survived
+
+
 def losses(out, tau, weights=None):
-    """{l1_raw, l1_bound, value, w, plan, floor, consistency} means (0 when empty) and coverage counts. weights [P]:
-    per query (part) of the batch, each term a weighted mean over its rows (None: all 1)."""
+    """{l1_raw, l1_bound, value, w, plan, floor, consistency, l1_read, beam} means (0 when empty) and coverage
+    counts. weights [P]: per query (part) of the batch, each term a weighted mean over its rows (None: all 1)."""
     zero = out["l"].sum() * 0
     res = {}
 
@@ -812,4 +1123,25 @@ def losses(out, tau, weights=None):
         res["consistency"] = zero
     res["states_with_choice"] = int((n_known >= 2).sum())
     res["states"] = S
+
+    # rows read by lazily read pattern operands (QLever cost): r^ against the measured read
+    rows_r, est_r, true_r = [], [], []
+    for side, est in ((1, out["read1"]), (2, out["read2"])):
+        known_r = ~torch.isnan(out[f"node_read{side}_true"])
+        rows_r.append(out["node_part"][known_r]), est_r.append(est[known_r]), true_r.append(out[f"node_read{side}_true"][known_r])
+    res["l1_read"] = mean((torch.cat(est_r) - torch.cat(true_r)).abs(), torch.cat(rows_r))
+    res["read_labels"] = int(sum(len(r) for r in rows_r))
+
+    # the beam loss over the pools of traced beams
+    res["beam"], res["pools"], res["pools_kept"] = zero, 0, 0
+    if out.get("pool_score") is not None:
+        score = out["pool_score"]
+        stars, comps, res["pools"], res["pools_kept"] = _beam_pairs(
+            score.detach().double().cpu().numpy(), out["pool_index"].cpu().numpy(), out["pool_set"].cpu().numpy(),
+            out["pool_on"].cpu().numpy(), out["pool_k"].cpu().numpy(), out["pool_b"].cpu().numpy())
+        if len(stars):
+            st = torch.as_tensor(stars, device=score.device)
+            ct = torch.as_tensor(comps, device=score.device)
+            hinge = tau * F.softplus((score[st] - score[ct]) / tau)
+            res["beam"] = mean(hinge, out["pool_part"][out["pool_index"][st]])
     return res

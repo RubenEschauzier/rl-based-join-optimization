@@ -179,9 +179,13 @@ class Instantiator:
     """
 
     def __init__(self, graph, statistics, max_pattern_matches=1_000_000, max_candidates=2000, max_restarts=30,
-                 off_stratum_weight=0.02, direction_preference=3.0):
+                 off_stratum_weight=0.02, direction_preference=3.0, big_pattern_rows=None):
         self.graph, self.statistics = graph, statistics
         self.max_pattern_matches = max_pattern_matches
+        # Patterns over max_pattern_matches are allowed while together they match at most this many
+        # triples (a quota per query, in rows): one huge predicate between two variables, or a few
+        # large ones, but never more scan than a budget. None: no such pattern (the guardrail).
+        self.big_pattern_rows = big_pattern_rows
         self.max_candidates = max_candidates
         self.max_restarts = max_restarts
         self.off_stratum_weight = off_stratum_weight
@@ -190,6 +194,10 @@ class Instantiator:
         # that are hard only because a pattern matches a huge part of the data).
         self.small_predicate = statistics.counts <= max_pattern_matches
         self._seed_cdf = np.cumsum(statistics.degree.astype(np.float64))
+
+    def _allowed(self, preds, big_left):
+        """Predicates allowed between two variables while big_left rows of the quota are left."""
+        return self.small_predicate[preds] | (self.statistics.counts[preds] <= big_left)
 
     def _sample_range(self, a, b, rng):
         size = b - a
@@ -304,6 +312,7 @@ class Instantiator:
             return None
         entities[order[0]] = seed
         used = {seed}
+        big_left = self.big_pattern_rows or 0          # rows of the quota left (variable-variable patterns)
 
         def other_end(index, node):
             u, v = shape.edges[index]
@@ -321,7 +330,7 @@ class Instantiator:
             keep &= self.statistics.degree[ents] >= degree[node]          # room for its other edges
             both_variables = u not in plan.constants and node not in plan.constants
             if both_variables:
-                keep &= self.small_predicate[preds]
+                keep &= self._allowed(preds, big_left)
             for other_edge in constraint[1:]:
                 keep &= self._adjacent(int(entities[other_end(other_edge, node)]), ents)
             preds, ents, u_subject = preds[keep], ents[keep], u_subject[keep]
@@ -343,12 +352,15 @@ class Instantiator:
             predicates[parent_edge] = preds[pick]
             oriented[parent_edge] = (u, node) if u_subject[pick] else (node, u)
             used.add(int(ents[pick]))
+            if both_variables and not self.small_predicate[preds[pick]]:
+                big_left -= int(self.statistics.counts[preds[pick]])
             # the other constraint edges close cycles: pick one of the existing connections
             for other_edge in constraint[1:]:
                 w = other_end(other_edge, node)
                 options, w_subject = self._connections(int(entities[w]), int(entities[node]))
-                if w not in plan.constants and node not in plan.constants:
-                    small = self.small_predicate[options]
+                closing_variables = w not in plan.constants and node not in plan.constants
+                if closing_variables:
+                    small = self._allowed(options, big_left)
                     options, w_subject = options[small], w_subject[small]
                 if len(options) == 0:
                     return None
@@ -356,11 +368,14 @@ class Instantiator:
                 choice = int(rng.choice(len(options), p=option_weights / option_weights.sum()))
                 predicates[other_edge] = options[choice]
                 oriented[other_edge] = (w, node) if w_subject[choice] else (node, w)
+                if closing_variables and not self.small_predicate[options[choice]]:
+                    big_left -= int(self.statistics.counts[options[choice]])
         # duplicate triple patterns (same oriented node pair and predicate) are not allowed
         if len({(o, int(p)) for o, p in zip(oriented, predicates)}) < shape.n_edges:
             return None
         instance = Instance(shape, entities, predicates, plan, oriented)
-        if max(instance.pattern_sizes(self.graph, self.statistics)) > self.max_pattern_matches:
+        over = [size for size in instance.pattern_sizes(self.graph, self.statistics) if size > self.max_pattern_matches]
+        if over and sum(over) > (self.big_pattern_rows or 0):
             return None
         return instance
 

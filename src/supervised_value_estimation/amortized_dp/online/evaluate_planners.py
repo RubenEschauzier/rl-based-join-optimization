@@ -7,7 +7,11 @@
     python -m src.supervised_value_estimation.amortized_dp.online.evaluate_planners report  RUN_DIR [--round R]
 
 RUN_DIR is a train_forest_value run directory (config.yaml, validation-<R>.json, model-<R>.pt, planner-<R>.pt);
-the outputs go to RUN_DIR/evaluation-<R>/.
+the outputs go to RUN_DIR/evaluation-<R>/. With --dataset DIR --gnce-dataset DIR --name NAME (every stage), the queries
+are a featurised test set instead (all of them, or --queries N spread over it; the estimator's and GNCE's processed
+splits of the same queries), and the outputs go to RUN_DIR/evaluation-<R>-<NAME>/. --dp-max-subsets K: the DP planners
+are infeasible (no plan, left out of the executions and reported as infeasible) on queries with more than K connected
+subsets.
 
 plan     the run's validation queries (validation-<R>.json, all or N spread over it), planned by
              GNCE greedy / beam-8 / DP      the GNCE cardinality model (cfg.gnce)
@@ -28,7 +32,8 @@ time-cpu the same planning on the CPU (--cpu-threads torch threads, default 1 as
          (the report counts the ones that differ from plans.json). -> inference-cpu.json (plans.json untouched; a
          separate, slower run)
 execute  every plan forced on QLever (runtime_tree.bushy_sparql) and every query unforced ("QLever"), `--repeats`
-         times, the planners' order rotated per query and repetition, one request at a time per endpoint (a thread
+         times, the planners' order rotated per query and repetition (planners with the same plan share its
+         executions), one request at a time per endpoint (a thread
          each), QLever's cache cleared before every execution (cmd=clear-cache with the servers' access token, by
          default from data/qlever/qlever_yago/qlever_yago.env): even with a 0-byte cache QLever keeps EMPTY results
          (size 0), so a repeat, or another planner's plan with the same empty subtree, would get it for free. Per
@@ -132,7 +137,7 @@ def count_forests(clock, args):
 def plan_all(args, device=None):
     run = Path(args.run)
     cfg = OmegaConf.load(run / "config.yaml")
-    out = run / f"evaluation-{args.round}"
+    out = evaluation_dir(args)
     out.mkdir(exist_ok=True)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load_backbone(cfg.estimator.config, cfg.estimator.run, cfg.estimator.select, device)
@@ -141,10 +146,13 @@ def plan_all(args, device=None):
     net = fv.ForestPlanner.load(run / f"planner-{args.round}.pt", device)
     model.eval(), gnce.eval(), net.eval()
     degrees = json.load(open(cfg.forest.degrees))
-    val, gnce_val = load_split(cfg.data.val_dir), load_split(cfg.gnce.dataset)
+    if args.dataset:
+        val, gnce_val = load_split(args.dataset), load_split(args.gnce_dataset)
+    else:
+        val, gnce_val = load_split(cfg.data.val_dir), load_split(cfg.gnce.dataset)
     index = {" ".join(val[i].query.split()): i for i in range(len(val))}
     gnce_index = {" ".join(gnce_val[i].query.split()): i for i in range(len(gnce_val))}
-    keys = list(json.load(open(run / f"validation-{args.round}.json")))
+    keys = list(index) if args.dataset else list(json.load(open(run / f"validation-{args.round}.json")))
     if args.queries:                                     # evenly spread: the file is ordered by query shape
         keys = [keys[i] for i in np.linspace(0, len(keys) - 1, min(args.queries, len(keys))).round().astype(int)]
     if device.type == "cpu" and (out / "plans.json").exists():      # time-cpu: the queries plan_all planned
@@ -163,6 +171,11 @@ def plan_all(args, device=None):
             tree, _ = bushy.estimator_beam_plan(q.n, q.neighbour_masks, est, width)
             yield name, tree
         clock.reset()
+        if args.dp_max_subsets and int(soft_dp.connected_masks(q.neighbour_masks, device).sum()) > args.dp_max_subsets:
+            yield "DP", None
+            if est_model is model:
+                yield "DP + bound", None
+            return
         s = soft_dp.SubsetStructure(q.neighbour_masks, device)
         logcard = clock.timed(lambda m: soft_dp.model_subset_logcards(est_model, data, m, device), count_subsets)(s.masks)
         yield "DP", soft_dp.hard_plan(s, soft_dp.soft_dp(s, logcard, 0.0)[1])
@@ -173,12 +186,14 @@ def plan_all(args, device=None):
             bounded = history_dp.degree_bound(q.patterns, s, torch.where(s.singleton, exact, logcard).clamp(min=0), degrees)
             yield "DP + bound", soft_dp.hard_plan(s, soft_dp.soft_dp(s, bounded, 0.0)[1])
 
+    per_forest = int(cfg.forest.get("builds_per_forest", 1))     # as the run planned
+
     def value_plans(q):
         for name, width in (("greedy", 1), (f"beam-{WIDTH}", WIDTH)):
             clock.reset()
             ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, clock.timed(encoder(model, q, device), count_subsets))
             ctx.step_timer = clock.block                 # each beam step's network part as one call
-            yield name, fv.beam_plans(net, ctx, [width])[0][0][0]
+            yield name, fv.beam_plans(net, ctx, [width], per_forest=per_forest)[0][0][0]
 
     plans = {}
     with torch.no_grad():
@@ -188,11 +203,13 @@ def plan_all(args, device=None):
             for prefix, generator in (("GNCE", estimator_plans(gnce, gnce_val[gnce_index[key]], q)),
                                       ("est", estimator_plans(model, q.data, q)), ("value", value_plans(q))):
                 for name, tree in generator:
-                    record["planners"][f"{prefix} {name}"] = {"plan": bushy.to_json(tree), "inference_ms": round(clock.ms, 3),
-                                                              "subsets": clock.subsets, "forests": clock.forests}
+                    record["planners"][f"{prefix} {name}"] = (
+                        {"plan": None, "inference_ms": None, "subsets": None, "forests": None} if tree is None else
+                        {"plan": bushy.to_json(tree), "inference_ms": round(clock.ms, 3),
+                         "subsets": clock.subsets, "forests": clock.forests})
             plans[key] = record
             if k % 100 == 0:
-                print(f"planned {max(k - 2, 0)} / {len(keys)}", flush=True)
+                print(f"planned {max(k - 2, 0)} / {len(keys)} ({time.strftime('%H:%M:%S')})", flush=True)
     if device.type == "cpu":
         json.dump({key: rec["planners"] for key, rec in plans.items()}, open(out / "inference-cpu.json", "w"))
         print(f"{len(plans)} queries, CPU inference ({torch.get_num_threads()} threads) -> {out / 'inference-cpu.json'}")
@@ -204,6 +221,10 @@ def plan_all(args, device=None):
 def time_cpu(args):
     torch.set_num_threads(args.cpu_threads)
     plan_all(args, torch.device("cpu"))
+
+
+def evaluation_dir(args):
+    return Path(args.run) / (f"evaluation-{args.round}" + (f"-{args.name}" if args.name else ""))
 
 
 def endpoints_of(args):
@@ -270,35 +291,40 @@ def run_on_endpoints(jobs, endpoints, token, timeout_s):
 
 
 def execute_all(args):
-    out = Path(args.run) / f"evaluation-{args.round}"
+    out = evaluation_dir(args)
     plans = json.load(open(out / "plans.json"))
     log = out / "executions.jsonl"
     done = set()
     if log.exists():
         done = {(r["key"], r["planner"], r["repeat"]) for r in map(json.loads, open(log))}
-    names = list(next(iter(plans.values()))["planners"]) + ["QLever"]
     jobs = []
     for k, (key, rec) in enumerate(plans.items()):
+        groups = {rec["query"]: ["QLever"]}              # SPARQL text -> the planners whose plan it is
+        for name, p in rec["planners"].items():
+            if p["plan"] is not None:
+                groups.setdefault(bushy_sparql(bushy.from_json(p["plan"]), rec["patterns"]), []).append(name)
+        entries = list(groups.items())
         for rep in range(args.repeats):
-            rot = (k + rep) % len(names)
-            for name in names[rot:] + names[:rot]:
-                if (key, name, rep) in done:
+            rot = (k + rep) % len(entries)
+            for text, names in entries[rot:] + entries[:rot]:
+                if all((key, name, rep) in done for name in names):
                     continue
-                text = rec["query"] if name == "QLever" else bushy_sparql(bushy.from_json(rec["planners"][name]["plan"]), rec["patterns"])
-                jobs.append(((key, name, rep), text))
+                jobs.append(((key, tuple(names), rep), text))
     endpoints, token = endpoints_of(args), access_token(args)
     print(f"{len(jobs):,} executions to go ({len(done):,} done) on {len(endpoints)} endpoints", flush=True)
     for s in range(0, len(jobs), args.chunk):
         results = run_on_endpoints(jobs[s:s + args.chunk], endpoints, token, args.timeout)
         with open(log, "a") as f:
-            for (key, name, rep), res in results:
+            for (key, names, rep), res in results:
                 tree = res.get("tree") or {}
-                f.write(json.dumps({"key": key, "planner": name, "repeat": rep, "latency_ms": 1000 * res["latency_s"],
-                                    "planning_ms": res.get("planning_ms"), "exec_ms": res.get("exec_ms"),
-                                    "censored": res["censored"], "cached": _any_cached(tree),
-                                    "cout": None if res["censored"] else executed_cout(tree),
-                                    "rows": None if res["censored"] else tree.get("result_rows"),
-                                    "error": res.get("error")}) + "\n")
+                record = {"repeat": rep, "latency_ms": 1000 * res["latency_s"],
+                          "planning_ms": res.get("planning_ms"), "exec_ms": res.get("exec_ms"),
+                          "censored": res["censored"], "cached": _any_cached(tree),
+                          "cout": None if res["censored"] else executed_cout(tree),
+                          "rows": None if res["censored"] else tree.get("result_rows"),
+                          "error": res.get("error"), "shared_with": len(names)}
+                for name in names:
+                    f.write(json.dumps({"key": key, "planner": name, **record}) + "\n")
         print(f"executed {min(s + args.chunk, len(jobs)):,} / {len(jobs):,}", flush=True)
 
 
@@ -327,6 +353,10 @@ def per_query(plans, executions, counts, timeout_ms, cpu):
     for key, rec in plans.items():
         row = {}
         for name in list(rec["planners"]) + ["QLever"]:
+            if name != "QLever" and rec["planners"][name]["plan"] is None:
+                row[name] = {"exec": None, "e2e": None, "qlever_planning": math.nan, "inference": None, "cout": None,
+                             "censored": False, "unmeasured": False, "infeasible": True, "subsets": None, "forests": None}
+                continue
             runs = by.get((key, name), [])
             ok = [r for r in runs if not r["censored"] and not r["cached"] and r["exec_ms"] is not None]
             inference = cpu.get(key, {}).get(name, {}).get("inference_ms") if name != "QLever" else 0.0
@@ -348,7 +378,7 @@ def per_query(plans, executions, counts, timeout_ms, cpu):
             e2e = None if total_ms is None or inference is None else total_ms + inference
             row[name] = {"exec": exec_ms, "e2e": e2e, "qlever_planning": planning,
                          "inference": inference, "cout": cout, "censored": not ok and exec_ms is not None,
-                         "unmeasured": exec_ms is None, "subsets": rec["planners"].get(name, {}).get("subsets"),
+                         "unmeasured": exec_ms is None, "infeasible": False, "subsets": rec["planners"].get(name, {}).get("subsets"),
                          "forests": rec["planners"].get(name, {}).get("forests")}
         table[key] = row
         if key not in empty and key in counts and counts[key].get((1 << rec["n"]) - 1) is not None:
@@ -378,6 +408,7 @@ def summarise(table, keys, names):
                 for r, q in zip(rows, qrows)]
         out[name] = {
             "queries": len(rows), "timeouts": sum(r["censored"] for r in rows), "unmeasured": sum(r["unmeasured"] for r in rows),
+            "infeasible": sum(r.get("infeasible", False) for r in rows),
             "exec_ms": qs(r["exec"] for r in rows), "e2e_ms": qs(r["e2e"] for r in rows),
             "exec_speedup_vs_qlever": geomean(max(q["exec"], 1) / max(r["exec"], 1) for r, q in zip(rows, qrows)
                                               if r["exec"] is not None and q["exec"] is not None),
@@ -387,15 +418,24 @@ def summarise(table, keys, names):
             "cout_vs_qlever_geomean": geomean(vs_q), "cout_vs_qlever": qs(vs_q),
             "inference_ms": qs(r["inference"] for r in rows) if name != "QLever" else None,
             "qlever_planning_ms": qs(r["qlever_planning"] for r in rows),
-            "subsets_mean": float(np.mean([r["subsets"] for r in rows])) if name != "QLever" else None,
-            "forests_mean": float(np.mean([r["forests"] for r in rows])) if name != "QLever" else None}
+            "subsets_mean": _mean(r["subsets"] for r in rows) if name != "QLever" else None,
+            "forests_mean": _mean(r["forests"] for r in rows) if name != "QLever" else None}
     return out
+
+
+def _mean(values):
+    v = [x for x in values if x is not None]
+    return float(np.mean(v)) if v else None
 
 
 def splits(plans, table, empty):
     keys = list(plans)
     out = {"all": keys, "non-empty result": [k for k in keys if empty.get(k) is False],
            "empty result": [k for k in keys if empty.get(k) is True]}
+    feasible = [k for k in keys if not any(r.get("infeasible") for r in table[k].values())]
+    if len(feasible) < len(keys):                       # every planner compared on the same queries
+        out["every planner feasible"] = feasible
+        out["every planner feasible, non-empty result"] = [k for k in feasible if empty.get(k) is False]
     for shape in sorted({plans[k]["shape"] for k in keys}):
         out[f"shape {shape}"] = [k for k in keys if plans[k]["shape"] == shape]
     for b, (lo, hi) in SIZE_BUCKETS.items():
@@ -422,7 +462,8 @@ def markdown(summary):
             e, t, c = r["exec_ms"], r["e2e_ms"], r["cout_error"]
             inf = r["inference_ms"]
             inf = "-" if not inf or inf["p50"] is None else f"{fmt(inf['p50'], '.1f')} / {fmt(inf['p99'], '.1f')}"
-            timeouts = f"{r['timeouts']}" + (f" (+{r['unmeasured']} unmeasured)" if r["unmeasured"] else "")
+            timeouts = (f"{r['timeouts']}" + (f" (+{r['unmeasured']} unmeasured)" if r["unmeasured"] else "")
+                        + (f" ({r['infeasible']} infeasible)" if r.get("infeasible") else ""))
             lines.append(f"| {name} | {fmt(e['p50'], '.1f')} | {fmt(e['p90'], '.1f')} | {fmt(e['p95'], '.1f')} | {fmt(e['p99'], '.1f')} | "
                          f"{fmt(e['max'], '.0f')} | {timeouts} | {fmt(r['exec_speedup_vs_qlever'], '.3f')} | {fmt(t['p50'], '.1f')} | "
                          f"{fmt(t['p99'], '.1f')} | {fmt(r['e2e_speedup_vs_qlever'], '.3f')} | {fmt(c['p50'])} | {fmt(c['p90'])} | "
@@ -435,7 +476,7 @@ def report(args):
     from src.supervised_value_estimation.amortized_dp.online import evaluate_plots
 
     run = Path(args.run)
-    out = run / f"evaluation-{args.round}"
+    out = evaluation_dir(args)
     plans = json.load(open(out / "plans.json"))
     executions = [json.loads(line) for line in open(out / "executions.jsonl")]
     counts = pickle.load(open(run / "counts.pkl", "rb")) if (run / "counts.pkl").exists() else {}
@@ -446,7 +487,7 @@ def report(args):
     names = list(next(iter(plans.values()))["planners"]) + ["QLever"]
     summary = {split: (len(keys), summarise(table, keys, names)) for split, keys in splits(plans, table, empty).items()}
     differ = {name: sum(cpu[k][name]["plan"] != rec["planners"][name]["plan"] for k, rec in plans.items()
-                        if "plan" in cpu.get(k, {}).get(name, {})) for name in names[:-1]}
+                        if cpu.get(k, {}).get(name, {}).get("plan") is not None) for name in names[:-1]}
     json.dump({"per_query": table, "empty": empty, "summary": summary, "cpu_plans_differ": differ},
               open(out / "report.json", "w"))
     cpu_note = ("plans that differ from the executed GPU plans: " + ", ".join(f"{n} {c}" for n, c in differ.items())
@@ -457,7 +498,8 @@ def report(args):
               f"geomean of QLever / planner (1 ms floor).\n")
     open(out / "report.md", "w").write(header + markdown(summary))
     evaluate_plots.plot_all(plans, table, names, out)
-    print(header + markdown({k: v for k, v in summary.items() if k in ("all", "non-empty result", "empty result")}))
+    print(header + markdown({k: v for k, v in summary.items() if k in ("all", "non-empty result", "empty result",
+                                                                     "every planner feasible, non-empty result")}))
     print(f"\n-> {out / 'report.md'}, report.json, plots in {out}")
 
 
@@ -477,6 +519,10 @@ def main():
     p.add_argument("--timeout", type=float, default=30.0, help="seconds per execution")
     p.add_argument("--chunk", type=int, default=2000, help="executions per checkpoint")
     p.add_argument("--cpu-threads", type=int, default=1, help="time-cpu: torch threads")
+    p.add_argument("--dataset", default="", help="processed split of a test set (instead of the run's validation queries)")
+    p.add_argument("--gnce-dataset", default="", help="GNCE's processed split of the same test set")
+    p.add_argument("--name", default="", help="with --dataset: outputs in evaluation-<R>-<name>")
+    p.add_argument("--dp-max-subsets", type=int, default=0, help="DP planners infeasible above this many connected subsets (0: no limit)")
     args = p.parse_args()
     {"plan": plan_all, "time-cpu": time_cpu, "execute": execute_all, "report": report}[args.stage](args)
 

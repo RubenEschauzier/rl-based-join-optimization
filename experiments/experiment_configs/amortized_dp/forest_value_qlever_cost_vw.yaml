@@ -1,0 +1,12 @@
+# The 22-10 run (forest_value_rowreadout_mixed_yago_v2_vw.yaml) planning and training on QLever's planning cost instead
+# of C_out (work_function.py module text: result rows + 0.98 x rows read by lazily read patterns + 0.33 x n log2 n of
+# sorted join results), with the learned rows-read head trained on measured reads (ReadTasks next to the counts).
+# NOTE: mixed_yago_v2 has no pattern of 1M rows or more (the generator's max_pattern_matches cap), so no pattern is
+# ever read lazily there: on these queries this run trains the sort term only and the rows-read head gets no labels.
+#   python -m src.supervised_value_estimation.amortized_dp.online.train_forest_value --config-name forest_value_qlever_cost_vw.yaml
+defaults:
+  - forest_value_rowreadout_mixed_yago_v2_vw
+  - _self_
+
+cost:
+  model: qlever
