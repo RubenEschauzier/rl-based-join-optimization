@@ -124,3 +124,12 @@ def test_query_readout_matches_the_backbone_on_real_queries(max_pairs):
                 phi_ref, l_ref = phi_and_direct(model, *batch)
                 phi, l = phi_and_direct(model, *batch, readout=readout, masks=chunk)
                 assert torch.allclose(phi, phi_ref, rtol=1e-4, atol=1e-4) and torch.allclose(l, l_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_cuda_and_cuda_0_share_one_loaded_store(store):
+    """The query readout asks for the store on "cuda", the layer's forward on its input's "cuda:0": one load."""
+    layer = RowReadout(store)
+    first = layer.store(torch.device("cuda"))
+    assert layer.store(torch.device("cuda:0")) is first and layer.store("cuda") is first
+    assert layer.store(torch.device("cpu")) is not first

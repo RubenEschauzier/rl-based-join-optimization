@@ -80,6 +80,9 @@ class RowReadout(nn.Module):
         self.hidden = hidden
 
     def store(self, device):
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:      # "cuda" and "cuda:0" are the same store: one load
+            device = torch.device("cuda", torch.cuda.current_device())
         if self._store is None or self._store.device != device:
             self._store = _Store(self.store_directory, device)
         return self._store
