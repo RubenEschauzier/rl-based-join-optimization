@@ -1,0 +1,41 @@
+# Statistics-based generation on WatDiv (scale factor 2000, ~218M triples, real IRIs and literals:
+# graph.py dictionary-encodes the dump and writes the queries with the original terms).
+# The scale-free rule of statistics_based_yago.yaml (WatDiv is ~4x YAGO, so no fixed result / cost caps):
+# one counting budget, max_best_plan_work = scan rows + cheapest sampled C_out, the result budget the same,
+# big patterns within a row quota of half the budget, strata on spread_with_scans.
+# Every other setting as statistics_based_yago.yaml.
+#   python -m src.random_query_generation.statistics_based_generation.generate --config-name statistics_based_watdiv.yaml
+defaults:
+  - statistics_based_yago
+  - _self_
+
+generation:
+  ntriples: /mnt/data/watdiv/dataset.nt
+  cache_directory: data/statistics_based_generation/watdiv      # graph.npz, vocabulary.npz, statistics.npz
+  output_directory: data/generated_queries/statistics_based_watdiv
+  workers: 7
+
+  instantiation:
+    big_pattern_rows: 50000000
+
+  result_budget:
+    max_result: 100000000
+
+  acceptance:
+    max_best_plan_work: 100000000
+    max_min_cost: null
+    max_result: null
+
+  spread_strata:
+    measure: spread_with_scans
+
+  certificate:
+    # Only the two huge predicates (friendOf 90M, follows 65M triples) are COUNTed on QLever; every other
+    # predicate has at most 4.8M triples. YAGO's 2M would send most WatDiv subsets to QLever (~39 counts
+    # per candidate, days for the full run).
+    max_in_memory_rows: 5000000
+
+  # QLever on this machine: deploy_isolated_qlever_instances.py on data/qlever/qlever_watdiv starts one
+  # instance per physical core but the first (7 here).
+  endpoints:
+    ports_per_host: 7

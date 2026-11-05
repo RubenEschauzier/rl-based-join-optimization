@@ -31,6 +31,8 @@ MAX_COMBINATIONS_PER_STAR = 50
 
 # QLever requires standard Accept headers for JSON SPARQL results
 QLEVER_HEADERS = {'Accept': 'application/sparql-results+json'}
+# A term of a triple pattern: IRI, literal (spaces allowed), or any other whitespace-free token.
+TERM_OR_TOKEN = re.compile(r'<[^>]*>|"(?:[^"\\]|\\.)*"(?:@[A-Za-z0-9-]+|\^\^\S+)?|\S+')
 
 
 class WrapperIsomorphicGraphFixedHashing:
@@ -62,7 +64,7 @@ def convert_query_to_graph(query):
     bgp = re.search(r'(?<={)[^}]*(?=})', query).group().replace("}", "").replace("{", "")
     tps = [tp.strip() for tp in bgp.split(" . ")[:-1]]
     for tp in tps:
-        spo = tp.strip().split(' ')
+        spo = TERM_OR_TOKEN.findall(tp)    # literals may contain spaces
         triple_to_add = []
         # If subject is variable add BNode to represent variable
         if spo[0][0] == "?":

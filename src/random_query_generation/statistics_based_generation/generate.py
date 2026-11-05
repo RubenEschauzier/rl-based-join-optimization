@@ -34,7 +34,7 @@ from src.random_query_generation.statistics_based_generation.certificate import 
     BackgroundCounter, certificate_tasks, certify_in_memory, final_count_task, finish_certificate,
 )
 from src.random_query_generation.statistics_based_generation.counting import ExactCounter, PredicateIndex
-from src.random_query_generation.statistics_based_generation.graph import load_graph
+from src.random_query_generation.statistics_based_generation.graph import load_graph, pattern_terms
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
 from src.random_query_generation.statistics_based_generation.instantiate import (
     ChokePoint, Instantiator, binding_plan, tighten_to_budget,
@@ -102,7 +102,8 @@ def _make_candidate(job):
         "n_constants": len(instance.plan.constants), "constant_strata": strata,
         "added_constants": len(instance.plan.constants) - planned_constants,
         "template": f"{kind}|{n}|{choke_name}|{'zero' if hard_zero else 'nonzero'}|{'-'.join(strata)}",
-        "entities": sorted({t.strip("<>") for p in patterns for t in p.split() if t.startswith("<")}),
+        "entities": sorted({t.strip("<>") if t.startswith("<") else t
+                            for p in patterns for t in pattern_terms(p) if not t.startswith("?")}),
         "seed": int(seed),
     }
     if not certify_in_memory(candidate, instance.structured_patterns(), _STATE["counter"],
@@ -371,7 +372,7 @@ def _write_shape(kind, queries, output_directory):
             "x": c["entities"],
             "y": c["y"],                     # QLever's COUNT(*) of the query (equal to the in-memory count)
             "query": f"SELECT * WHERE {{ {body} }}",
-            "triples": [p.split() + ["."] for p in c["triple_patterns"]],
+            "triples": [pattern_terms(p) + ["."] for p in c["triple_patterns"]],
             "type": f"statistics_based_{kind}",
             "generation": {k: c[k] for k in ("shape", "n_patterns", "choke_point", "hard_zero", "perturbation",
                                              "pattern_sizes", "n_constants", "constant_strata", "added_constants",

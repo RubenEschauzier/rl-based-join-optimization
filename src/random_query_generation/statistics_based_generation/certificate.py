@@ -43,13 +43,14 @@ import time
 import numpy as np
 import requests
 
+from src.random_query_generation.statistics_based_generation.graph import pattern_terms
 from src.supervised_value_estimation.amortized_dp.labels import mask_of
 from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_on_endpoint, count_query
 
 
 def pattern_adjacency(triple_patterns):
     """Pairs of patterns sharing a variable."""
-    variables = [{t for t in p.split() if t.startswith("?")} for p in triple_patterns]
+    variables = [{t for t in pattern_terms(p) if t.startswith("?")} for p in triple_patterns]
     n = len(variables)
     return [[j for j in range(n) if j != i and variables[i] & variables[j]] for i in range(n)]
 

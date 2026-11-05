@@ -9,7 +9,7 @@ from src.random_query_generation.statistics_based_generation.certificate import 
 )
 from src.random_query_generation.statistics_based_generation.generate import _accept
 from src.random_query_generation.statistics_based_generation.counting import _Message, _sum_by
-from src.random_query_generation.statistics_based_generation.graph import DataGraph, parse_ntriples
+from src.random_query_generation.statistics_based_generation.graph import DataGraph, load_graph, parse_ntriples, pattern_terms
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
 from src.random_query_generation.statistics_based_generation.instantiate import (
     ChokePoint, Instantiator, binding_plan, variable_connected,
@@ -42,6 +42,24 @@ def test_ntriples_parsing(tmp_path):
                     "<http://example.com/3> <http://example.com/13000081> <http://example.com/1> .\n")
     s, p, o = parse_ntriples(path)
     assert s.tolist() == [1, 3] and p.tolist() == [13000080, 13000081] and o.tolist() == [2, 1]
+
+
+def test_dump_with_real_iris_and_literals_keeps_its_terms(tmp_path):
+    path = tmp_path / "g.nt"
+    path.write_text('<http://x.org/User0>\t<http://x.org/name>\t"deaf \\"gauntlets\\" quoit" .\n'
+                    '<http://x.org/User0>\t<http://x.org/follows>\t<http://x.org/User1> .\n'
+                    '<http://x.org/User1> <http://x.org/name> "Anna"@en .\n'
+                    '<http://x.org/User0>\t<http://x.org/follows>\t<http://x.org/User1> .\n')   # duplicate: kept once
+    graph = load_graph(path, tmp_path / "cache")
+    for g in (graph, load_graph(path, tmp_path / "cache")):          # built, then from the cache
+        assert g.n_triples == 3 and g.n_predicates == 2 and g.n_entities == 4
+        ids = {g.iri(e): e for e in range(g.n_entities)}
+        user0, user1 = ids["<http://x.org/User0>"], ids["<http://x.org/User1>"]
+        name = next(q for q in range(g.n_predicates) if g.predicate_iri(q) == "<http://x.org/name>")
+        assert g.iri(g.objects_of(user0, name)[0]) == '"deaf \\"gauntlets\\" quoit"'
+        assert g.iri(g.objects_of(user1, name)[0]) == '"Anna"@en' and g.iri(user1) == "<http://x.org/User1>"
+    pattern = '?v0 <http://x.org/name> "deaf \\"gauntlets\\" quoit"'
+    assert pattern_terms(pattern) == ["?v0", "<http://x.org/name>", '"deaf \\"gauntlets\\" quoit"']
 
 
 def test_graph_indexes_match_the_triples(data):
