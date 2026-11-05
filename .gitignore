@@ -186,6 +186,8 @@ fabric.properties
 
 data/*
 /data/pretrain_data/*
+# data/ may be a symlink to another disk (data -> /mnt/data-ssd/data): never track the link itself
+/data
 
 /output/*
 /outputs
