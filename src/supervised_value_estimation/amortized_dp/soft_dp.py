@@ -208,6 +208,43 @@ def subset_batch(query, masks: torch.Tensor, device):
     return x[v_idx], edge_index, ea[ee], s_idx
 
 
+def subset_batch_many(queries, masks_list, device):
+    """subset_batch of several queries at once, over the disjoint union of the queries (patterns, nodes and edges
+    side by side, in order): (x, edge_index, edge_attr, batch, bits [M, sum n] the subsets' patterns in the union),
+    the same graphs as torch.cat of each query's subset_batch with node and graph offsets. queries: objects with x,
+    edge_index, edge_attr and triple_patterns (on the device: no copies); masks on the CPU or the device."""
+    import numpy as np
+    from src.models.model_layers.row_readout import packed_to
+    device = torch.device(device)
+    ns = [len(q.triple_patterns) for q in queries]
+    xs = [q.x.to(device) for q in queries]
+    eis = [torch.as_tensor(q.edge_index).to(device) for q in queries]
+    vo = np.concatenate([[0], np.cumsum([len(t) for t in xs])[:-1]]).astype(np.int64)
+    po = np.concatenate([[0], np.cumsum(ns)[:-1]]).astype(np.int64)
+    Q = np.arange(len(ns))
+    g = packed_to(device, {"masks": torch.cat([m.reshape(-1) for m in masks_list]),
+                           "local": torch.from_numpy(np.concatenate([np.arange(n) for n in ns]).astype(np.int64)),
+                           "q_of_col": torch.from_numpy(np.repeat(Q, ns)),
+                           "q_of_row": torch.from_numpy(np.repeat(Q, [len(m) for m in masks_list])),
+                           "edge_off": torch.from_numpy(np.repeat(vo, [e.shape[1] for e in eis]))})
+    x = torch.cat(xs)
+    ei = torch.cat(eis, 1) + g["edge_off"]
+    ea = torch.cat([q.edge_attr.to(device) for q in queries])
+    N = sum(ns)
+    bits = (((g["masks"][:, None] >> g["local"][None, :]) & 1) != 0) & (g["q_of_row"][:, None] == g["q_of_col"][None, :])
+    p = torch.arange(N, device=device)
+    incidence = torch.zeros(N, x.shape[0], dtype=torch.bool, device=device)   # pattern i touches node v
+    incidence[p, ei[0, 2 * p]] = True
+    incidence[p, ei[1, 2 * p]] = True
+    node_in = (bits.float() @ incidence.float()) > 0
+    counts = node_in.sum(1)
+    local = torch.cumsum(node_in.long(), 1) - 1 + (torch.cumsum(counts, 0) - counts)[:, None]
+    s_idx, v_idx = torch.nonzero(node_in, as_tuple=True)
+    es, ee = torch.nonzero(bits.repeat_interleave(2, dim=1), as_tuple=True)
+    edge_index = torch.stack([local[es, ei[0, ee]], local[es, ei[1, ee]]])
+    return x[v_idx], edge_index, ea[ee], s_idx, bits
+
+
 def model_subset_logcards(model, query, masks: torch.Tensor, device, chunk: int = 16384) -> torch.Tensor:
     """The cardinality model's log card for every subset in `masks`, in chunks (keeps the graph for
     backward; wrap in torch.no_grad() for estimates only)."""

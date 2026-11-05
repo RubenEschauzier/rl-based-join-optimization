@@ -207,4 +207,4 @@ data/*
 
 !/logs/.keep
 /logs
-/runs
+/runs/data

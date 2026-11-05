@@ -12,7 +12,8 @@ bound. Each ROUND, as train_plan_loss:
      forest.count_candidates also the result of every candidate merge along the deployed plan (all beams of a
      query run as one batch, fv.beam_plans);
   3. COUNT the new subsets on QLever (a failed count costs the query's failed-count bound, 2 x its largest count),
-     streamed: each query's subsets are counted while the next queries are planned (CountStream);
+     streamed: each query's subsets are counted while the next queries are planned (CountStream, in its own
+     process: CountProcess);
   4. train on the most recent `replay_queries` counted queries (up to forest.max_plans_per_query counted plans each):
          l1_weight * L1(l) + forest.bound_l1_weight * L1(l'') + forest.value_weight * |V - log G|
          + plan_weight * per-step plan regret + forest.consistency_weight * |V - min Q^|   (forest_value.losses)
@@ -68,6 +69,11 @@ Search and objective options (defaults: the runs before 2026-11-04):
     along the deployed plan with forest.count_candidates) gets a ReadTask next to the counts, whose read is the
     label of the planner's rows-read head (l1_read at cost.read_l1_weight); G, the plan regret and the realized
     regret are in that cost, and validation also reports it (vs GNCE GOO). C_out only with the epinet.
+Planning: with online.plan_workers > 0 a round's queries are planned by that many worker processes around this
+process's GPU (plan_server.py: the beams' selection in the workers on CPU tensors, each step's network part batched
+over the waiting queries on the GPU: one encoder pass over all their new subsets, then the bound and the value net);
+0 plans in this process, one query at a time (the runs before 2026-11-05). The plain planner only (no epinet). Either
+way the counts run in their own process (CountProcess).
 Outputs in online.output_directory/forest-value-<time>/: config.yaml, rounds.jsonl, validation.jsonl,
 validation-<round>.json, model-<round>.pt (cardinality model), planner-<round>.pt, epinet-<round>.pt, counts.pkl,
 reads.pkl (QLever cost).
@@ -81,6 +87,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import hydra
 import numpy as np
@@ -89,6 +96,7 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.stats import spearmanr
 from tqdm import tqdm
 
+from src.models.model_layers.row_readout import packed_to
 from src.supervised_value_estimation.amortized_dp import bushy, forest_epinet as fe, forest_value as fv, history_dp, soft_dp
 from src.supervised_value_estimation.amortized_dp.bushy_train import count_connected_subsets, load_backbone, load_split
 from src.supervised_value_estimation.amortized_dp.labels import model_log_cardinalities
@@ -96,8 +104,10 @@ from src.supervised_value_estimation.amortized_dp.online.train_online import _en
 from src.supervised_value_estimation.amortized_dp.online.train_online_bushy import connected, neighbour_masks_of
 from src.supervised_value_estimation.amortized_dp.online.train_plan_loss import (BUCKETS, Query, failed_bound,
                                                                                  multi_query_batch, phi_and_direct,
-                                                                                 plan_cost, query_readout, subset_phi)
-from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import (CountStream, ReadTask, count_query,
+                                                                                 plan_cost, query_readout, subset_phi,
+                                                                                 subset_phi_many)
+from src.supervised_value_estimation.amortized_dp.online.plan_server import PlanPool
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import (CountProcess, ReadTask, count_query,
                                                                                      count_subsets)
 from src.supervised_value_estimation.amortized_dp.work_function import (QLeverCost, lazy_splits, plan_internal_splits,
                                                                         plan_work, variable_masks)
@@ -242,6 +252,47 @@ def candidate_splits(tree, q):
     return out
 
 
+def plan_groups(widths, explore=0, sigma=0.0, alternatives=False, thompson=False, explore_width=None):
+    """plan_query's beams: (name, width, score noise, all final trees) per group."""
+    groups = [("GOO" if w == 1 else f"beam-{w}", w, 0.0, alternatives) for w in widths]
+    return groups + [(f"explore-{i}", explore_width or widths[-1], 0.0 if thompson else sigma, False)
+                     for i in range(explore)]
+
+
+def group_plans(groups, out):
+    """{name: tree} of beam_plans's trees per group (a group's alternatives "name #i")."""
+    plans = {}
+    for (name, *_), trees in zip(groups, out):
+        plans[name] = trees[0]
+        plans.update({f"{name} #{i}": t for i, t in enumerate(trees[1:], 1)})
+    return plans
+
+
+def batched_encoder(model, device):
+    """The planning server's encode_many ([(fv.PlanState, masks)] -> [(phi, l)]): encoder over several queries in
+    one backbone pass (subset_phi_many; a state's data is its Query, its readout the query's QueryReadout)."""
+    def on_device(st):                                   # the query's graph on the device, once per query
+        if getattr(st, "graph", None) is None:
+            d = st.data.data
+            st.graph = SimpleNamespace(x=d.x.to(device), edge_index=torch.as_tensor(d.edge_index).to(device),
+                                       edge_attr=d.edge_attr.to(device), triple_patterns=d.triple_patterns)
+            st.graph.exact = st.graph.edge_attr[0::2, -2].float()           # single patterns' log1p counts
+        return st.graph
+
+    def encode_many(items):
+        ms = [torch.tensor(m, dtype=torch.long) for _, m in items]          # on the CPU: one copy in the batch
+        out = subset_phi_many(model, [(on_device(st), st.readout, m) for (st, _), m in zip(items, ms)], device)
+        # single patterns: the exact count (history_dp.single_pattern_logcounts), for all queries at once
+        m = torch.cat(ms)
+        po = np.repeat(np.concatenate([[0], np.cumsum([len(st.graph.triple_patterns) for st, _ in items])[:-1]]), [len(x) for x in ms])
+        g = packed_to(device, {"single": (m & (m - 1)) == 0,
+                               "row": torch.log2(m.double()).round().long().clamp(min=0) + torch.from_numpy(po)})
+        exact = torch.cat([st.graph.exact for st, _ in items])
+        l = torch.where(g["single"], exact[g["row"].clamp(max=len(exact) - 1)], torch.cat([l for _, l in out]))
+        return [(phi, part) for (phi, _), part in zip(out, l.split([len(x) for x in ms]))]
+    return encode_many
+
+
 @torch.no_grad()
 def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, generator=None, alternatives=False,
                reference=False, epinet=None, thompson=False, details=False, per_forest=1, explore_width=None,
@@ -253,8 +304,7 @@ def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, gen
     trace_kept, per step the component trees of each forest the first beam (widths[0]) kept}). per_forest: builds
     per forest every beam keeps (fv.beam_plans); explore_width: the exploration beams' width (default widths[-1])."""
     ctx = fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, encoder(model, q, device))
-    groups = [("GOO" if w == 1 else f"beam-{w}", w, 0.0, alternatives) for w in widths]
-    groups += [(f"explore-{i}", explore_width or widths[-1], 0.0 if thompson else sigma, False) for i in range(explore)]
+    groups = plan_groups(widths, explore, sigma, alternatives, thompson, explore_width)
     indexes = None
     if epinet is not None:
         indexes = torch.zeros(len(groups), epinet.index_dim, device=device)
@@ -263,10 +313,7 @@ def plan_query(model, net, q, degrees, device, widths, explore=0, sigma=0.0, gen
     kept = [] if trace_kept else None
     out, _ = fv.beam_plans(net, ctx, [g[1] for g in groups], [g[2] for g in groups], [g[3] for g in groups], generator,
                            epinet=epinet, indexes=indexes, per_forest=per_forest, kept=kept)
-    plans = {}
-    for (name, *_), trees in zip(groups, out):                  # all beams of the query in one batch
-        plans[name] = trees[0]
-        plans.update({f"{name} #{i}": t for i, t in enumerate(trees[1:], 1)})
+    plans = group_plans(groups, out)                         # all beams of the query in one batch
     if reference:
         s = soft_dp.SubsetStructure(q.neighbour_masks, device)
         est = soft_dp.model_subset_logcards(model, q.data, s.masks, device)
@@ -349,6 +396,12 @@ def main(cfg: DictConfig):
     with open(fcfg.degrees) as f:
         degrees = json.load(f)
     builder = PartBuilder(degrees, int(online.get("build_workers", 0)))   # before the datasets: light spawned workers
+    plan_workers = int(online.get("plan_workers", 0))
+    if plan_workers and bool((cfg.get("epinet") or {"enabled": False})["enabled"]):
+        raise ValueError("online.plan_workers: the planning server plans with the plain planner, not the epinet")
+    cost_cfg = cfg.get("cost") or {"model": "cout"}
+    pool = PlanPool(plan_workers, degrees, dict(cost_cfg["qlever"]) if str(cost_cfg["model"]) == "qlever" else None) \
+        if plan_workers else None                        # planning processes around this process's GPU (plan_server.py)
 
     # --- queries: the same seeded selection as train_plan_loss ----------------------------------------
     train_dataset = load_split(cfg.data.train_dir)
@@ -419,6 +472,10 @@ def main(cfg: DictConfig):
 
     endpoints = _endpoints(online.execution)
     print(f"{len(endpoints)} QLever endpoints: {endpoints[0]} ... {endpoints[-1]}", flush=True)
+    counter = CountProcess(endpoints, float(online.count_timeout_s))   # each round's counts, in their own process
+    encode_many = batched_encoder(model, device)
+    if pool is not None:
+        print(f"Planning: {plan_workers} worker processes around a GPU network server (plan_server.py)", flush=True)
     counts: dict[str, dict[int, int | None]] = {}
     largest = [0]
     seed_cache = online.validation.get("true_counts_cache")
@@ -661,18 +718,11 @@ def main(cfg: DictConfig):
             candidates = [candidates[i] for i in top]
         new_keys = {q.key for q in candidates}
         batch += candidates
-        stream = CountStream(endpoints, float(online.count_timeout_s))
+        stream = counter.begin()                         # counted in its own process while planning goes on
         queued = set()
-        for q in tqdm(batch, desc="Planning", file=sys.stdout, mininterval=30):
-            width = int(rng.choice(beam_widths)) if beam_loss else int(online.deployed_width)   # the beam loss: per query
+
+        def planned(q, width, plans, kept):                  # a planned query: its count tasks and plans
             deployed = f"beam-{width}" if width > 1 else "GOO"
-            plans, det = plan_query(model, net, q, degrees, device, [width], int(online.explore_plans),
-                                    float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
-                                    epinet=epi, thompson=epi is not None and bool(ecfg.thompson), details=True,
-                                    per_forest=per_forest, explore_width=int(online.deployed_width), trace_kept=beam_loss)
-            if det["indexes"] is not None:                       # decision uncertainty over this execution's plans
-                trees = list(dict.fromkeys([bushy.canonical(plans[deployed])] + [bushy.canonical(t) for t in plans.values()]))
-                decision_of[q.key], disagree_of[q.key] = decision_uncertainty(net, epi, det["ctx"], trees, det["indexes"])
             masks = [m for t in plans.values() for m in bushy.internal_masks(t)]
             if bool(fcfg.count_candidates):
                 masks += candidate_masks(plans[deployed], q)
@@ -688,7 +738,7 @@ def main(cfg: DictConfig):
             stream.add(tasks)                                    # counted while the next queries are planned
             deployed_of[q.key] = bushy.canonical(plans[deployed])
             if beam_loss:
-                beams_of[q.key] = {"width": width, "kept": det["kept"]}
+                beams_of[q.key] = {"width": width, "kept": kept}
                 beam_version[q.key] = beam_version.get(q.key, 0) + 1
             known = plans_of.setdefault(q.key, [])
             for t in plans.values():
@@ -697,6 +747,35 @@ def main(cfg: DictConfig):
                     known.remove(c)
                 known.append(c)
             del known[:-int(fcfg.max_plans_per_query)]
+
+        widths_of = [int(rng.choice(beam_widths)) if beam_loss else int(online.deployed_width) for _ in batch]
+        if pool is None:                                     # in this process, one query at a time
+            for q, width in tqdm(list(zip(batch, widths_of)), desc="Planning", file=sys.stdout, mininterval=30):
+                plans, det = plan_query(model, net, q, degrees, device, [width], int(online.explore_plans),
+                                        float(online.explore_sigma), generator, bool(online.count_beam_alternatives),
+                                        epinet=epi, thompson=epi is not None and bool(ecfg.thompson), details=True,
+                                        per_forest=per_forest, explore_width=int(online.deployed_width),
+                                        trace_kept=beam_loss)
+                if det["indexes"] is not None:                   # decision uncertainty over this execution's plans
+                    deployed = f"beam-{width}" if width > 1 else "GOO"
+                    trees = list(dict.fromkeys([bushy.canonical(plans[deployed])] + [bushy.canonical(t) for t in plans.values()]))
+                    decision_of[q.key], disagree_of[q.key] = decision_uncertainty(net, epi, det["ctx"], trees, det["indexes"])
+                planned(q, width, plans, det["kept"])
+        else:                                                # plan_workers processes around this GPU server
+            groups_of = [plan_groups([w], int(online.explore_plans), float(online.explore_sigma),
+                                     bool(online.count_beam_alternatives), False, int(online.deployed_width))
+                         for w in widths_of]
+            jobs = [((lambda q=q: fv.PlanState(fv.QueryContext(q.n, q.neighbour_masks, q.patterns, degrees, None), q,
+                                               query_readout(model, q.data, device))),
+                     {"n": q.n, "neighbour_masks": list(q.neighbour_masks), "patterns": list(q.patterns),
+                      "widths": [g[1] for g in gs], "noises": [g[2] for g in gs], "all_trees": [g[3] for g in gs],
+                      "per_forest": per_forest, "kept": beam_loss, "seed": int(online.seed) * 1_000_003 + round_index * 4096 + x})
+                    for x, (q, gs) in enumerate(zip(batch, groups_of))]
+            for x, out, kept in tqdm(pool.plan(net, jobs, encode_many), total=len(jobs), desc="Planning", file=sys.stdout,
+                                     mininterval=30):
+                planned(batch[x], widths_of[x], group_plans(groups_of[x], out),
+                       [[t for g, t in step if g == 0] for step in kept] if kept is not None else None)
+        pool_stats = dict(pool.stats) if pool is not None else None
         t1 = time.perf_counter()
         results = stream.finish()
         new, failed, count_s = store_counts(results), sum(v is None for v in results.values()), stream.seconds
@@ -819,6 +898,8 @@ def main(cfg: DictConfig):
             record["decision"] = {"D": round(float(d.mean()), 4), "D>log2": round(float(np.mean(d > math.log(2))), 4),
                                   "disagree": round(float(np.mean([disagree_of[q.key] for q in batch if q.key in disagree_of])), 4),
                                   "spearman_D_realized": round(float(rho), 4) if np.isfinite(rho) else None}
+        if pool_stats is not None and pool_stats["batches"]:  # queries per network batch on the planning server
+            record["plan_batch"] = round(pool_stats["requests"] / pool_stats["batches"], 2)
         record["executed_regret"] = round(float(np.mean(executed)), 4) if executed else None
         record["executed_regret>log2"] = round(float(np.mean(np.array(executed) > math.log(2))), 4) if executed else None
         if epi is not None:
@@ -829,7 +910,9 @@ def main(cfg: DictConfig):
         print(f"[round {round_index}] {new:,} counts ({failed} failed) in {count_s:.0f}s | {steps} steps: L1 {record['l1_raw']:.3f} "
               f"(bounded {record['l1_bound']:.3f}), value {record['value']:.3f} (W {record['w']:.3f}), plan regret {record['plan']:.3f} (floor "
               f"{record['floor']:.3f}), consistency {record['consistency']:.3f}, states with a counted choice "
-              f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s (+{count_wait:.0f}s waiting for counts), build "
+              f"{record['choice']:.0%} | plan {record['plan_s']:.0f}s"
+              f"{' (%.1f queries a network batch)' % record['plan_batch'] if 'plan_batch' in record else ''} "
+              f"(+{count_wait:.0f}s waiting for counts), build "
               f"{record['build_s']:.0f}s, train "
               f"{record['train_s']:.0f}s | window {len(window):,}", flush=True)
         if beam_loss or qcost is not None:

@@ -220,7 +220,8 @@ class QueryReadout:
         # contexts: pair b of constant edge c is bit b of c's context; code = bits @ W over the subset's patterns
         npair = torch.bincount(pe, minlength=self.K)
         bit = torch.arange(len(pe), device=dev) - (torch.cumsum(npair, 0) - npair)[pe]      # pe is sorted
-        self.W = torch.zeros(self.n, self.K, device=dev).index_put_((self.pat_j, pe), (2.0 ** bit), accumulate=True)
+        self.wv = 2.0 ** bit                             # W's entries, per pair (merge_readouts)
+        self.W = torch.zeros(self.n, self.K, device=dev).index_put_((self.pat_j, pe), self.wv, accumulate=True)
         self.tabled = npair <= self.max_pairs
         size = torch.where(self.tabled, 2 ** npair, torch.zeros_like(npair))
         self.tptr = torch.cumsum(size, 0) - size
@@ -253,15 +254,17 @@ class QueryReadout:
         return m.out(torch.cat([self.rx[c_i], h_sum, h_max, soft], 1))
 
     @torch.no_grad()
-    def __call__(self, masks, x, edge_attr):
-        """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x[:, 1:], edge_attr with the readout)."""
+    def __call__(self, masks, x, edge_attr, bits=None):
+        """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x[:, 1:], edge_attr with the readout).
+        bits [M, n]: the subsets' patterns in place of masks (a merged readout: soft_dp.subset_batch_many's)."""
         if not self.ready:
             self._build()
         dev = self.device
         base = edge_attr[:, 1:]
         readout = torch.zeros(len(edge_attr), self.m.out_dim, device=dev, dtype=base.dtype)
         if self.K:
-            bits = ((masks.to(dev)[:, None] >> torch.arange(self.n, device=dev)) & 1).bool()
+            if bits is None:
+                bits = ((masks.to(dev)[:, None] >> torch.arange(self.n, device=dev)) & 1).bool()
             inst = bits[:, self.pat_c]                                         # [M, K]: constant edge in the subset
             s_i, c_i = torch.nonzero(inst, as_tuple=True)
             code = (bits.float() @ self.W).long()                              # [M, K] contexts
@@ -282,3 +285,61 @@ class QueryReadout:
             readout[pos[s_i, self.eid[c_i]]] = out.to(base.dtype)
             readout = readout + readout[torch.arange(len(readout), device=dev) ^ 1]
         return x[:, 1:], torch.cat([base[:, :-1], readout, base[:, -1:]], 1)
+
+
+def packed_to(dev, fields):
+    """fields {name: tensor}: the ones not on `dev` copied there in one transfer per dtype, side by side (pinned and
+    non-blocking to a GPU: a pageable host-to-GPU copy waits for every kernel queued before it); the others as
+    they are."""
+    out, by = {}, {}
+    for k, t in fields.items():
+        if t.device == dev:
+            out[k] = t
+        else:
+            by.setdefault(t.dtype, []).append(k)
+    for keys in by.values():
+        flat = torch.cat([fields[k].reshape(-1) for k in keys])
+        flat = flat.pin_memory().to(dev, non_blocking=True) if dev.type == "cuda" else flat.to(dev)
+        s = 0
+        for k in keys:
+            m = fields[k].numel()
+            out[k] = flat[s:s + m].view(fields[k].shape)
+            s += m
+    return out
+
+
+def _repeat(values, counts):
+    return torch.from_numpy(np.repeat(np.asarray(values, dtype=np.int64), counts))
+
+
+def merge_readouts(readouts, ns):
+    """One QueryReadout over the disjoint union of several queries (n_q patterns each, in order), for
+    soft_dp.subset_batch_many's graphs and bits: their built tables side by side, the indexes offset (patterns,
+    edges, constant edges, entries, table rows), W from the pairs' entries. Called with those bits, the same numbers
+    as each query's own readout on its own subsets. One query: its own readout."""
+    for r in readouts:
+        if not r.ready:
+            r._build()
+    if len(readouts) == 1:
+        return readouts[0]
+    first = readouts[0]
+    out = QueryReadout(first.m, None, first.device, first.max_pairs)
+    out.ready, out.n = True, sum(ns)
+    built = [(r, sum(ns[:x])) for x, r in enumerate(readouts) if r.K]
+    out.K = sum(r.K for r, _ in built)
+    if not out.K:
+        return out
+    dev = torch.device(first.device)
+    po, Ks, pairs = [b for _, b in built], [r.K for r, _ in built], [len(r.pe) for r, _ in built]
+    excl = lambda xs: np.concatenate([[0], np.cumsum(xs)[:-1]]).astype(np.int64)
+    g = packed_to(dev, {"po_c": _repeat(po, Ks), "table_c": _repeat(excl([len(r.table) for r, _ in built]), Ks),
+                        "entry_c": _repeat(excl([len(r.k) for r, _ in built]), Ks),
+                        "K_p": _repeat(excl(Ks), pairs), "po_p": _repeat(po, pairs)})
+    cat = lambda k: torch.cat([getattr(r, k) for r, _ in built])
+    out.pat_c, out.eid = cat("pat_c") + g["po_c"], cat("eid") + 2 * g["po_c"]
+    out.tptr, out.eptr = cat("tptr") + g["table_c"], cat("eptr") + g["entry_c"]
+    out.pe, out.pat_j = cat("pe") + g["K_p"], cat("pat_j") + g["po_p"]
+    for k in ("tabled", "f_e", "ne", "rx", "h", "g_e", "k", "v", "table"):
+        setattr(out, k, cat(k))
+    out.W = torch.zeros(out.n, out.K, device=dev).index_put_((out.pat_j, out.pe), cat("wv"), accumulate=True)
+    return out

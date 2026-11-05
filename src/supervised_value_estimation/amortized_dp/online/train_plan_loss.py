@@ -119,6 +119,53 @@ def subset_phi(model, data, masks, device, chunk=16384, readout=None):
     return torch.cat([o[0] for o in out]), torch.cat([o[1] for o in out])
 
 
+def subset_phi_many(model, items, device, chunk=16384):
+    """subset_phi of several queries in one backbone pass: items [(data, readout, masks)] -> [(phi, l)] (data: the
+    query's Data, or its x, edge_index, edge_attr and triple_patterns already on the device; readout: its
+    row_readout.QueryReadout, or None for every item). Over the disjoint union of the queries
+    (soft_dp.subset_batch_many, row_readout.merge_readouts): the subset graphs of every query and the backbone in
+    one pass (the planning server, plan_server.py); at most `chunk` subsets a pass (a larger query alone, in chunks)."""
+    from src.models.model_layers.row_readout import merge_readouts
+    out = [None] * len(items)
+    if len({readout is None for _, readout, _ in items}) > 1:
+        raise ValueError("subset_phi_many: a readout for every query or for none")
+
+    def run(group):
+        if not group:
+            return
+        datas, masks = [items[x][0] for x in group], [items[x][2] for x in group]
+        x_, ei_, ea_, b_, bits = soft_dp.subset_batch_many(datas, masks, device)
+        if items[group[0]][1] is not None:
+            readout = merge_readouts([items[x][1] for x in group], [len(d.triple_patterns) for d in datas])
+            x_, ea_ = readout(None, x_, ea_, bits=bits)
+        if items[group[0]][1] is None:
+            phi = model.embedding_model.forward(x_, ei_, ea_, b_)
+        else:
+            from torch_geometric.nn.conv import MessagePassing
+            for layer in list(model.embedding_model.children())[1:]:
+                x_ = layer(x_, ei_, ea_) if isinstance(layer, MessagePassing) else layer(x_, b_)
+            phi = x_
+        l = model.heads[model.head_types.index("cardinality")](phi).reshape(-1)
+        start = 0
+        for x in group:
+            m = len(items[x][2])
+            out[x] = (phi[start:start + m], l[start:start + m])
+            start += m
+
+    group, total = [], 0
+    for x, (data, readout, masks) in enumerate(items):
+        if len(masks) > chunk:
+            out[x] = subset_phi(model, data, masks, device, chunk, readout)
+            continue
+        if total + len(masks) > chunk:
+            run(group)
+            group, total = [], 0
+        group.append(x)
+        total += len(masks)
+    run(group)
+    return out
+
+
 @torch.no_grad()
 def history_estimates(model, history, q, structure, device):
     """The history head's log1p estimates (hard DP histories, tau = 0) of every subset of `structure`, clamped by

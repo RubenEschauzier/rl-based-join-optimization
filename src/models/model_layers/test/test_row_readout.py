@@ -133,3 +133,23 @@ def test_cuda_and_cuda_0_share_one_loaded_store(store):
     first = layer.store(torch.device("cuda"))
     assert layer.store(torch.device("cuda:0")) is first and layer.store("cuda") is first
     assert layer.store(torch.device("cpu")) is not first
+
+
+@pytest.mark.parametrize("max_pairs", [10, 0])
+def test_merged_readouts_are_each_query_side_by_side(store, max_pairs):
+    """merge_readouts of three queries (one without a constant) on subset_batch_many's graphs: each query's own
+    readout of its own subsets, side by side."""
+    from src.models.model_layers.row_readout import QueryReadout, merge_readouts
+    from src.supervised_value_estimation.amortized_dp import soft_dp
+    torch.manual_seed(0)
+    layer = RowReadout(store, out_dim=4, hidden=8)
+    qs = [_Query([(0, 3, 1), (1, 7, 2), (1, 9, 3), (0, 3, 2)]), _Query([(1, 7, 2), (1, 9, 3)]),
+          _Query([(0, 3, 1), (1, 7, 2)])]
+    masks = [torch.arange(1, 1 << len(q.triple_patterns)) for q in qs]
+    readouts = [QueryReadout(layer, q, "cpu", max_pairs=max_pairs) for q in qs]
+    x, ei, ea, _, bits = soft_dp.subset_batch_many(qs, masks, "cpu")
+    mx, mea = merge_readouts(readouts, [len(q.triple_patterns) for q in qs])(None, x, ea, bits=bits)
+    ref = [r(m, *[t for k, t in enumerate(soft_dp.subset_batch(q, m, "cpu")) if k in (0, 2)])
+           for r, q, m in zip(readouts, qs, masks)]
+    assert torch.equal(mx, torch.cat([r[0] for r in ref]))
+    assert torch.allclose(mea, torch.cat([r[1] for r in ref]), atol=1e-6)

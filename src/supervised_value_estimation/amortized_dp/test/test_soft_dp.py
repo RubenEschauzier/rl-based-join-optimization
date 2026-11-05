@@ -154,3 +154,26 @@ def test_split_pairs_in_chunks_equal_the_unchunked_ones():
     assert whole.keys() == chunked.keys()
     for k in whole:
         assert all(torch.equal(a, b) for a, b in zip(whole[k], chunked[k]))
+
+
+def test_subset_batch_many_is_each_query_side_by_side():
+    """subset_batch_many over queries of 3-7 patterns: torch.cat of each query's subset_batch (node and graph offsets),
+    and bits the subsets' patterns in the union."""
+    qs = [_synthetic_query(n, seed=n) for n in (3, 7, 5)]
+    masks = [torch.tensor([m for m in range(1, 1 << len(q.triple_patterns)) if m % (2 + k) != 1])
+             for k, q in enumerate(qs)]
+    got = soft_dp.subset_batch_many(qs, masks, DEVICE)
+    nodes = graphs = 0
+    parts = []
+    for q, m in zip(qs, masks):
+        x, ei, ea, s = soft_dp.subset_batch(q, m, DEVICE)
+        parts.append((x, ei + nodes, ea, s + graphs))
+        nodes, graphs = nodes + len(x), graphs + len(m)
+    for k, dim in ((0, 0), (1, 1), (2, 0), (3, 0)):
+        assert torch.equal(got[k], torch.cat([p[k] for p in parts], dim))
+    po = [0, 3, 10]
+    for q, m, o in zip(qs, masks, po):
+        rows = got[4][sum(len(x) for x in masks[:po.index(o)]):][:len(m)]
+        expect = torch.zeros(len(m), 15, dtype=torch.bool)
+        expect[:, o:o + len(q.triple_patterns)] = ((m[:, None] >> torch.arange(len(q.triple_patterns))) & 1).bool()
+        assert torch.equal(rows, expect)

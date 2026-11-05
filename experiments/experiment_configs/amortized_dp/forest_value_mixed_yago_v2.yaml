@@ -13,6 +13,7 @@ online:
   plan_weight: 5.0
   plan_tau: 0.2              # per-step policy temperature over the candidates' log cost-to-go
   build_workers: 8           # processes building the training parts of a round's new / changed queries (0: serial)
+  plan_workers: 0            # processes planning a round's queries around a GPU network server (plan_server.py; 0: in-process)
   replay:                    # regret-based prioritized experience replay (module text of train_forest_value.py)
     prioritized: false
     priority: decision       # decision: the epinet's decision uncertainty D (needs Thompson beams); realized: true regret

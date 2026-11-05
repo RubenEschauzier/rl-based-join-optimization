@@ -76,6 +76,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from src.models.model_layers.row_readout import packed_to
 from src.supervised_value_estimation.amortized_dp import bushy
 from src.supervised_value_estimation.amortized_dp.labels import members
 from src.supervised_value_estimation.amortized_dp.work_function import (QLeverCost, WorkStitchTable, join_work,
@@ -344,16 +345,24 @@ class QueryContext:
         self.reach: dict[int, int] = {}
         self.step_timer: Callable = contextlib.nullcontext
 
+    def missing(self, masks):
+        """The masks (list or tensor) not encoded yet, each once, in order."""
+        keys = masks.tolist() if torch.is_tensor(masks) else list(masks)
+        return [m for m in dict.fromkeys(keys) if m not in self.cache]
+
+    def store(self, masks, phi, l):
+        """Add the encodings of new masks (encoded elsewhere: the planning server's batched encoder)."""
+        base = len(self.cache)
+        self.cache.update((m, base + i) for i, m in enumerate(masks))
+        self.phi = phi if self.phi is None else torch.cat([self.phi, phi])
+        self.l = l if self.l is None else torch.cat([self.l, l])
+
     def rows(self, masks):
         """[M] rows of phi / l for the masks (list or tensor), encoding the ones not seen yet."""
         keys = masks.tolist() if torch.is_tensor(masks) else list(masks)
-        missing = [m for m in dict.fromkeys(keys) if m not in self.cache]
+        missing = self.missing(keys)
         if missing:
-            phi, l = self.encode(missing)
-            base = len(self.cache)
-            self.cache.update((m, base + i) for i, m in enumerate(missing))
-            self.phi = phi if self.phi is None else torch.cat([self.phi, phi])
-            self.l = l if self.l is None else torch.cat([self.l, l])
+            self.store(missing, *self.encode(missing))
         return torch.tensor([self.cache[m] for m in keys], dtype=torch.long, device=self.l.device)
 
     def encoded(self, masks):
@@ -436,9 +445,185 @@ def plan_scores(net: ForestPlanner, ctx: QueryContext, trees, epinet=None, index
     return (scores, l2[:, roots]) if with_root else scores
 
 
+SERVER_VALUE_CHUNK = 32768      # forests per value-net pass (the fused attention kernel fails above 65,535 in one batch)
+
+
+class PlanState:
+    """The network side of one query's beams (beam_plans; the planning server holds one per query it plans): the
+    QueryContext (the encoder cache: phi and l on the network's device) and, after network_open, the standardised
+    phi(Q) [1, D] and l(Q) [1]. data, readout: what the server's batched encoder needs."""
+
+    def __init__(self, ctx: QueryContext, data=None, readout=None):
+        self.ctx, self.data, self.readout = ctx, data, readout
+        self.q_std = self.lq = None
+
+
+def _encode(items, encode_many):
+    """Encode the masks [(PlanState, masks)] their contexts have not seen: with encode_many ([(PlanState, masks)] ->
+    [(phi, l)]) every query's in one pass (the server), else each context with its own encoder."""
+    todo = [(st, st.ctx.missing(m)) for st, m in items]
+    todo = [(st, m) for st, m in todo if m]
+    if encode_many is None:
+        for st, m in todo:
+            st.ctx.store(m, *st.ctx.encode(m))
+    elif todo:
+        for (st, m), (phi, l) in zip(todo, encode_many(todo)):
+            st.ctx.store(m, phi, l)
+
+
+@torch.no_grad()
+def network_open(net: ForestPlanner, states, encode_many=None):
+    """The start of beam_plans for several queries: encode each query Q and its single patterns; per state (rows of
+    the single patterns [n], their l [n], l(Q) [1]), with the state's q_std and lq set."""
+    _encode([(st, [(1 << st.ctx.n) - 1] + [1 << i for i in range(st.ctx.n)]) for st in states], encode_many)
+    out = []
+    for st in states:
+        ctx, n = st.ctx, st.ctx.n
+        rq, rs = ctx.rows([(1 << n) - 1]), ctx.rows([1 << i for i in range(n)])
+        st.q_std, st.lq = net.standardise(ctx.phi[rq]), ctx.l[rq]
+        out.append((rs, ctx.l[rs], st.lq))
+    return out
+
+
+@torch.no_grad()
+def network_steps(net: ForestPlanner, items, encode_many=None, hidden=False):
+    """The network part of a beam step (beam_plans) for several queries in one pass. items [(PlanState, request)],
+    a request the step's C candidates, each merging components A, B of a forest into U (tensors on the beam's
+    device; rows index the state's phi / l):
+        U [C]; cl_a, cl_b, cc_a, cc_b [C] (l'' and log subtree cost of A, B); fa, fb [C, 3]; size [C]; kc (the
+        child forest's components); QLever cost: crow_a, crow_b, lazy_a, lazy_b, sort_a, sort_b [C];
+        kc > 1 (the value net): crow_old, cl_old, cc_old, sz_old, single_old [C, kc - 1] (the components kept),
+        child_m, child_r [C, kc] (the child forest, U last); QLever cost and kc 2 also child_v, child_s [C, 2].
+    The new U of every query are encoded first (encode_many: one backbone pass over all queries); then the bound,
+    the read head and the value net run once over every candidate, forests of fewer components padded (pad = no
+    component: masked out of the attention, the same V). The inputs are assembled where the requests are (the
+    server: on the CPU) and copied to the network's device once per dtype. Returns per item {ru [C] (rows of U), l2,
+    c_u (the join's cost), cost_u (log subtree cost of U), V [C]; with hidden also hv [C, d] or None at kc 1} on the
+    request's device."""
+    _encode([(st, req["U"]) for st, req in items], encode_many)
+    dev, qcost = net.mean.device, net.cost is not None
+    one = len(items) == 1
+    sizes = [len(req["U"]) for _, req in items]
+    rows = [torch.tensor([st.ctx.cache[m] for m in req["U"].tolist()], dtype=torch.long) for st, req in items]
+    base = [0]
+    for st, _ in items[:-1]:
+        base.append(base[-1] + len(st.ctx.cache))
+    phi = items[0][0].ctx.phi if one else torch.cat([st.ctx.phi for st, _ in items])
+    lt = items[0][0].ctx.l if one else torch.cat([st.ctx.l for st, _ in items])
+
+    def cat(key, offset=False, which=None):
+        ts = [items[x][1][key] + base[x] if offset and base[x] else items[x][1][key]
+              for x in (range(len(items)) if which is None else which)]
+        return ts[0] if len(ts) == 1 else torch.cat(ts)
+
+    h = {"ru": rows[0] if one else torch.cat([r + o for r, o in zip(rows, base)])}
+    h.update({k: cat(k) for k in ("cl_a", "cl_b", "cc_a", "cc_b", "fa", "fb", "size")})
+    if qcost:
+        h.update(crow_a=cat("crow_a", True), crow_b=cat("crow_b", True),
+                 **{k: cat(k) for k in ("lazy_a", "lazy_b", "sort_a", "sort_b")})
+    vi = [x for x, (_, req) in enumerate(items) if req["kc"] > 1]           # the items with a value net pass
+    final = []
+    if vi:
+        K = max(items[x][1]["kc"] for x in vi)
+        start = [0]
+        for s in sizes:
+            start.append(start[-1] + s)
+        if len(vi) < len(items):
+            h["sel"] = torch.cat([torch.arange(start[x], start[x + 1]) for x in vi])
+
+        def padded(key, value=0, offset=False, new_last=False):
+            ts = []
+            for x in vi:
+                t, kc = items[x][1][key], items[x][1]["kc"]
+                t = t + base[x] if offset and base[x] else t
+                if kc < K:                                   # pad = no component: kept components, pad, U last
+                    fill = t.new_full((len(t), K - kc), value)
+                    t = torch.cat([t[:, :-1], fill, t[:, -1:]] if new_last else [t, fill], 1)
+                ts.append(t)
+            return ts[0] if len(ts) == 1 else torch.cat(ts)
+
+        h.update(crow_old=padded("crow_old", offset=True), cl_old=padded("cl_old"), cc_old=padded("cc_old"),
+                 single_old=padded("single_old", False), sz_old=padded("sz_old"),
+                 child_m=padded("child_m", new_last=True), child_r=padded("child_r", new_last=True))
+        pad = torch.zeros(sum(sizes[x] for x in vi), K, dtype=torch.bool)
+        s = 0
+        for x in vi:
+            pad[s:s + sizes[x], items[x][1]["kc"] - 1:K - 1] = True
+            s += sizes[x]
+        qi = torch.cat([torch.full((sizes[x],), t, dtype=torch.long) for t, x in enumerate(vi)])
+        h.update(pad=pad, qi=qi, frac=torch.tensor([items[x][1]["kc"] / items[x][0].ctx.n for x in vi])[qi],
+                 kcs=torch.tensor([items[x][1]["kc"] for x in vi], dtype=torch.long)[qi])
+        final = [t for t, x in enumerate(vi) if items[x][1]["kc"] == 2] if qcost else []
+        if final:                                        # QLever cost: V of 2 components = its final join's cost
+            fx = [vi[t] for t in final]
+            h.update(pos=torch.cat([(qi == t).nonzero(as_tuple=True)[0] for t in final]),
+                     **{f"{key}2": cat(key, which=fx) for key in ("child_m", "child_v", "child_s")})
+    g = packed_to(dev, h)
+    ru = g["ru"]
+    phi_u, cl_a, cl_b = net.standardise(phi[ru]), g["cl_a"], g["cl_b"]
+    l2, _ = net.bound(lt[ru], cl_a, cl_b, g["fa"], g["fb"], phi_u, g["size"])
+    c_u = l2
+    if qcost:
+        ra, rb = operand_reads(net, net.standardise(phi[g["crow_a"]]), net.standardise(phi[g["crow_b"]]), cl_a, cl_b)
+        c_u = join_cost(net, l2, cl_a, cl_b, g["lazy_a"], g["lazy_b"], ra, rb, g["sort_a"], g["sort_b"])
+    cost_u = torch.logaddexp(c_u, torch.logaddexp(g["cc_a"], g["cc_b"]))
+    V = torch.full_like(l2, NEG)
+    hv = None
+    if vi:
+        sel = g.get("sel")
+        pick = (lambda t: t) if sel is None else (lambda t: t[sel])
+        crow_old, cl_old = g["crow_old"], g["cl_old"]
+        tok_old = token_features(net.standardise(phi[crow_old]), cl_old, g["cc_old"], g["single_old"], g["sz_old"])
+        tok_new = token_features(pick(phi_u), pick(l2), pick(cost_u),
+                                 torch.zeros(len(crow_old), dtype=torch.bool, device=dev), pick(g["size"]))
+        tokens = torch.cat([tok_old, tok_new[:, None]], 1)
+        adj = (g["child_r"][:, :, None] & g["child_m"][:, None, :]) != 0
+        qi = g["qi"]
+        q_std = (items[vi[0]][0].q_std if len(vi) == 1 else torch.cat([items[x][0].q_std for x in vi]))[qi]
+        lq = (items[vi[0]][0].lq if len(vi) == 1 else torch.cat([items[x][0].lq for x in vi]))[qi]
+        query = torch.cat([q_std, (lq / 10)[:, None], g["frac"][:, None]], 1)
+        lq_v = lq + _log_weight(net.cost.out) if qcost else lq
+        pad, kcs, B = g["pad"], g["kcs"], SERVER_VALUE_CHUNK
+        parts = [net.values(tokens[s:s + B], pad[s:s + B], adj[s:s + B], query[s:s + B], lq_v[s:s + B], kcs[s:s + B],
+                            return_hidden=True) for s in range(0, len(tokens), B)]
+        Vv = parts[0][0] if len(parts) == 1 else torch.cat([p[0] for p in parts])
+        if hidden:
+            hv = parts[0][2] if len(parts) == 1 else torch.cat([p[2] for p in parts])
+        if final:
+            pos = g["pos"]
+            l2c = torch.stack([cl_old[pos, 0], pick(l2)[pos]], 1)
+            cm2, cv2, cs2 = g["child_m2"], g["child_v2"], g["child_s2"]
+            jq = cv2[:, 0] & cv2[:, 1]
+            sq = (cs2 >= 0) & (cs2 != jq[:, None])
+            lz = ((cm2 & (cm2 - 1)) == 0) & (l2c >= math.log1p(net.cost.lazy_rows))
+            r0, r1 = operand_reads(net, net.standardise(phi[crow_old[pos, 0]]), net.standardise(phi[pick(ru)[pos]]),
+                                   l2c[:, 0], l2c[:, 1])
+            Vv[pos] = join_cost(net, lq[pos], l2c[:, 0], l2c[:, 1], lz[:, 0], lz[:, 1], r0, r1, sq[:, 0], sq[:, 1])
+        if sel is None:
+            V = Vv
+        else:
+            V[sel] = Vv
+    to = items[0][1]["U"].device                         # one copy back for all items
+    both = torch.stack([l2, c_u, cost_u, V]).to(to)
+    out, s = [], 0
+    for x, (st, req) in enumerate(items):
+        res = {"ru": rows[x].to(to), **dict(zip(("l2", "c_u", "cost_u", "V"), both[:, s:s + sizes[x]]))}
+        if hidden:
+            res["hv"] = None if req["kc"] == 1 else hv[_hv_rows(vi, sizes, x)].to(to)
+        out.append(res)
+        s += sizes[x]
+    return out
+
+
+def _hv_rows(vi, sizes, x):
+    """The rows of item x in the value pass over the items vi."""
+    s = sum(sizes[y] for y in vi[:vi.index(x)])
+    return slice(s, s + sizes[x])
+
+
 @torch.no_grad()
 def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_trees=None, generator=None, trace=None,
-               epinet=None, indexes=None, robust=None, start=None, trace_h=None, per_forest=1, kept=None):
+               epinet=None, indexes=None, robust=None, start=None, trace_h=None, per_forest=1, kept=None, network=None):
     """Independent beams over one query in one batch: group g keeps widths[g] forests per step, ranked by
     total(F) = log(cost so far + G(F)) (float64; ties broken by the cost so far, then by first appearance), with
     N(0, noises[g]) on each candidate's score (exploration). Returns ([trees of group g, cheapest first: all the
@@ -461,19 +646,26 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     per_forest: per group and child forest the best this many candidates (builds) are kept, instead of one; the
     final step keeps one complete plan per group either way (or all, with all_trees). kept: a list that receives,
     per step, [(group, component trees)] of every forest the beams keep (the beam loss's pools, build_query_data).
-    With a QLever cost (net.cost) the joins cost join_cost (module text, part 4); not with epinet, robust or start."""
+    With a QLever cost (net.cost) the joins cost join_cost (module text, part 4); not with epinet, robust or start.
+    Each step's network part (encode, bound, value net) is network_steps, here; network (plan_server.py) instead
+    sends it to a planning server: an object with open() and step(request) (network_open / network_steps over this
+    query, answered by the server in a batch with other queries'). Then the beams run on CPU tensors, ctx needs no
+    encoder, net only its cost, and the number of subsets encoded returned is 0. The plain planner only."""
     G = len(widths)
     qcost = net.cost is not None
     if qcost and (epinet is not None or robust is not None or start is not None):
         raise NotImplementedError("beam_plans with a QLever cost: no epinet, robust beams or start forest")
+    remote = network is not None
+    if remote and (epinet is not None or robust is not None or start is not None or trace_h is not None):
+        raise NotImplementedError("beam_plans over a planning server: the plain planner only")
+    plain = epinet is None and robust is None            # the step's network part: network_steps
     noises = list(noises) if noises is not None else [0.0] * G
     all_trees = list(all_trees) if all_trees is not None else [False] * G
     n = ctx.n
-    rq = ctx.rows([(1 << n) - 1])
-    rs = ctx.rows([1 << i for i in range(n)])
-    phi_q, lq = ctx.phi[rq], ctx.l[rq]
+    local = None if remote else PlanState(ctx)
+    rs, l_single, lq = network.open() if remote else network_open(net, [local])[0]
+    q_std = None if remote else local.q_std
     device = lq.device
-    q_std = net.standardise(phi_q)
     lq_g = lq.expand(G)
     if epinet is not None:
         indexes = indexes.to(device)
@@ -496,7 +688,7 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
     cm = bit.expand(G, n).clone()
     cr = (nb & ~bit).expand(G, n).clone()
     crow = rs.expand(G, n).clone()
-    cl = ctx.l[rs].expand(G, n).clone()
+    cl = l_single.expand(G, n).clone()
     cc = torch.full((G, n), NEG, device=device)
     so = torch.full((G,), NEG, device=device)
     if robust is not None:                               # per entry and world: l'', log subtree cost, cost so far
@@ -539,78 +731,81 @@ def beam_plans(net: ForestPlanner, ctx: QueryContext, widths, noises=None, all_t
         i, j = I[p], J[p]
         a, b = cm[e, i], cm[e, j]
         U = a | b
-        with ctx.step_timer():                           # the step's network part: encode, bound, value net
-            ru = ctx.rows(U)
-            phi_u, l_u = ctx.phi[ru], ctx.l[ru]
-            phi_std = net.standardise(phi_u)
-            gc = grp[e]
-            if epinet is not None:
-                l_u = l_u + epinet.card_shift(phi_std, indexes[gc])
-            size = _popcount(U, n) / n
-            fa, fb = _merge_fans(torch.cat([a, b]), torch.cat([b, a]), n, touch_s, touch_o, fan).split(len(a))
-            l2, _ = net.bound(l_u, cl[e, i], cl[e, j], fa, fb, phi_std, size)
-            c_u = l2
+        gc = grp[e]
+        C, kc = len(e), k - 1
+        size = _popcount(U, n) / n
+        fa, fb = _merge_fans(torch.cat([a, b]), torch.cat([b, a]), n, touch_s, touch_o, fan).split(len(a))
+        ar = torch.arange(k, **long)
+        old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
+        eo = e[:, None]
+        child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
+        child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
+        if qcost:
+            jv = cv[e, i] & cv[e, j]
+            child_v = torch.cat([cv[eo, old], (cv[e, i] | cv[e, j])[:, None]], 1)
+            child_s = torch.cat([cs[eo, old], jv[:, None]], 1)
+        if per_forest > 1:                               # symmetric in the two parts (int64 arithmetic wraps)
+            lo, hi = torch.minimum(ch[e, i], ch[e, j]), torch.maximum(ch[e, i], ch[e, j])
+            child_h = torch.cat([ch[eo, old], ((lo * 1000003) ^ (hi * 998244353) ^ (lo + hi))[:, None]], 1)
+        hv = None
+        if plain:                                        # network_steps: here, or on the planning server
+            req = {"U": U, "cl_a": cl[e, i], "cl_b": cl[e, j], "cc_a": cc[e, i], "cc_b": cc[e, j], "fa": fa, "fb": fb,
+                   "size": size, "kc": kc}
             if qcost:
-                jv = cv[e, i] & cv[e, j]
-                sort_a, sort_b = (cs[e, i] >= 0) & (cs[e, i] != jv), (cs[e, j] >= 0) & (cs[e, j] != jv)
-                lazy_a, lazy_b = ((a & (a - 1)) == 0) & (cl[e, i] >= lazy_l), ((b & (b - 1)) == 0) & (cl[e, j] >= lazy_l)
-                ra, rb = operand_reads(net, net.standardise(ctx.phi[crow[e, i]]), net.standardise(ctx.phi[crow[e, j]]),
-                                       cl[e, i], cl[e, j])
-                c_u = join_cost(net, l2, cl[e, i], cl[e, j], lazy_a, lazy_b, ra, rb, sort_a, sort_b)
-            cost_u = torch.logaddexp(c_u, torch.logaddexp(cc[e, i], cc[e, j]))
-            so_far = torch.logaddexp(so[e], c_u)
-            if robust is not None:
-                l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
-                Cn = len(e)
-                l2w, _ = net.bound(l_uw.reshape(-1), clw[e, i].reshape(-1), clw[e, j].reshape(-1),
-                                   fa.repeat_interleave(Kr, 0), fb.repeat_interleave(Kr, 0),
-                                   phi_std.repeat_interleave(Kr, 0), size.repeat_interleave(Kr))
-                l2w = l2w.view(Cn, Kr)
-                cost_uw = torch.logaddexp(l2w, torch.logaddexp(ccw[e, i], ccw[e, j]))
-                so_w = torch.logaddexp(sow[e], l2w)
-            C, kc = len(e), k - 1
-            ar = torch.arange(k, **long)
-            old = ((ar != i[:, None]) & (ar != j[:, None])).nonzero(as_tuple=True)[1].view(C, k - 2)
-            eo = e[:, None]
-            child_m = torch.cat([cm[eo, old], U[:, None]], 1)                       # the new component last
-            child_r = torch.cat([cr[eo, old], ((cr[e, i] | cr[e, j]) & ~U)[:, None]], 1)
-            if qcost:
-                child_v = torch.cat([cv[eo, old], (cv[e, i] | cv[e, j])[:, None]], 1)
-                child_s = torch.cat([cs[eo, old], jv[:, None]], 1)
-            if per_forest > 1:                           # symmetric in the two parts (int64 arithmetic wraps)
-                lo, hi = torch.minimum(ch[e, i], ch[e, j]), torch.maximum(ch[e, i], ch[e, j])
-                child_h = torch.cat([ch[eo, old], ((lo * 1000003) ^ (hi * 998244353) ^ (lo + hi))[:, None]], 1)
-            if kc == 1:
-                V = torch.full_like(l2, NEG)
-                hv = None
-                total = so_far.double()
-                if robust is not None:
-                    total_w = so_w.double()
-            else:
+                req.update(crow_a=crow[e, i], crow_b=crow[e, j],
+                           sort_a=(cs[e, i] >= 0) & (cs[e, i] != jv), sort_b=(cs[e, j] >= 0) & (cs[e, j] != jv),
+                           lazy_a=((a & (a - 1)) == 0) & (cl[e, i] >= lazy_l),
+                           lazy_b=((b & (b - 1)) == 0) & (cl[e, j] >= lazy_l))
+            if kc > 1:
                 sz_old = _popcount(cm[eo, old], n) / n
-                tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
-                tok_new = token_features(phi_std, l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
-                tokens = torch.cat([tok_old, tok_new[:, None]], 1)
-                adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
-                query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
-                shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
-                lq_v = lq_g[gc] + _log_weight(net.cost.out) if qcost else lq_g[gc]
-                V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_v,
-                                      torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
-                if qcost and kc == 2:                    # the cost of the final join of the two components
-                    rows2 = torch.cat([crow[eo, old], ru[:, None]], 1)
-                    l2c = torch.cat([cl[eo, old], l2[:, None]], 1)
-                    jq = child_v[:, 0] & child_v[:, 1]
-                    sq = (child_s >= 0) & (child_s != jq[:, None])
-                    lz = ((child_m & (child_m - 1)) == 0) & (l2c >= lazy_l)
-                    r0, r1 = operand_reads(net, net.standardise(ctx.phi[rows2[:, 0]]), net.standardise(ctx.phi[rows2[:, 1]]),
-                                           l2c[:, 0], l2c[:, 1])
-                    V = join_cost(net, lq_g[gc], l2c[:, 0], l2c[:, 1], lz[:, 0], lz[:, 1], r0, r1, sq[:, 0], sq[:, 1])
-                total = torch.logaddexp(so_far.double(), V.double())
+                req.update(crow_old=crow[eo, old], cl_old=cl[eo, old], cc_old=cc[eo, old], sz_old=sz_old,
+                           single_old=sz_old * n < 1.5, child_m=child_m, child_r=child_r)
+                if qcost and kc == 2:
+                    req.update(child_v=child_v, child_s=child_s)
+            with ctx.step_timer():                       # the step's network part: encode, bound, value net
+                res = network.step(req) if remote else network_steps(net, [(local, req)], hidden=trace_h is not None)[0]
+            ru, l2, c_u, cost_u, V = res["ru"], res["l2"], res["c_u"], res["cost_u"], res["V"]
+            hv = res.get("hv")
+            so_far = torch.logaddexp(so[e], c_u)
+            total = so_far.double() if kc == 1 else torch.logaddexp(so_far.double(), V.double())
+        else:                                            # Thompson indexes or robust beams (C_out, here)
+            with ctx.step_timer():
+                ru = ctx.rows(U)
+                phi_u, l_u = ctx.phi[ru], ctx.l[ru]
+                phi_std = net.standardise(phi_u)
+                if epinet is not None:
+                    l_u = l_u + epinet.card_shift(phi_std, indexes[gc])
+                l2, _ = net.bound(l_u, cl[e, i], cl[e, j], fa, fb, phi_std, size)
+                cost_u = torch.logaddexp(l2, torch.logaddexp(cc[e, i], cc[e, j]))
+                so_far = torch.logaddexp(so[e], l2)
                 if robust is not None:
-                    Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
-                        lq_r.expand(C, Kr), W[:, None] + r_epi.scale_value * r_epi.value_samples(hv, Zr).T)
-                    total_w = torch.logaddexp(so_w.double(), Vw.double())
+                    l_uw = l_u[:, None] + r_epi.scale_card * r_epi.card_samples(phi_std, Zr).T            # [C, K]
+                    l2w, _ = net.bound(l_uw.reshape(-1), clw[e, i].reshape(-1), clw[e, j].reshape(-1),
+                                       fa.repeat_interleave(Kr, 0), fb.repeat_interleave(Kr, 0),
+                                       phi_std.repeat_interleave(Kr, 0), size.repeat_interleave(Kr))
+                    l2w = l2w.view(C, Kr)
+                    cost_uw = torch.logaddexp(l2w, torch.logaddexp(ccw[e, i], ccw[e, j]))
+                    so_w = torch.logaddexp(sow[e], l2w)
+                if kc == 1:
+                    V = torch.full_like(l2, NEG)
+                    total = so_far.double()
+                    if robust is not None:
+                        total_w = so_w.double()
+                else:
+                    sz_old = _popcount(cm[eo, old], n) / n
+                    tok_old = token_features(net.standardise(ctx.phi[crow[eo, old]]), cl[eo, old], cc[eo, old], sz_old * n < 1.5, sz_old)
+                    tok_new = token_features(phi_std, l2, cost_u, torch.zeros_like(l2, dtype=torch.bool), size)
+                    tokens = torch.cat([tok_old, tok_new[:, None]], 1)
+                    adj = (child_r[:, :, None] & child_m[:, None, :]) != 0
+                    query = torch.cat([q_std.expand(C, -1), (lq_g[gc] / 10)[:, None], torch.full((C, 1), kc / n, device=device)], 1)
+                    shift = (lambda h: epinet.value_shift(h, indexes[gc])) if epinet is not None else None
+                    V, W, hv = net.values(tokens, torch.zeros(C, kc, dtype=torch.bool, device=device), adj, query, lq_g[gc],
+                                          torch.full((C,), kc, **long), w_shift=shift, return_hidden=True)
+                    total = torch.logaddexp(so_far.double(), V.double())
+                    if robust is not None:
+                        Vw = lq_r.expand(C, Kr) if kc == 2 else torch.logaddexp(
+                            lq_r.expand(C, Kr), W[:, None] + r_epi.scale_value * r_epi.value_samples(hv, Zr).T)
+                        total_w = torch.logaddexp(so_w.double(), Vw.double())
         if robust is not None:                           # rank by the statistic over the worlds
             total = total_w.mean(1) if stat == "mean" else torch.quantile(total_w, 0.9, dim=1)
         if trace is not None:

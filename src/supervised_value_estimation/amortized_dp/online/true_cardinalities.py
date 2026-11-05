@@ -152,6 +152,52 @@ class CountStream:
         return self.results
 
 
+def _count_process(endpoints, timeout_s, tasks, results):
+    while tasks.get() == "begin":
+        stream = CountStream(endpoints, timeout_s)
+        while (batch := tasks.get()) is not None:
+            stream.add(batch)
+        results.put((stream.finish(), stream.seconds))
+
+
+class CountProcess:
+    """CountStream in a child process, kept for the whole run: its endpoint threads no longer share the planning
+    process's interpreter lock (work_2026-11-04/count_contention.py: planning 27% slower next to them). Per round
+    begin() -> this, with CountStream's add(tasks), finish() -> {key: rows or None} and seconds (from begin to the
+    last result)."""
+
+    def __init__(self, endpoints, timeout_s):
+        import multiprocessing as mp
+        context = mp.get_context("spawn")
+        self.tasks, self.results = context.Queue(), context.Queue()
+        self.proc = context.Process(target=_count_process, args=(list(endpoints), timeout_s, self.tasks, self.results),
+                                    daemon=True)
+        self.proc.start()
+        self.seconds = 0.0
+
+    def begin(self):
+        self.tasks.put("begin")
+        return self
+
+    def add(self, tasks):
+        if tasks:
+            self.tasks.put(list(tasks))
+
+    def finish(self):
+        self.tasks.put(None)
+        while True:
+            try:
+                results, self.seconds = self.results.get(timeout=60)
+                return results
+            except queue.Empty:
+                if not self.proc.is_alive():
+                    raise RuntimeError(f"the count process died (exit code {self.proc.exitcode})")
+
+    def close(self):
+        self.tasks.put("stop")
+        self.proc.join(timeout=30)
+
+
 def load_or_count(path, queries, endpoints, timeout_s):
     """queries: {query string: (triple patterns, connected subset masks)} ->
     {query string: {mask: rows or None}}, counting only what the cache at `path` lacks."""
