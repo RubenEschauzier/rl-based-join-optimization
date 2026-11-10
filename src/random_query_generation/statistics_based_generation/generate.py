@@ -44,6 +44,8 @@ from src.random_query_generation.statistics_based_generation.statistics import l
 
 # Set in the parent before the worker pool forks, so workers share them copy-on-write.
 _STATE = {}
+# how often (seconds) the parent checks for jobs whose worker was killed
+LOST_CHECK_S = 30
 
 
 def _endpoints(settings):
@@ -139,9 +141,20 @@ def _canonical(patterns):
     return " . ".join(sorted(patterns))
 
 
-def _timed_candidate(job):
+def _timed_candidate(job, slot=None):
+    if slot is not None:            # which worker runs the job, so the parent sees if it gets killed
+        _STATE["started"][slot] = os.getpid()
     start = time.perf_counter()
     return _make_candidate(job), time.perf_counter() - start
+
+
+def _is_dead(pid):
+    """A pool worker that is gone or a zombie (killed, e.g. by the OOM killer, and not yet reaped)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return True
 
 
 def _job_keys(cells):
@@ -238,6 +251,13 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     final_timeout = float(gen.final_count.timeout_s)
     submitted, outstanding = Counter(), Counter()     # per job key; outstanding = not yet resolved
     status = {"submitted": 0, "finished": 0, "in_pool": 0, "at_qlever": 0, "busy": 0.0}
+    # A worker killed mid-job (e.g. by the OOM killer) never returns its job, and the pool does not
+    # tell: every job in flight has a slot, its worker writes its pid there when it starts, and a
+    # job whose worker is dead is resolved as lost (else the shape would wait for it forever).
+    started = _STATE.get("started")
+    free_slots = list(range(len(started))) if started is not None else []
+    in_flight = {}                                    # slot -> (job key, job number)
+    last_check = time.perf_counter()
     start = time.perf_counter()
 
     def draw_weights():
@@ -260,10 +280,39 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         outstanding[key] += 1
         status["submitted"] += 1
         status["in_pool"] += 1
-        pool.apply_async(_timed_candidate, ((kind, *key, next(seed_counter)),),
-                         callback=lambda result, key=key: events.put(("made", key, *result)),
+        slot = free_slots.pop() if free_slots else None
+        job = status["submitted"]
+        if slot is not None:
+            started[slot] = 0
+            in_flight[slot] = (key, job)
+        pool.apply_async(_timed_candidate, ((kind, *key, next(seed_counter)), slot),
+                         callback=lambda result, key=key, slot=slot, job=job: events.put(("made", key, *result, slot, job)),
                          error_callback=lambda error: events.put(("error", error)))
         return True
+
+    def release(slot, job):
+        """Free a job's slot; False if the job was already resolved as lost."""
+        if slot is None:
+            return True
+        if in_flight.get(slot, (None, None))[1] != job:
+            return False
+        del in_flight[slot]
+        free_slots.append(slot)
+        return True
+
+    def lost_jobs():
+        """Resolve the jobs whose worker died; returns how many."""
+        lost = [(slot, key) for slot, (key, _) in in_flight.items() if started[slot] and _is_dead(started[slot])]
+        for slot, key in lost:
+            del in_flight[slot]
+            free_slots.append(slot)
+            status["in_pool"] -= 1
+            status["finished"] += 1
+            outstanding[key] -= 1
+            reasons["worker_killed"] += 1
+        if lost:
+            print(f"[{kind}] {len(lost)} job(s) lost: their worker was killed (out of memory?)", flush=True)
+        return len(lost)
 
     def cell_of(c):
         return c["n_patterns"], c["choke_point"], c["hard_zero"], c["spread_class"]
@@ -316,12 +365,23 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     while status["in_pool"] < in_pool_limit and submit():
         pass
     while status["in_pool"] or status["at_qlever"]:
-        event = events.get()
+        if started is not None and time.perf_counter() - last_check > LOST_CHECK_S:
+            last_check = time.perf_counter()
+            if lost_jobs():
+                while status["in_pool"] < in_pool_limit and submit():
+                    pass
+                continue
+        try:
+            event = events.get(timeout=LOST_CHECK_S)
+        except queue.Empty:
+            continue
         if event[0] == "error":
             counter.close()
             raise event[1]
         if event[0] == "made":
-            _, key, c, seconds = event
+            _, key, c, seconds, slot, job = event
+            if not release(slot, job):
+                continue                  # already resolved as lost (cannot normally happen)
             status["in_pool"] -= 1
             status["finished"] += 1
             status["busy"] += seconds
@@ -425,6 +485,8 @@ def main(cfg: DictConfig):
     seed_counter = iter(range(int(gen.seed) * 10_000_000, 10 ** 12))
     summaries = {}
     context = multiprocessing.get_context("fork")
+    # one slot per job in flight (2 per worker, see in_pool_limit), shared with the workers
+    _STATE["started"] = context.RawArray("q", 2 * int(gen.workers))
     with context.Pool(int(gen.workers)) as pool:
         for kind in gen.shapes:
             summary, written = _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory)

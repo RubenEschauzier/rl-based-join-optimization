@@ -24,6 +24,8 @@ import copy
 
 import numpy as np
 
+from src.random_query_generation.statistics_based_generation.counting import PredicateIndex
+
 
 class HardZeroMaker:
     def __init__(self, graph, statistics, max_pattern_matches, anticorrelation_gamma=1.0, counter=None,
@@ -33,13 +35,12 @@ class HardZeroMaker:
         self.counter = counter          # counting.AcyclicCounter: pair checks before a swap is kept
         self.max_pattern_matches = max_pattern_matches
         self.gamma = anticorrelation_gamma
-        # every triple, grouped by predicate, to sample a predicate's subjects / objects
-        subjects = np.repeat(np.arange(graph.n_entities, dtype=np.int32), np.diff(graph.out_ptr))
-        order = np.argsort(graph.out_p, kind="stable")
-        self.by_predicate_subject = subjects[order]
-        self.by_predicate_object = graph.out_o[order]
-        self.predicate_ptr = np.zeros(graph.n_predicates + 1, dtype=np.int64)
-        np.cumsum(np.bincount(graph.out_p, minlength=graph.n_predicates), out=self.predicate_ptr[1:])
+        # every triple, grouped by predicate, to sample a predicate's subjects / objects: the
+        # counter's index when there is one (not a second copy of every triple)
+        index = counter.index if counter is not None else PredicateIndex(graph)
+        self.by_predicate_subject = index.subjects
+        self.by_predicate_object = index.objects
+        self.predicate_ptr = index.ptr
 
     def _incident(self, instance, node):
         return [(i, int(instance.predicates[i]), instance.oriented[i][0] == node)

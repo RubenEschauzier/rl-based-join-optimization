@@ -20,20 +20,42 @@ import numpy as np
 
 
 class PredicateIndex:
-    """All triples grouped by predicate, with per-predicate subject/object groupings."""
+    """All triples grouped by predicate, twice: per predicate sorted by subject (subjects, objects)
+    and sorted by object (objects_by_object, subjects_by_object). The graph's CSR indexes are
+    sorted by entity first, so a stable sort on the predicate keeps each predicate's triples in
+    entity order. Either side of a predicate is then a sorted array: the edges of any set of
+    entities are a few binary searches away."""
 
     def __init__(self, graph):
         self.graph = graph
-        subjects = np.repeat(np.arange(graph.n_entities, dtype=np.int32), np.diff(graph.out_ptr))
-        order = np.argsort(graph.out_p, kind="stable")
-        self.subjects = subjects[order]
-        self.objects = graph.out_o[order]
         self.ptr = np.zeros(graph.n_predicates + 1, dtype=np.int64)
         np.cumsum(np.bincount(graph.out_p, minlength=graph.n_predicates), out=self.ptr[1:])
+        order = np.argsort(graph.out_p, kind="stable")
+        self.subjects = np.repeat(np.arange(graph.n_entities, dtype=np.int32), np.diff(graph.out_ptr))[order]
+        self.objects = graph.out_o[order]
+        order = np.argsort(graph.in_p, kind="stable")
+        self.objects_by_object = np.repeat(np.arange(graph.n_entities, dtype=np.int32), np.diff(graph.in_ptr))[order]
+        self.subjects_by_object = graph.in_s[order]
+        # distinct subjects / objects per predicate (a push's expected edges: entities x triples / distinct)
+        self.distinct = {}
+        for by_subject, keys in ((True, self.subjects), (False, self.objects_by_object)):
+            first = np.ones(len(keys), dtype=bool)
+            first[1:] = keys[1:] != keys[:-1]
+            first[self.ptr[:-1][self.ptr[:-1] < len(keys)]] = True       # each predicate starts anew
+            self.distinct[by_subject] = np.add.reduceat(first, self.ptr[:-1]) if len(keys) else np.zeros(0, int)
 
     def triples(self, predicate):
+        """(subjects, objects) of a predicate, sorted by subject."""
         a, b = self.ptr[predicate], self.ptr[predicate + 1]
         return self.subjects[a:b], self.objects[a:b]
+
+    def sorted_by(self, predicate, by_subject):
+        """(keys, others) of a predicate's triples sorted by keys: (subjects, objects) when
+        by_subject, else (objects, subjects)."""
+        a, b = self.ptr[predicate], self.ptr[predicate + 1]
+        if by_subject:
+            return self.subjects[a:b], self.objects[a:b]
+        return self.objects_by_object[a:b], self.subjects_by_object[a:b]
 
 
 class _Message:
@@ -86,9 +108,12 @@ class AcyclicCounter:
     """Counts of connected sub-BGPs of one query, given as patterns
     (subject term, predicate, object term) with a term ("v", node) or ("c", entity)."""
 
-    def __init__(self, graph, predicate_index, small_support=2048, cache_entries=200_000, cache_ids=20_000_000):
+    def __init__(self, graph, predicate_index, full_pass_share=0.5, cache_entries=200_000, cache_ids=20_000_000):
         self.graph, self.index = graph, predicate_index
-        self.small_support = small_support
+        # A push gathers the edges of the message's entities unless they are more than this share
+        # of the predicate's triples; then one pass over all of them is cheaper.
+        self.full_pass_share = full_pass_share
+        self._dense = None              # scratch vector over the entities for full passes (per process)
         # Messages of unconstrained leaves are the same in every query: the per-predicate
         # degree vectors, cached for the whole run. Messages of subtrees are cached per query.
         self._degree_cache = {}
@@ -132,29 +157,38 @@ class AcyclicCounter:
     def _push(self, message, predicate, child_is_object):
         """sum over the child's entities e' of message(e') * [triple between e and e'] -> parent e.
         child_is_object: the child variable is the pattern's object (the parent its subject)."""
-        if message is not None and len(message.ids) <= self.small_support:
-            # few child entities: gather their own edges with this predicate
-            parents, weights = [], []
-            for entity, value in zip(message.ids, message.values):
-                found = (self.graph.subjects_of(int(entity), predicate) if child_is_object
-                         else self.graph.objects_of(int(entity), predicate))
-                parents.append(found)
-                weights.append(np.full(len(found), value))
-            if not parents:
-                return _Message(np.empty(0, np.int64), np.empty(0))
-            return _sum_by(np.concatenate(parents).astype(np.int64), np.concatenate(weights))
-        if message is None and (predicate, child_is_object) in self._degree_cache:
-            return self._degree_cache[(predicate, child_is_object)]
-        subjects, objects = self.index.triples(predicate)
-        child, parent = (objects, subjects) if child_is_object else (subjects, objects)
-        n = self.graph.n_entities
         if message is None:
-            result = _sum_by(parent, np.ones(len(child)), n)
-            self._degree_cache[(predicate, child_is_object)] = result
-            return result
-        weights = message.lookup(child, n)
+            key = (predicate, child_is_object)
+            if key not in self._degree_cache:
+                subjects, objects = self.index.triples(predicate)
+                parent = subjects if child_is_object else objects
+                self._degree_cache[key] = _sum_by(parent, np.ones(len(parent)), self.graph.n_entities)
+            return self._degree_cache[key]
+        keys, parents = self.index.sorted_by(predicate, by_subject=not child_is_object)
+        if len(message.ids) == 0 or len(keys) == 0:
+            return _Message(np.empty(0, np.int64), np.empty(0))
+        n = self.graph.n_entities
+        # many entities (by the predicate's average degree): a full pass, without binary searches
+        distinct = int(self.index.distinct[not child_is_object][predicate])
+        gather = len(message.ids) <= self.full_pass_share * distinct
+        if gather:
+            ids = message.ids.astype(keys.dtype)       # same dtype: no cast of the (large) keys array
+            lo, hi = np.searchsorted(keys, ids, "left"), np.searchsorted(keys, ids, "right")
+            lengths = hi - lo
+            edges = int(lengths.sum())
+            gather = edges <= self.full_pass_share * len(keys)
+        if gather:
+            # gather the child entities' own edges: positions lo..hi-1 of every entity, flattened
+            starts = np.repeat(lo - np.cumsum(lengths) + lengths, lengths)
+            positions = np.arange(edges, dtype=np.int64) + starts
+            return _sum_by(parents[positions].astype(np.int64), np.repeat(message.values, lengths), n)
+        if self._dense is None:
+            self._dense = np.zeros(n)
+        self._dense[message.ids] = message.values
+        weights = self._dense[keys]
+        self._dense[message.ids] = 0.0
         keep = weights != 0
-        return _sum_by(parent[keep], weights[keep], n)
+        return _sum_by(parents[keep], weights[keep], n)
 
     def count(self, patterns, subset):
         """Exact number of solutions of the connected, acyclic sub-BGP `subset`."""
@@ -267,8 +301,10 @@ class ExactCounter(AcyclicCounter):
     def _entities_with(self, predicate, as_subject):
         key = (predicate, as_subject)
         if key not in self._predicate_entities:
-            subjects, objects = self.index.triples(predicate)
-            self._predicate_entities[key] = np.unique((subjects if as_subject else objects).astype(np.int64))
+            keys, _ = self.index.sorted_by(predicate, by_subject=as_subject)
+            first = np.ones(len(keys), dtype=bool)                  # keys are sorted: no np.unique
+            first[1:] = keys[1:] != keys[:-1]
+            self._predicate_entities[key] = keys[first].astype(np.int64)
         return self._predicate_entities[key]
 
     def _domain(self, patterns, subset, variable):

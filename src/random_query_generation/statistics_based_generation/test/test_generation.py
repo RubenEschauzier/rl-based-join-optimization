@@ -216,8 +216,8 @@ def test_acyclic_counts_equal_brute_force():
     graph = DataGraph.from_arrays(s, p, o)
     p_ids = np.searchsorted(graph.predicate_iris, p)
     triples = list(zip(s.tolist(), p_ids.tolist(), o.tolist()))
-    for small_support in (0, 10_000):                    # both the gather and the scan path
-        counter = AcyclicCounter(graph, PredicateIndex(graph), small_support=small_support)
+    for full_pass_share in (0.0, 2.0):                    # both the full-pass and the gather path
+        counter = AcyclicCounter(graph, PredicateIndex(graph), full_pass_share=full_pass_share)
         rng = np.random.default_rng(4)
         for _ in range(25):
             # random tree-shaped query over 3-4 variables, sometimes with constants
@@ -411,3 +411,43 @@ def test_big_patterns_fit_the_row_quota(data):
             assert sum(over) <= quota
             with_big += bool(over)
     assert with_big >= 1
+
+
+def test_predicate_index_is_sorted_both_ways(data):
+    from src.random_query_generation.statistics_based_generation.counting import PredicateIndex
+    graph, _, (s, p, o) = data
+    index = PredicateIndex(graph)
+    p_ids = np.searchsorted(graph.predicate_iris, p)
+    for predicate in range(graph.n_predicates):
+        expected = sorted((a, b) for a, q, b in zip(s.tolist(), p_ids.tolist(), o.tolist()) if q == predicate)
+        subjects, objects = index.sorted_by(predicate, by_subject=True)
+        assert list(zip(subjects.tolist(), objects.tolist())) == expected
+        keys, others = index.sorted_by(predicate, by_subject=False)
+        assert list(zip(keys.tolist(), others.tolist())) == sorted((b, a) for a, b in expected)
+
+
+def _killing_candidate(job):
+    """Stand-in for _make_candidate: no candidate, and the worker dies on one job (as if OOM-killed)."""
+    import os
+    if job[-1] == 3:
+        os._exit(1)
+    return None
+
+
+def test_a_killed_worker_costs_one_job_not_the_shape(tmp_path, monkeypatch):
+    import multiprocessing
+    from collections import Counter as C
+    from src.random_query_generation.statistics_based_generation import generate as G
+    monkeypatch.setattr(G, "_make_candidate", _killing_candidate)
+    monkeypatch.setattr(G, "LOST_CHECK_S", 0.2)
+    gen = OmegaConf.create({
+        "mode": "pilot", "sizes": [4], "zero_share": 0.0, "spread_strata": None, "workers": 2,
+        "pilot": {"candidates_per_shape": 12}, "hard_zero": {"base_choke_points": ["random"], "max_empty_pairs": 1},
+        "acceptance": {"max_candidate_factor": 10}, "progress_every": 1000,
+        "certificate": {"timeout_s": 1}, "final_count": {"timeout_s": 1}})
+    monkeypatch.setitem(G._STATE, "choke_points", {"random": (None, 1.0)})
+    context = multiprocessing.get_context("fork")
+    monkeypatch.setitem(G._STATE, "started", context.RawArray("q", 4))
+    with context.Pool(2) as pool:
+        summary, _ = G._run_shape("star", gen, [], pool, np.random.default_rng(0), iter(range(10 ** 6)), tmp_path)
+    assert (tmp_path / "pilot_star.jsonl").exists()        # the shape finished despite the lost job
