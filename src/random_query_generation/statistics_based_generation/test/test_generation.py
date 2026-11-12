@@ -451,3 +451,114 @@ def test_a_killed_worker_costs_one_job_not_the_shape(tmp_path, monkeypatch):
     with context.Pool(2) as pool:
         summary, _ = G._run_shape("star", gen, [], pool, np.random.default_rng(0), iter(range(10 ** 6)), tmp_path)
     assert (tmp_path / "pilot_star.jsonl").exists()        # the shape finished despite the lost job
+
+
+def test_estimate_is_the_independence_formula():
+    from src.random_query_generation.statistics_based_generation.estimation import Estimator
+    est = Estimator(distinct_subjects=[10, 4], distinct_objects=[5, 8])
+    # ?a p0 ?x . ?x p1 ?b : x is p0's object (5 distinct) and p1's subject (4 distinct)
+    patterns = [(("v", 0), 0, ("v", 1)), (("v", 1), 1, ("v", 2))]
+    sizes = [20, 12]
+    assert est.cardinality(patterns, sizes, [0]) == 20                              # one pattern: exact
+    assert est.cardinality(patterns, sizes, [0, 1]) == pytest.approx(20 * 12 * 4 / (5 * 4))
+    # a constant next to x: x's distinct values are the pattern's size
+    patterns = [(("c", 7), 0, ("v", 1)), (("v", 1), 1, ("v", 2))]
+    assert est.cardinality(patterns, [3, 12], [0, 1]) == pytest.approx(3 * 12 * 3 / (3 * 4))
+    cert = est.certificate(patterns, [3, 12], [[0, 1], [1, 0]])
+    assert cert["scan_rows"] == 15 and cert["best_plan_work"] == 15 + cert["min_cost"]
+
+
+def test_pair_checker_agrees_with_the_exact_counter(data):
+    from src.random_query_generation.statistics_based_generation.counting import AcyclicCounter, PredicateIndex
+    from src.random_query_generation.statistics_based_generation.estimation import PairChecker
+    graph, statistics, (s, p, o) = data
+    counter = AcyclicCounter(graph, PredicateIndex(graph))
+    checker = PairChecker(graph, statistics)
+    rng = np.random.default_rng(5)
+    entities = np.unique(np.concatenate([s, o]))
+    seen = {True: 0, False: 0}
+    for _ in range(400):
+        p1, p2 = (int(x) for x in rng.integers(0, graph.n_predicates, 2))
+        x_subject_1, x_subject_2 = bool(rng.random() < 0.5), bool(rng.random() < 0.5)
+        ends = []
+        for k in range(2):
+            ends.append(("c", int(rng.choice(entities))) if rng.random() < 0.5
+                        else ("v", 10 + k))
+        x = ("v", 0)
+        first = (x, p1, ends[0]) if x_subject_1 else (ends[0], p1, x)
+        second = (x, p2, ends[1]) if x_subject_2 else (ends[1], p2, x)
+        patterns = [first, second]
+        exact = counter.count(patterns, [0, 1])
+        value = checker.count(patterns, (0, 1))
+        assert (value > 0) == (exact > 0), (patterns, value, exact)
+        seen[exact > 0] += 1
+    assert seen[True] > 20 and seen[False] > 20                    # both outcomes were tested
+
+
+def test_predicate_pools_match_the_index(data):
+    from src.random_query_generation.statistics_based_generation.counting import PredicateIndex
+    from src.random_query_generation.statistics_based_generation.estimation import predicate_pools
+    graph, _, _ = data
+    index = PredicateIndex(graph)
+    ptr, subjects, objects = predicate_pools(graph)
+    assert np.array_equal(ptr, index.ptr)
+    for q in range(graph.n_predicates):
+        a, b = ptr[q], ptr[q + 1]
+        assert sorted(zip(subjects[a:b].tolist(), objects[a:b].tolist())) == \
+            sorted(zip(index.subjects[a:b].tolist(), index.objects[a:b].tolist()))
+
+
+def _fake_qlever(fail_on_memory):
+    """A local HTTP server answering COUNT queries like QLever: 500 "Tried to allocate" for a query
+    containing BIG if `fail_on_memory`, else the count 7."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            query = self.rfile.read(int(self.headers["Content-Length"])).decode()
+            if fail_on_memory and "BIG" in query:
+                status, body = 500, {"exception": "Tried to allocate 800 kB, but only 1 kB were available"}
+            else:
+                status, body = 200, {"results": {"bindings": [{"count": {"value": "7"}}]}}
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+@pytest.mark.parametrize("with_big_lane", [True, False])
+def test_memory_failures_are_retried_in_the_big_lane(with_big_lane):
+    import queue
+    from src.random_query_generation.statistics_based_generation.certificate import BackgroundCounter
+    small, small_url = _fake_qlever(fail_on_memory=True)
+    big, big_url = _fake_qlever(fail_on_memory=False)
+    done = queue.Queue()
+    counter = BackgroundCounter([small_url], done, [big_url] if with_big_lane else [])
+    candidates = [{"name": i} for i in range(20)]
+    for i, c in enumerate(candidates):
+        query = "SELECT (COUNT(*) AS ?count) WHERE { BIG }" if i % 2 else "SELECT (COUNT(*) AS ?count) WHERE { }"
+        counter.submit(c, [("result", query, 5)], "final")
+    results = {c["name"]: counts["result"] for _, c, counts in (done.get(timeout=10) for _ in candidates)}
+    counter.close()
+    small.shutdown()
+    big.shutdown()
+    assert counter.pending == 0
+    for i, c in enumerate(candidates):
+        if i % 2 and not with_big_lane:
+            assert results[i] is None and c["count_log"]["result"]["error"] == "memory"
+        else:
+            assert results[i] == 7 and c["count_log"]["result"]["error"] is None
+    if with_big_lane:
+        # the big lane also takes small-lane work when it has no retries, so some heavy counts go there directly
+        assert counter.escalated == counter.escalated_ok <= 10
+        assert all(candidates[i]["count_log"]["result"]["lane"] == "big" for i in range(1, 20, 2))

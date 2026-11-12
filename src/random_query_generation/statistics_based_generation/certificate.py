@@ -45,7 +45,7 @@ import requests
 
 from src.random_query_generation.statistics_based_generation.graph import pattern_terms
 from src.supervised_value_estimation.amortized_dp.labels import mask_of
-from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_on_endpoint, count_query
+from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_query
 
 
 def pattern_adjacency(triple_patterns):
@@ -232,19 +232,62 @@ def final_count_task(candidate, timeout_s):
     return [("result", count_query(candidate["triple_patterns"], full), timeout_s)]
 
 
+def count_with_reason(session, endpoint, query, timeout_s):
+    """(rows, None) or (None, why): QLever answers a timeout with HTTP 429 "Operation timed out" and a query
+    over its memory limit with HTTP 500 "Tried to allocate ...". Why is timeout / memory / client_timeout /
+    connection / http_<status> / bad_reply."""
+    try:
+        response = session.post(endpoint, params={"timeout": f"{int(timeout_s)}s"}, data=query,
+                                headers={"Accept": "application/sparql-results+json",
+                                         "Content-Type": "application/sparql-query"},
+                                timeout=timeout_s + 30)
+    except requests.Timeout:
+        return None, "client_timeout"
+    except requests.RequestException:
+        return None, "connection"
+    if response.status_code != 200:
+        text = response.text[:2000]
+        if response.status_code == 429 or "timed out" in text:
+            return None, "timeout"
+        if "allocate" in text:
+            return None, "memory"
+        return None, f"http_{response.status_code}"
+    try:
+        bindings = response.json().get("results", {}).get("bindings", [])
+        return (int(bindings[0]["count"]["value"]) if bindings else 0), None
+    except (ValueError, KeyError, IndexError):
+        return None, "bad_reply"
+
+
 class BackgroundCounter:
     """COUNTs on QLever in background threads while the workers keep generating: one thread per
     endpoint with one request in flight, so each single-core instance runs one count at a time.
     `submit(candidate, tasks, tag)` counts tasks [(key, sparql, timeout_s)]; when all are done
     the candidate is put on `done` as (tag, candidate, {key: rows or None}), None for a count
-    that failed or timed out."""
+    that failed or timed out. Each count's seconds, failure reason and lane go in the candidate's
+    "count_log" {key: {"seconds", "error", "lane"}} (seconds summed over both lanes).
 
-    def __init__(self, endpoints, done):
+    Two lanes (deploy_isolated_qlever_instances.py, QLEVER_BIG_MEMORY_MB): `endpoints` are instances
+    with a small memory limit, `big_endpoints` instances with a large one. A count that fails on
+    memory in the small lane is retried in the big lane instead of being lost: the queries whose
+    intermediate results do not fit are the hard ones, and dropping them would bias the workload. The
+    instances' limits add up to less than the node's RAM, so no mix of queries can exhaust it. A big
+    lane thread takes retries first and helps with the small lane's queue when it has none."""
+
+    POLL_S = 0.05
+
+    def __init__(self, endpoints, done, big_endpoints=()):
         self.done = done
-        self.work, self.lock = queue.Queue(), threading.Lock()
+        self.work, self.retry, self.lock = queue.Queue(), queue.Queue(), threading.Lock()
         self.pending, self.counted, self.seconds = 0, 0, 0.0
-        self.threads = [threading.Thread(target=self._worker, args=(endpoint,), daemon=True)
-                        for endpoint in dict.fromkeys(endpoints)]
+        self.escalated, self.escalated_ok = 0, 0
+        self.stopping = threading.Event()
+        big = list(dict.fromkeys(big_endpoints))
+        small = [e for e in dict.fromkeys(endpoints) if e not in big]
+        self.has_big_lane = bool(big)
+        self.threads = ([threading.Thread(target=self._worker, args=(e,), daemon=True) for e in small]
+                        + [threading.Thread(target=self._big_worker, args=(e,), daemon=True) for e in big])
+        self.n_small = len(small)
         for thread in self.threads:
             thread.start()
 
@@ -255,28 +298,58 @@ class BackgroundCounter:
         for key, query, timeout_s in tasks:
             self.work.put((state, key, query, timeout_s))
 
+    def _run(self, session, endpoint, item, lane):
+        state, key, query, timeout_s = item
+        start = time.perf_counter()
+        value, error = count_with_reason(session, endpoint, query, timeout_s)
+        seconds = time.perf_counter() - start
+        escalate = error == "memory" and lane == "small" and self.has_big_lane
+        with self.lock:
+            self.counted += 1
+            self.seconds += seconds
+            log = state["candidate"].setdefault("count_log", {})
+            previous = log.get(key, {}).get("seconds", 0.0)
+            log[key] = {"seconds": round(previous + seconds, 3), "error": error, "lane": lane}
+            if lane == "big" and key in state.setdefault("escalated", set()):
+                self.escalated_ok += value is not None
+            if escalate:
+                self.escalated += 1
+                state.setdefault("escalated", set()).add(key)
+            else:
+                self.pending -= 1
+                state["counts"][key] = value
+                state["left"] -= 1
+            finished = state["left"] == 0
+        if escalate:
+            self.retry.put(item)
+        elif finished:
+            self.done.put((state["tag"], state["candidate"], state["counts"]))
+
     def _worker(self, endpoint):
         session = requests.Session()
         while True:
             item = self.work.get()
             if item is None:
                 return
-            state, key, query, timeout_s = item
-            start = time.perf_counter()
+            self._run(session, endpoint, item, "small")
+
+    def _big_worker(self, endpoint):
+        session = requests.Session()
+        while not self.stopping.is_set():
             try:
-                value = count_on_endpoint(session, endpoint, query, timeout_s)
-            except (requests.RequestException, ValueError, KeyError):
-                value = None
-            with self.lock:
-                self.pending -= 1
-                self.counted += 1
-                self.seconds += time.perf_counter() - start
-                state["counts"][key] = value
-                state["left"] -= 1
-                finished = state["left"] == 0
-            if finished:
-                self.done.put((state["tag"], state["candidate"], state["counts"]))
+                item = self.retry.get_nowait()
+            except queue.Empty:
+                try:
+                    item = self.work.get(timeout=self.POLL_S)
+                except queue.Empty:
+                    continue
+                if item is None:             # a small thread's stop signal: leave it for them
+                    self.work.put(None)
+                    time.sleep(self.POLL_S)
+                    continue
+            self._run(session, endpoint, item, "big")
 
     def close(self):
-        for _ in self.threads:
+        self.stopping.set()
+        for _ in range(self.n_small):
             self.work.put(None)

@@ -115,3 +115,7 @@ generation:
     ports_per_host: 4
     base_port: 7000
     endpoints: []
+    # the last `big_lane_ports` ports of each host are its big lane: instances with a large memory limit
+    # (deploy_isolated_qlever_instances.py, QLEVER_BIG_MEMORY_MB) that retry counts the others could not fit
+    big_lane_ports: 0
+    big_endpoints: []                # with explicit `endpoints`

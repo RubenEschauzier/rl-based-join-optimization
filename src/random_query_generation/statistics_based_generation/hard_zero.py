@@ -29,18 +29,19 @@ from src.random_query_generation.statistics_based_generation.counting import Pre
 
 class HardZeroMaker:
     def __init__(self, graph, statistics, max_pattern_matches, anticorrelation_gamma=1.0, counter=None,
-                 max_empty_pairs=0):
+                 max_empty_pairs=0, pools=None):
         self.graph, self.statistics = graph, statistics
         self.max_empty_pairs = max_empty_pairs
         self.counter = counter          # counting.AcyclicCounter: pair checks before a swap is kept
         self.max_pattern_matches = max_pattern_matches
         self.gamma = anticorrelation_gamma
-        # every triple, grouped by predicate, to sample a predicate's subjects / objects: the
-        # counter's index when there is one (not a second copy of every triple)
-        index = counter.index if counter is not None else PredicateIndex(graph)
-        self.by_predicate_subject = index.subjects
-        self.by_predicate_object = index.objects
-        self.predicate_ptr = index.ptr
+        # every triple, grouped by predicate, to sample a predicate's subjects / objects: `pools`
+        # (estimation.predicate_pools: ptr, subjects, objects) if given, else the counter's index when there
+        # is one (not a second copy of every triple)
+        if pools is None:
+            index = getattr(counter, "index", None) or PredicateIndex(graph)
+            pools = index.ptr, index.subjects, index.objects
+        self.predicate_ptr, self.by_predicate_subject, self.by_predicate_object = pools
 
     def _incident(self, instance, node):
         return [(i, int(instance.predicates[i]), instance.oriented[i][0] == node)

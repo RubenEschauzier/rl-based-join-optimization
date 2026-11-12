@@ -35,7 +35,7 @@ generation:
     # per candidate, days for the full run).
     max_in_memory_rows: 5000000
 
-  # QLever on this machine: deploy_isolated_qlever_instances.py on data/qlever/qlever_watdiv starts one
+  # QLever on this machine: deployment/qlever/deploy_isolated_qlever_instances.py on data/qlever/qlever_watdiv starts one
   # instance per physical core but the first (7 here).
   endpoints:
     ports_per_host: 7

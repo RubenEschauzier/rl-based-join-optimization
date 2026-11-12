@@ -1,0 +1,26 @@
+# Fast generation on WatDiv (generate.py, generation.method = estimated): no certificate. Each candidate is
+# embedded as before (shape template + predicates + witness constants), tightened to the result budget with the
+# ESTIMATED result (estimation.py, independence), bucketed by its estimated spread class, screened on its
+# estimated best-plan work, and labelled by QLever's exact COUNT (which also decides hard zeros).
+# Measured on the certified WatDiv workload: estimated buckets give about the targeted mix, slightly harder
+# (experiments/experiment_outputs/statistics_based_watdiv_v1/work_2026-11-12/SCREENING.md).
+#   python -m src.random_query_generation.statistics_based_generation.generate --config-name statistics_based_watdiv_fast.yaml
+defaults:
+  - statistics_based_watdiv
+  - _self_
+
+generation:
+  mode: generate
+  method: estimated
+  output_directory: data/generated_queries/statistics_based_watdiv_fast
+
+  estimated:
+    # screen: drop a candidate whose ESTIMATED best-plan work exceeds this factor x acceptance.max_best_plan_work
+    # (generous: the estimate errs both ways; the final count's timeout is the exact guard)
+    max_work_factor: 10
+    # no constant (IRI or literal at a subject / object) in more than this share of a shape's queries
+    max_constant_share: 0.005
+
+  acceptance:
+    # candidates are cheap now; most extra ones only find their cell full
+    max_candidate_factor: 100

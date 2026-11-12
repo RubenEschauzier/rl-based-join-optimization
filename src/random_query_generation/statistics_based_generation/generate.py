@@ -31,9 +31,12 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from src.random_query_generation.statistics_based_generation.certificate import (
-    BackgroundCounter, certificate_tasks, certify_in_memory, final_count_task, finish_certificate,
+    BackgroundCounter, certificate_tasks, certify_in_memory, final_count_task, finish_certificate, plan_orders,
 )
 from src.random_query_generation.statistics_based_generation.counting import ExactCounter, PredicateIndex
+from src.random_query_generation.statistics_based_generation.estimation import (
+    Estimator, PairChecker, predicate_pools, tighten_estimated,
+)
 from src.random_query_generation.statistics_based_generation.graph import load_graph, pattern_terms
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
 from src.random_query_generation.statistics_based_generation.instantiate import (
@@ -48,12 +51,31 @@ _STATE = {}
 LOST_CHECK_S = 30
 
 
+def load_generation_config(path):
+    """The `generation` block of a generation config read outside Hydra, with its `defaults` merged in
+    (statistics_based_watdiv.yaml only overrides statistics_based_yago.yaml)."""
+    def load(path):
+        cfg = OmegaConf.load(path)
+        merged = OmegaConf.create()
+        for name in cfg.pop("defaults", []):
+            if name != "_self_":
+                merged = OmegaConf.merge(merged, load(Path(path).parent / f"{name}.yaml"))
+        return OmegaConf.merge(merged, cfg)
+    return load(path).generation
+
+
 def _endpoints(settings):
+    """(small lane, big lane) endpoints (certificate.BackgroundCounter). Either explicit lists (`endpoints`,
+    `big_endpoints`) or hosts x ports, where the last `big_lane_ports` ports of each host are its big lane
+    (deploy_isolated_qlever_instances.py gives the last instances QLEVER_BIG_MEMORY_MB)."""
     if settings.get("endpoints"):
-        return list(settings.endpoints)
+        return list(settings.endpoints), list(settings.get("big_endpoints") or [])
     hosts = [str(h).split("://", 1)[-1].rstrip("/") for h in settings.endpoint_hosts]
-    return [f"http://{h}:{p}" for h in hosts
-            for p in range(int(settings.base_port), int(settings.base_port) + int(settings.ports_per_host))]
+    ports = list(range(int(settings.base_port), int(settings.base_port) + int(settings.ports_per_host)))
+    n_big = int(settings.get("big_lane_ports", 0))
+    small_ports, big_ports = (ports[:-n_big], ports[-n_big:]) if n_big else (ports, [])
+    return ([f"http://{h}:{p}" for h in hosts for p in small_ports],
+            [f"http://{h}:{p}" for h in hosts for p in big_ports])
 
 
 def _choke_points(settings):
@@ -81,9 +103,13 @@ def _make_candidate(job):
     if instance is None:
         return None
     planned_constants = len(instance.plan.constants)
+    estimated = _STATE["method"] == "estimated"
     if _STATE["max_result"] is not None:
-        instance = tighten_to_budget(instance, graph, statistics, _STATE["counter"], _STATE["max_result"], rng,
-                                     max_conditioning=_STATE["budget_conditioning"])
+        if estimated:
+            instance = tighten_estimated(instance, graph, statistics, _STATE["estimator"], _STATE["max_result"], rng)
+        else:
+            instance = tighten_to_budget(instance, graph, statistics, _STATE["counter"], _STATE["max_result"], rng,
+                                         max_conditioning=_STATE["budget_conditioning"])
         if instance is None:
             return None
     perturbation = None
@@ -108,6 +134,13 @@ def _make_candidate(job):
                             for p in patterns for t in pattern_terms(p) if not t.startswith("?")}),
         "seed": int(seed),
     }
+    if estimated:
+        # no counts here: the sampled plans are costed with the estimate (bucket, work screen); QLever's final
+        # count gives y (and decides hard zeros)
+        orders = plan_orders(patterns, sizes, _STATE["random_plans"], rng)
+        candidate["orders"] = orders
+        candidate["estimate"] = _STATE["estimator"].certificate(instance.structured_patterns(), sizes, orders)
+        return candidate
     if not certify_in_memory(candidate, instance.structured_patterns(), _STATE["counter"],
                              _STATE["random_plans"], rng, _STATE["max_empty_pairs"], _STATE["max_in_memory_rows"]):
         return None
@@ -185,7 +218,8 @@ def _summary(candidates):
         by_group[(c["choke_point"], c["hard_zero"])].append(c)
     out = {}
     for (choke, zero), group in sorted(by_group.items()):
-        certs = [c["certificate"] for c in group]
+        # estimated candidates: the estimate's fields with QLever's exact result
+        certs = [c.get("certificate") or {**c["estimate"], "result": c.get("y")} for c in group]
         out[f"{choke}{' (hard zero)' if zero else ''}"] = {
             "n": len(group),
             "certified": sum("spread" in c for c in certs),
@@ -240,13 +274,27 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     # count equals the in-memory one, and that QLever count is its `y`. Disagreements are
     # dropped and written to count_mismatches_<shape>.jsonl; a failed count frees the place.
     accepted, kept, reasons, seen = defaultdict(list), [], Counter(), set()
-    reserved, mismatches = Counter(), []
+    reserved, mismatches, qlever_failed = Counter(), [], []
+    # generation.method estimated: no certificate; the estimate picks the cell (spread class) and screens the
+    # work budget, QLever's final count gives y. No constant may appear in more than max_constant_share of
+    # the shape's queries (counted when a candidate reserves its place, given back if its count fails).
+    estimated = gen.get("method", "certified") == "estimated"
+    # every final count of the estimated method (estimate, y or the failure reason, seconds), for diagnosis
+    final_counts = open(output_directory / f"final_counts_{kind}.jsonl", "w") if estimated else None
+    if estimated and pilot:
+        raise ValueError("generation.method=estimated has no pilot mode")
+    fast = gen.get("estimated") or {}
+    work_limit = (float(fast.get("max_work_factor", 10)) * float(gen.acceptance.max_best_plan_work)
+                  if estimated and gen.acceptance.get("max_best_plan_work") is not None else None)
+    constant_cap = max(1, int(math.ceil(float(fast.get("max_constant_share", 0.005)) * total)))
+    constant_uses = Counter()
     budget = total if pilot else int(float(gen.acceptance.max_candidate_factor) * total)
     in_pool_limit = 2 * int(gen.workers)
     progress_every = int(gen.get("progress_every", 256))
     # ("made", job key, candidate, seconds) | ("counted" / "final", candidate, counts) | ("error", e)
     events = queue.Queue()
-    counter = BackgroundCounter(endpoints, events)
+    small_lane, big_lane = endpoints if isinstance(endpoints, tuple) else (endpoints, [])   # see _endpoints
+    counter = BackgroundCounter(small_lane, events, big_lane)
     certificate_timeout = float(gen.certificate.timeout_s)
     final_timeout = float(gen.final_count.timeout_s)
     submitted, outstanding = Counter(), Counter()     # per job key; outstanding = not yet resolved
@@ -336,13 +384,68 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         else:
             outstanding[_job_key(c)] -= 1
 
+    def constants_of(c):
+        return {t for p in c["triple_patterns"] for t in pattern_terms(p)[::2] if not t.startswith("?")}
+
+    def resolve_estimated(c):
+        estimate = c["estimate"]
+        if not c["hard_zero"] and work_limit is not None and estimate["best_plan_work"] > work_limit:
+            reasons["estimated_too_expensive"] += 1
+            outstanding[_job_key(c)] -= 1
+            return
+        c["spread_class"] = spread_class(estimate[measure], strata.edges) if stratify and not c["hard_zero"] else None
+        constants = constants_of(c)
+        if any(constant_uses[t] >= constant_cap for t in constants):
+            reasons["constant_overused"] += 1
+            outstanding[_job_key(c)] -= 1
+            return
+        cell = cell_of(c)
+        if len(accepted[cell]) + reserved[cell] < wanted[cell] and counter.threads:
+            reasons["to_count"] += 1
+            reserved[cell] += 1
+            constant_uses.update(constants)
+            status["at_qlever"] += 1
+            counter.submit(c, final_count_task(c, final_timeout), "final")
+        else:
+            reasons["cell_full"] += 1
+            outstanding[_job_key(c)] -= 1
+
+    def finalise_estimated(c, value):
+        cell = cell_of(c)
+        reserved[cell] -= 1
+        outstanding[_job_key(c)] -= 1
+        log = c.get("count_log", {}).get("result", {})
+        final_counts.write(json.dumps({"triple_patterns": c["triple_patterns"], "template": c["template"],
+                                       "hard_zero": c["hard_zero"], "estimate": c["estimate"], "y": value,
+                                       **log}) + "\n")
+        final_counts.flush()                  # line by line: a killed run keeps its log
+        if value is None:
+            reason = f"final_count_failed_{log.get('error')}"
+            qlever_failed.append(c)
+        elif c["hard_zero"] and value != 0:
+            reason = "not_hard_zero"
+        elif not c["hard_zero"] and value == 0:
+            reason = "zero"
+        elif not c["hard_zero"] and gen.acceptance.max_result is not None and value > gen.acceptance.max_result:
+            reason = "result_too_large"
+        else:
+            c["y"] = int(value)
+            accepted[cell].append(c)
+            return
+        reasons[reason] += 1
+        constant_uses.subtract(constants_of(c))
+
     def finalise(c, counts):
+        if estimated:
+            return finalise_estimated(c, counts.get("result"))
         cell = cell_of(c)
         reserved[cell] -= 1
         outstanding[_job_key(c)] -= 1
         value, in_memory = counts.get("result"), c["certificate"]["result"]
         if value is None:
             reasons["final_count_failed"] += 1
+            # the count is known, QLever's plan failed
+            qlever_failed.append({**c, "y": None if in_memory is None else int(in_memory)})
         elif value != in_memory:
             reasons["count_mismatch"] += 1
             mismatches.append({"triple_patterns": c["triple_patterns"], "qlever": value, "in_memory": in_memory,
@@ -356,10 +459,12 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         done = sum(min(len(accepted[cell]), count) for cell, count in wanted.items())
         with counter.lock:
             counted, seconds, queued = counter.counted, counter.seconds, counter.pending
+            escalated, escalated_ok = counter.escalated, counter.escalated_ok
+        lanes = f" | big lane {escalated_ok}/{escalated} retries ok" if counter.has_big_lane else ""
         print(f"[{kind}] candidates {status['finished']:,} | kept {done:,}/{sum(wanted.values()):,} | "
               f"{elapsed:.0f}s | {status['finished'] / max(elapsed, 1e-9):.1f} candidates/s | "
               f"workers {100 * status['busy'] / max(elapsed * int(gen.workers), 1e-9):.0f}% busy | "
-              f"qlever {counted:,} counts ({seconds / max(counted, 1):.1f}s mean), {queued} queued | "
+              f"qlever {counted:,} counts ({seconds / max(counted, 1):.1f}s mean), {queued} queued{lanes} | "
               f"{dict(reasons) if reasons else ''}", flush=True)
 
     while status["in_pool"] < in_pool_limit and submit():
@@ -389,7 +494,9 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
                 outstanding[key] -= 1
             else:
                 seen.add(_canonical(c["triple_patterns"]))
-                if c["qlever_masks"] and counter.threads:
+                if estimated:
+                    resolve_estimated(c)
+                elif c["qlever_masks"] and counter.threads:
                     status["at_qlever"] += 1
                     counter.submit(c, certificate_tasks(c, certificate_timeout), "counted")
                 else:
@@ -414,37 +521,53 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             for c in kept:
                 f.write(json.dumps(c) + "\n")
         return _summary(kept), {}
+    if final_counts is not None:
+        final_counts.close()
     with open(output_directory / f"count_mismatches_{kind}.jsonl", "w") as f:
         for m in mismatches:
             f.write(json.dumps(m) + "\n")
     if mismatches:
         print(f"[{kind}] {len(mismatches)} QLever / in-memory count mismatches -> "
               f"{output_directory / f'count_mismatches_{kind}.jsonl'}", flush=True)
-    return _summary(queries), {**_write_shape(kind, queries, output_directory), "count_mismatches": len(mismatches)}
+    return _summary(queries), {**_write_shape(kind, queries, output_directory, qlever_failed), "count_mismatches": len(mismatches)}
 
 
-def _write_shape(kind, queries, output_directory):
+def _record(c, kind):
+    """A candidate as a query record of the workload files."""
+    body = " ".join(f"{p} ." for p in c["triple_patterns"])
+    return {
+        "x": c["entities"],
+        "y": c.get("y"),                     # QLever's COUNT(*) of the query (equal to the in-memory count)
+        "query": f"SELECT * WHERE {{ {body} }}",
+        "triples": [pattern_terms(p) + ["."] for p in c["triple_patterns"]],
+        "type": f"statistics_based_{kind}",
+        "generation": {k: c[k] for k in ("shape", "n_patterns", "choke_point", "hard_zero", "perturbation",
+                                         "pattern_sizes", "n_constants", "constant_strata", "added_constants",
+                                         "spread_class", "template",
+                                         "seed", "certificate", "estimate", "orders") if k in c},
+    }
+
+
+def _write_shape(kind, queries, output_directory, failed=()):
     from src.utils.generation_utils.generation_utils import filter_isomorphic_queries
-    records = []
-    for c in queries:
-        body = " ".join(f"{p} ." for p in c["triple_patterns"])
-        records.append({
-            "x": c["entities"],
-            "y": c["y"],                     # QLever's COUNT(*) of the query (equal to the in-memory count)
-            "query": f"SELECT * WHERE {{ {body} }}",
-            "triples": [pattern_terms(p) + ["."] for p in c["triple_patterns"]],
-            "type": f"statistics_based_{kind}",
-            "generation": {k: c[k] for k in ("shape", "n_patterns", "choke_point", "hard_zero", "perturbation",
-                                             "pattern_sizes", "n_constants", "constant_strata", "added_constants",
-                                             "spread_class", "template",
-                                             "seed", "certificate", "orders")},
-        })
-    records = filter_isomorphic_queries(records)
+    records = filter_isomorphic_queries([_record(c, kind) for c in queries])
     path = output_directory / f"statistics_based_{kind}.json"
     with open(path, "w") as f:
         json.dump(records, f)
     print(f"[{kind}] wrote {len(records):,} queries -> {path}")
-    return {"written": len(records)}
+    # Queries whose final COUNT failed on QLever (memory / timeout in every lane), apart: no label to train on
+    # (y = None; in certified mode the in-memory count), but QLever's own plan fails on them, so they test
+    # whether a learned planner finds an order that does finish. count_failure: the last lane's error.
+    failed_records = []
+    for c in failed:
+        record = _record(c, kind)
+        record["count_failure"] = c.get("count_log", {}).get("result")
+        failed_records.append(record)
+    failed_path = output_directory / f"statistics_based_{kind}_qlever_failed.json"
+    with open(failed_path, "w") as f:
+        json.dump(failed_records, f)
+    print(f"[{kind}] wrote {len(failed_records):,} queries QLever could not count -> {failed_path}")
+    return {"written": len(records), "qlever_failed": len(failed_records)}
 
 
 @hydra.main(version_base=None,
@@ -460,6 +583,7 @@ def main(cfg: DictConfig):
     statistics = load_statistics(graph, gen.cache_directory)
     settings = gen.instantiation
     by_shape = dict(settings.get("max_restarts_by_shape") or {})
+    method = gen.get("method", "certified")
     _STATE.update(
         graph=graph, statistics=statistics, choke_points=_choke_points(gen.choke_points),
         instantiators={kind: Instantiator(graph, statistics, int(settings.max_pattern_matches),
@@ -467,20 +591,30 @@ def main(cfg: DictConfig):
                                           int(by_shape.get(kind, settings.max_restarts)),
                                           big_pattern_rows=settings.get("big_pattern_rows"))
                        for kind in gen.shapes},
-        counter=ExactCounter(graph, PredicateIndex(graph),
-                             max_assignments=int(gen.certificate.get("max_conditioning_values", 2000))),
         random_plans=int(gen.certificate.random_plans),
         max_in_memory_rows=gen.certificate.get("max_in_memory_rows"),
         max_empty_pairs=int(gen.hard_zero.max_empty_pairs),
         max_result=gen.result_budget.max_result,
         budget_conditioning=int(gen.result_budget.get("max_conditioning", 200)),
         max_scan_rows=gen.acceptance.get("max_best_plan_work"),
+        method=method,
     )
+    if method == "estimated":
+        # no exact counter (and no predicate index): the estimate needs the statistics' distinct counts,
+        # the hard zeros an exact pair check and per-predicate pools
+        _STATE["counter"] = None
+        _STATE["estimator"] = Estimator(statistics.distinct_subjects, statistics.distinct_objects)
+        pair_checker, pools = PairChecker(graph, statistics), predicate_pools(graph)
+    else:
+        _STATE["counter"] = ExactCounter(graph, PredicateIndex(graph),
+                                         max_assignments=int(gen.certificate.get("max_conditioning_values", 2000)))
+        pair_checker, pools = _STATE["counter"], None
     _STATE["hard_zero"] = HardZeroMaker(graph, statistics, int(settings.max_pattern_matches),
-                                        float(gen.hard_zero.anticorrelation_gamma), counter=_STATE["counter"],
-                                        max_empty_pairs=int(gen.hard_zero.max_empty_pairs))
+                                        float(gen.hard_zero.anticorrelation_gamma), counter=pair_checker,
+                                        max_empty_pairs=int(gen.hard_zero.max_empty_pairs), pools=pools)
     endpoints = _endpoints(gen.endpoints)
-    print(f"{len(endpoints)} counting endpoints: {endpoints[0]} ... {endpoints[-1]}")
+    print(f"{len(endpoints[0])} counting endpoints: {endpoints[0][0]} ... {endpoints[0][-1]}; "
+          f"big lane: {endpoints[1] or 'none'}")
     rng = np.random.default_rng(int(gen.seed))
     seed_counter = iter(range(int(gen.seed) * 10_000_000, 10 ** 12))
     summaries = {}
