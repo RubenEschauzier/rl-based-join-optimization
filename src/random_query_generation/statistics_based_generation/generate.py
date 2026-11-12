@@ -292,9 +292,11 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     in_pool_limit = 2 * int(gen.workers)
     progress_every = int(gen.get("progress_every", 256))
     # ("made", job key, candidate, seconds) | ("counted" / "final", candidate, counts) | ("error", e)
+    # | ("escalated", tag, candidate): a count sent to the big lane
     events = queue.Queue()
     small_lane, big_lane = endpoints if isinstance(endpoints, tuple) else (endpoints, [])   # see _endpoints
-    counter = BackgroundCounter(small_lane, events, big_lane)
+    counter = BackgroundCounter(small_lane, events, big_lane,
+                                int((gen.get("endpoints") or {}).get("retries_per_big_lane", 4)))
     certificate_timeout = float(gen.certificate.timeout_s)
     final_timeout = float(gen.final_count.timeout_s)
     submitted, outstanding = Counter(), Counter()     # per job key; outstanding = not yet resolved
@@ -410,16 +412,29 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             reasons["cell_full"] += 1
             outstanding[_job_key(c)] -= 1
 
+    def release_escalated(c):
+        """A final count went to the big lane: its cell place is given back meanwhile (most retries
+        fail, and a place held for hours by a queued retry blocks the cell)."""
+        if not c.get("released"):
+            c["released"] = True
+            reserved[cell_of(c)] -= 1
+
     def finalise_estimated(c, value):
         cell = cell_of(c)
-        reserved[cell] -= 1
         outstanding[_job_key(c)] -= 1
+        # a retried count gave its place back (release_escalated): kept only if its cell still has room
+        released = c.get("released", False)
+        if not released:
+            reserved[cell] -= 1
+        late = released and len(accepted[cell]) + reserved[cell] >= wanted[cell]
         log = c.get("count_log", {}).get("result", {})
         final_counts.write(json.dumps({"triple_patterns": c["triple_patterns"], "template": c["template"],
                                        "hard_zero": c["hard_zero"], "estimate": c["estimate"], "y": value,
-                                       **log}) + "\n")
+                                       **log, **({"cell_full": True} if late else {})}) + "\n")
         final_counts.flush()                  # line by line: a killed run keeps its log
-        if value is None:
+        if late and value is not None:
+            reason = "cell_full_after_retry"
+        elif value is None:
             reason = f"final_count_failed_{log.get('error')}"
             qlever_failed.append(c)
         elif c["hard_zero"] and value != 0:
@@ -503,6 +518,10 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
                     resolve(finish_certificate(c))
             if status["finished"] % progress_every == 0:
                 progress()
+        elif event[0] == "escalated":
+            _, tag, c = event
+            if estimated and tag == "final":
+                release_escalated(c)
         elif event[0] == "counted":
             _, c, counts = event
             status["at_qlever"] -= 1

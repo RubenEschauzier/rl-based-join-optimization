@@ -1,4 +1,6 @@
 import itertools
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -536,6 +538,50 @@ def _fake_qlever(fail_on_memory):
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
+def _collect(done, n):
+    """{candidate name: count} of n finished candidates, and how many retries were announced."""
+    results, escalated = {}, 0
+    while len(results) < n:
+        tag, c, counts = done.get(timeout=10)
+        if tag == "escalated":
+            escalated += 1
+        else:
+            results[c["name"]] = counts["result"]
+    return results, escalated
+
+
+def test_the_retry_queue_is_capped():
+    """Beyond retries_per_thread queued retries per big lane thread, a memory failure is final."""
+    import queue
+    from src.random_query_generation.statistics_based_generation.certificate import BackgroundCounter
+    small, small_url = _fake_qlever(fail_on_memory=True)
+    big, big_url = _fake_qlever(fail_on_memory=False)
+    done = queue.Queue()
+    counter = BackgroundCounter([small_url] * 4, done, [big_url], retries_per_thread=2)
+    # keep the big lane busy so the retries queue up: its thread only starts once all are submitted
+    gate = threading.Event()
+    original = counter._run
+    def slow_big(session, endpoint, item, lane):
+        if lane == "big":
+            gate.wait(10)
+        return original(session, endpoint, item, lane)
+    counter._run = slow_big
+    candidates = [{"name": i} for i in range(12)]
+    for c in candidates:
+        counter.submit(c, [("result", "SELECT (COUNT(*) AS ?count) WHERE { BIG }", 5)], "final")
+    time.sleep(1.0)
+    gate.set()
+    results, escalated = _collect(done, len(candidates))
+    counter.close()
+    small.shutdown()
+    big.shutdown()
+    # the blocked big thread holds one count (a retry or small-lane work it helped with) while two
+    # retries wait: at most 3 escalated, every other memory failure is final
+    assert 1 <= escalated == counter.escalated <= 3
+    assert sum(v is None for v in results.values()) >= len(candidates) - 1 - escalated
+    assert counter.retries_queued == 0
+
+
 @pytest.mark.parametrize("with_big_lane", [True, False])
 def test_memory_failures_are_retried_in_the_big_lane(with_big_lane):
     import queue
@@ -548,11 +594,12 @@ def test_memory_failures_are_retried_in_the_big_lane(with_big_lane):
     for i, c in enumerate(candidates):
         query = "SELECT (COUNT(*) AS ?count) WHERE { BIG }" if i % 2 else "SELECT (COUNT(*) AS ?count) WHERE { }"
         counter.submit(c, [("result", query, 5)], "final")
-    results = {c["name"]: counts["result"] for _, c, counts in (done.get(timeout=10) for _ in candidates)}
+    results, escalated = _collect(done, len(candidates))
     counter.close()
     small.shutdown()
     big.shutdown()
-    assert counter.pending == 0
+    assert counter.pending == 0 and counter.retries_queued == 0
+    assert escalated == counter.escalated     # every retry is announced before its result
     for i, c in enumerate(candidates):
         if i % 2 and not with_big_lane:
             assert results[i] is None and c["count_log"]["result"]["error"] == "memory"

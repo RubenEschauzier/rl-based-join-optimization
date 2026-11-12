@@ -119,3 +119,5 @@ generation:
     # (deploy_isolated_qlever_instances.py, QLEVER_BIG_MEMORY_MB) that retry counts the others could not fit
     big_lane_ports: 0
     big_endpoints: []                # with explicit `endpoints`
+    # at most this many retries per big lane instance wait; a memory failure beyond that is final
+    retries_per_big_lane: 4

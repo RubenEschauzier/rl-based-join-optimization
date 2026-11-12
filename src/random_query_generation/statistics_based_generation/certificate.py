@@ -272,11 +272,15 @@ class BackgroundCounter:
     memory in the small lane is retried in the big lane instead of being lost: the queries whose
     intermediate results do not fit are the hard ones, and dropping them would bias the workload. The
     instances' limits add up to less than the node's RAM, so no mix of queries can exhaust it. A big
-    lane thread takes retries first and helps with the small lane's queue when it has none."""
+    lane thread takes retries first and helps with the small lane's queue when it has none.
+
+    The big lane is slow (one count per instance, most retries are heavy), so at most `retries_per_thread`
+    retries per big lane thread wait for it; a memory failure beyond that is final. Each retry is announced
+    on `done` as ("escalated", tag, candidate) when it is queued, before its final result."""
 
     POLL_S = 0.05
 
-    def __init__(self, endpoints, done, big_endpoints=()):
+    def __init__(self, endpoints, done, big_endpoints=(), retries_per_thread=4):
         self.done = done
         self.work, self.retry, self.lock = queue.Queue(), queue.Queue(), threading.Lock()
         self.pending, self.counted, self.seconds = 0, 0, 0.0
@@ -288,6 +292,8 @@ class BackgroundCounter:
         self.threads = ([threading.Thread(target=self._worker, args=(e,), daemon=True) for e in small]
                         + [threading.Thread(target=self._big_worker, args=(e,), daemon=True) for e in big])
         self.n_small = len(small)
+        self.max_retries = retries_per_thread * len(big)
+        self.retries_queued = 0
         for thread in self.threads:
             thread.start()
 
@@ -303,8 +309,11 @@ class BackgroundCounter:
         start = time.perf_counter()
         value, error = count_with_reason(session, endpoint, query, timeout_s)
         seconds = time.perf_counter() - start
-        escalate = error == "memory" and lane == "small" and self.has_big_lane
         with self.lock:
+            escalate = (error == "memory" and lane == "small" and self.has_big_lane
+                        and self.retries_queued < self.max_retries)
+            if escalate:
+                self.retries_queued += 1
             self.counted += 1
             self.seconds += seconds
             log = state["candidate"].setdefault("count_log", {})
@@ -321,6 +330,7 @@ class BackgroundCounter:
                 state["left"] -= 1
             finished = state["left"] == 0
         if escalate:
+            self.done.put(("escalated", state["tag"], state["candidate"]))
             self.retry.put(item)
         elif finished:
             self.done.put((state["tag"], state["candidate"], state["counts"]))
@@ -338,6 +348,8 @@ class BackgroundCounter:
         while not self.stopping.is_set():
             try:
                 item = self.retry.get_nowait()
+                with self.lock:
+                    self.retries_queued -= 1
             except queue.Empty:
                 try:
                     item = self.work.get(timeout=self.POLL_S)
