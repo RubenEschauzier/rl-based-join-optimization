@@ -31,7 +31,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from src.random_query_generation.statistics_based_generation.counting import ExactCounter, PredicateIndex
-from src.random_query_generation.statistics_based_generation.generate import _choke_points
+from src.random_query_generation.statistics_based_generation.generate import _choke_points, load_generation_config
 from src.random_query_generation.statistics_based_generation.graph import load_graph
 from src.random_query_generation.statistics_based_generation.hard_zero import HardZeroMaker
 from src.random_query_generation.statistics_based_generation.instantiate import Instantiator, binding_plan
@@ -128,7 +128,7 @@ def make_instances_capped(job):
 
 
 def _setup(cfg):
-    gen = OmegaConf.load(cfg.corpus.generation_config).generation
+    gen = load_generation_config(cfg.corpus.generation_config)
     graph = load_graph(gen.ntriples, gen.cache_directory)
     statistics = load_statistics(graph, gen.cache_directory)
     settings = gen.instantiation

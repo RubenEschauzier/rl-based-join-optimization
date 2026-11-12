@@ -13,10 +13,13 @@ For every pattern with a constant c, leaving c through f to the node v, the laye
 and appends `out_dim` features to both directed edges of the pattern (zeros for variable-only patterns).
 Sub-queries see only their own patterns, so the readout of a subset is that subset's.
 
-Inputs (src/query_featurizers/row_readout_columns.py adds them to a featurised dataset): x[:, 0] the node's entity
-id (-1 for variables), edge_attr[:, 0] the source node's feature in the pattern (-1 if unknown). Both columns are
-stripped: the outputs are x[:, 1:] and edge_attr[:, 1:-1] + readout + the direction column, so the following
-TripleGineConv layers take edge_dim = (edge columns - 2) + out_dim.
+Inputs (src/query_featurizers/row_readout_columns.py adds them to a featurised dataset): the node's entity id in
+the first ID_COLUMNS columns of x (-1 for variables), edge_attr[:, 0] the source node's feature in the pattern (-1 if
+unknown). A float32 column holds integers exactly only up to 2^24, so a graph with that many entities (WatDiv: 20.3M)
+splits the id over two columns, id >> 12 and id & 4095 (store_layout: the store's entity count decides, for the
+dataset and the layer alike). The id and feature columns are stripped: the outputs are x[:, id columns:] and
+edge_attr[:, 1:-1] + readout + the direction column, so the following TripleGineConv layers take
+edge_dim = (edge columns - 2) + out_dim. The number of predicates P (features F = 2P) comes from the store too.
 The store (~3 GB) is loaded to the input's device on the first forward; it is not part of the state dict.
 """
 from __future__ import annotations
@@ -27,7 +30,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-NP_, F = 92, 184
+ID_SPLIT = 12                     # two id columns: id >> ID_SPLIT and id & (2^ID_SPLIT - 1)
+
+
+def store_layout(directory):
+    """(predicates P, id columns) of a row store: two id columns when its graph has 2^24 entities or more."""
+    d = Path(directory)
+    refs = np.load(d / "refs.npz")
+    n = int(refs["n_entities"]) if "n_entities" in refs else len(np.load(d / "dptr.npy", mmap_mode="r")) - 1
+    return len(refs["predicate_iris"]), 1 if n < 2 ** 24 else 2
+
+
+def entity_ids(x, id_columns):
+    """The entity id of every node (-1 for variables) from its first id_columns columns."""
+    if id_columns == 1:
+        return x[:, 0].long()
+    hi, lo = x[:, 0].long(), x[:, 1].long()
+    return torch.where(hi >= 0, (hi << ID_SPLIT) + lo, torch.full_like(hi, -1))
 
 
 def _ranges(start, count):
@@ -41,7 +60,7 @@ def _segment_max(v, seg, n):
 
 
 class _Store:
-    def __init__(self, directory, device):
+    def __init__(self, directory, device, F):
         d = Path(directory)
         ld = lambda n, dt: torch.from_numpy(np.load(d / f"{n}.npy").astype(dt)).to(device)
         dptr = np.load(d / "dptr.npy")
@@ -72,6 +91,8 @@ class RowReadout(nn.Module):
         super().__init__()
         self.store_directory, self.out_dim = str(store), out_dim
         self._store = None
+        n_predicates, self.id_columns = store_layout(store)
+        self.F = F = 2 * n_predicates
         self.f_emb, self.g_emb = nn.Embedding(F, emb), nn.Embedding(F, emb)
         self.pair = nn.Sequential(nn.Linear(10 + 2 * emb, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
         self.entry = nn.Sequential(nn.Linear(9 + emb, hidden), nn.ReLU(), nn.Linear(hidden, 2 * hidden))
@@ -84,7 +105,7 @@ class RowReadout(nn.Module):
         if device.type == "cuda" and device.index is None:      # "cuda" and "cuda:0" are the same store: one load
             device = torch.device("cuda", torch.cuda.current_device())
         if self._store is None or self._store.device != device:
-            self._store = _Store(self.store_directory, device)
+            self._store = _Store(self.store_directory, device, self.F)
         return self._store
 
     @staticmethod
@@ -97,9 +118,9 @@ class RowReadout(nn.Module):
                             (torch.log(m2) - ln - st.lref[2, f, g]) / 2], 1)
 
     def forward(self, x, edge_index, edge_attr):
-        device = x.device
-        ent, fs = x[:, 0].long(), edge_attr[:, 0].long()
-        x, base = x[:, 1:], edge_attr[:, 1:]
+        device, F = x.device, self.F
+        ent, fs = entity_ids(x, self.id_columns), edge_attr[:, 0].long()
+        x, base = x[:, self.id_columns:], edge_attr[:, 1:]
         E = len(fs)
         readout = torch.zeros(E, self.out_dim, device=device, dtype=base.dtype)
         src, dst = edge_index
@@ -174,7 +195,7 @@ class QueryReadout:
     def _build(self):
         m, dev = self.m, self.device
         x, ei, ea = self.query.x.to(dev), torch.as_tensor(self.query.edge_index).to(dev), self.query.edge_attr.to(dev)
-        ent, fs = x[:, 0].long(), ea[:, 0].long()
+        ent, fs, F = entity_ids(x, m.id_columns), ea[:, 0].long(), m.F
         src, dst = ei
         self.n = len(self.query.triple_patterns)
         eid = torch.nonzero((ent[src] >= 0) & (fs >= 0), as_tuple=True)[0]
@@ -255,7 +276,8 @@ class QueryReadout:
 
     @torch.no_grad()
     def __call__(self, masks, x, edge_attr, bits=None):
-        """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x[:, 1:], edge_attr with the readout).
+        """RowReadout.forward's outputs for soft_dp.subset_batch(query, masks): (x without its id columns, edge_attr
+        with the readout).
         bits [M, n]: the subsets' patterns in place of masks (a merged readout: soft_dp.subset_batch_many's)."""
         if not self.ready:
             self._build()
@@ -284,7 +306,7 @@ class QueryReadout:
             pos = (torch.cumsum(edges.reshape(-1).long(), 0) - 1).view_as(edges)
             readout[pos[s_i, self.eid[c_i]]] = out.to(base.dtype)
             readout = readout + readout[torch.arange(len(readout), device=dev) ^ 1]
-        return x[:, 1:], torch.cat([base[:, :-1], readout, base[:, -1:]], 1)
+        return x[:, self.m.id_columns:], torch.cat([base[:, :-1], readout, base[:, -1:]], 1)
 
 
 def packed_to(dev, fields):

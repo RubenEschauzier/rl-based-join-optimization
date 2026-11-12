@@ -1,0 +1,14 @@
+# The WatDiv counterpart of contextualizer_profiles_attention_hard_mixed_yago_v2.yaml (the one that reproduces
+# the stored hll_contextual_attention features): neighbour profiles + query-conditioned (hard) profile attention.
+#   python -m src.contextual_embeddings.pretrain --config-name contextualizer_profiles_attention_hard_watdiv.yaml
+defaults:
+  - contextualizer_watdiv
+  - _self_
+
+model:
+  profiles: true
+  profile_hidden: 64
+  profile_attention: hard
+
+training:
+  output_directory: experiments/experiment_outputs/statistics_based_watdiv_v1/contextualizer_profiles_attention_hard

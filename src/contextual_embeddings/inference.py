@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import rdflib
 import torch
@@ -35,16 +37,33 @@ class FrozenContextualizer:
         self.index = {t: i for i, t in enumerate(checkpoint["terms"])}
         self.predicate_id = {t: i for i, t in enumerate(checkpoint.get("predicate_terms") or [])}
         self.dim = self.model.dim
-
-    def token(self, term):
-        return self.index.get(str(term), 0)
+        # a dictionary-encoded graph (WatDiv): constants' graph ids through its vocabulary, looked up on first use
+        directory = checkpoint.get("graph_directory")
+        self.graph_terms = None
+        if directory and (Path(directory) / "vocabulary.npz").exists():
+            from src.contextual_embeddings.vocabulary import GraphTerms
+            self.graph_terms = GraphTerms(directory)
+        self._entity_ids = None
 
     @staticmethod
-    def entity_id(term):
-        """Graph entity id of a constant IRI (profiles are indexed by it), -1 otherwise."""
-        text = str(term)
-        suffix = text[len(IRI_PREFIX):] if text.startswith(IRI_PREFIX) else ""
-        return int(suffix) if suffix.isdigit() else -1
+    def key(term):
+        """Vocabulary key: an IRI without brackets, a literal in quoted N3 form."""
+        return term.n3() if isinstance(term, rdflib.term.Literal) else str(term)
+
+    def token(self, term):
+        return self.index.get(self.key(term), 0)
+
+    def entity_id(self, term):
+        """Graph entity id of a constant (profiles are indexed by it), -1 otherwise."""
+        if self.graph_terms is None:
+            text = str(term)
+            suffix = text[len(IRI_PREFIX):] if text.startswith(IRI_PREFIX) else ""
+            return int(suffix) if suffix.isdigit() else -1
+        if self._entity_ids is None:                     # every entity once: ~20 s for WatDiv's 20.3M terms
+            from src.query_featurizers.row_store import term_index
+            self._entity_ids = term_index(self.graph_terms.entities)
+        raw = term.n3() if isinstance(term, (rdflib.term.Literal, rdflib.term.URIRef)) else str(term)
+        return self._entity_ids.get(raw, -1)
 
     @torch.no_grad()
     def embed_query(self, rdflib_patterns):

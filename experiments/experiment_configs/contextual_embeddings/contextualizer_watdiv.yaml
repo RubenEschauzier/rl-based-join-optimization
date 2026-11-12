@@ -1,0 +1,25 @@
+# The contextualizer of the WatDiv workload (statistics_based_watdiv_v1): every setting as
+# contextualizer_mixed_yago_v2.yaml, on the WatDiv graph, rdf2vec and queries. WatDiv has real IRIs and
+# literals: vocabulary keys and graph ids go through the generator cache's vocabulary (vocabulary.GraphTerms).
+#   python -m src.contextual_embeddings.corpus   --config-name contextualizer_watdiv.yaml
+#   python -m src.contextual_embeddings.profiles --config-name contextualizer_watdiv.yaml
+#   python -m src.contextual_embeddings.pretrain --config-name contextualizer_profiles_attention_hard_watdiv.yaml
+defaults:
+  - contextualizer_mixed_yago_v2
+  - _self_
+
+corpus:
+  generation_config: experiments/experiment_configs/query_generation/statistics_based_watdiv.yaml
+  output_directory: data/contextual_embeddings/statistics_based_watdiv_v1/corpus
+  workers: 7                        # 8 physical cores locally; the WatDiv graph is ~10 GB shared
+
+vocabulary:
+  directory: data/contextual_embeddings/statistics_based_watdiv_v1
+  rdf2vec: data/rdf2vec_embeddings/statistics_based_watdiv_v1/model.json
+  queries: data/generated_queries/statistics_based_watdiv_v1
+
+profiles:
+  directory: data/contextual_embeddings/watdiv_profiles
+
+training:
+  output_directory: experiments/experiment_outputs/statistics_based_watdiv_v1/contextualizer

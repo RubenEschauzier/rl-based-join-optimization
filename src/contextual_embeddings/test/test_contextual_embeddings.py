@@ -121,3 +121,19 @@ def test_contextualizer_with_profiles_round_trip(tmp_path):
     expected = model.eval()(collate([{"nodes": [-1, 1, 2], "edges": [(0, 1, 0), (0, 2, 1)], "empty": 0,
                                       "replaced": [0, 0]}], ENTITY_TOKEN, PREDICATE_TOKEN, profiles=table))[0]
     assert np.allclose(out[c1], expected[1].detach().numpy(), atol=1e-5)
+
+
+def test_graph_terms_of_a_dictionary_encoded_graph(tmp_path):
+    """Real IRIs and literals: keys without brackets / in quoted form, and back to graph ids."""
+    from src.contextual_embeddings.vocabulary import GraphTerms
+    from src.random_query_generation.statistics_based_generation.graph import load_graph
+    path = tmp_path / "g.nt"
+    path.write_text('<http://x.org/User0>\t<http://x.org/name>\t"deaf gauntlets" .\n'
+                    '<http://x.org/User0>\t<http://x.org/follows>\t<http://x.org/User1> .\n')
+    graph = load_graph(path, tmp_path / "cache")
+    terms = GraphTerms(tmp_path / "cache")
+    keys = {terms.entity(i) for i in range(graph.n_entities)}
+    assert keys == {"http://x.org/User0", "http://x.org/User1", '"deaf gauntlets"'}
+    assert sorted(terms.predicate_terms()) == ["http://x.org/follows", "http://x.org/name"]
+    ids = terms.entity_ids(keys | {"http://x.org/nobody"})
+    assert set(ids) == keys and all(terms.entity(i) == k for k, i in ids.items())

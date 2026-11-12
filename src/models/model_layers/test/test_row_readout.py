@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 import torch
 
-from src.models.model_layers.row_readout import RowReadout, F, NP_
+from src.models.model_layers.row_readout import RowReadout
+
+NP_, F = 92, 184                       # the test store's predicates (store_layout reads them from refs.npz)
 
 
 @pytest.fixture
@@ -153,3 +155,26 @@ def test_merged_readouts_are_each_query_side_by_side(store, max_pairs):
            for r, q, m in zip(readouts, qs, masks)]
     assert torch.equal(mx, torch.cat([r[0] for r in ref]))
     assert torch.allclose(mea, torch.cat([r[1] for r in ref]), atol=1e-6)
+
+
+def test_two_id_columns_read_the_same_rows(store, tmp_path_factory):
+    """A store of a graph with >= 2^24 entities splits the id over two x columns; the readout is the same."""
+    import shutil
+    from src.models.model_layers.row_readout import ID_SPLIT, entity_ids, store_layout
+    big = tmp_path_factory.mktemp("big_store")
+    for f in store.iterdir():
+        shutil.copy(f, big / f.name)
+    refs = dict(np.load(store / "refs.npz"))
+    np.savez(big / "refs.npz", **refs, n_entities=np.int64(2 ** 24))
+    assert store_layout(store) == (NP_, 1) and store_layout(big) == (NP_, 2)
+    ids = torch.tensor([5, -1, 2 ** 24 + 12_345, 20_301_267])
+    split = torch.stack([torch.where(ids >= 0, ids >> ID_SPLIT, -1), torch.where(ids >= 0, ids & 4095, -1)], 1).float()
+    assert torch.equal(entity_ids(split, 2), ids)                   # exact beyond float32's 2^24
+    torch.manual_seed(0)
+    one = RowReadout(store, out_dim=4, hidden=8)
+    two = RowReadout(big, out_dim=4, hidden=8)
+    two.load_state_dict(one.state_dict())
+    x, ei, ea = graph([(0, 3, 1), (1, 7, 2), (1, 9, 3)])
+    x_two = torch.cat([torch.where(x[:, :1] >= 0, torch.zeros_like(x[:, :1]), x[:, :1]), x], 1)   # 5 -> (0, 5)
+    out_one, out_two = one(x, ei, ea), two(x_two, ei, ea)
+    assert torch.equal(out_one[0], out_two[0]) and torch.equal(out_one[1], out_two[1])

@@ -25,10 +25,11 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
+from src.random_query_generation.statistics_based_generation.generate import load_generation_config
 from src.random_query_generation.statistics_based_generation.graph import load_graph
 
 
-def build(graph, out_directory):
+def build(graph, out_directory, chunk_edges=20_000_000):
     start = time.perf_counter()
     n, n_predicates = graph.n_entities, graph.n_predicates
     n_features = 2 * n_predicates                # feature f: p (outgoing) or n_predicates + p (incoming)
@@ -51,22 +52,39 @@ def build(graph, out_directory):
     print(f"[profiles] {len(type_ids):,} types over {len(owners):,} entities ({time.perf_counter() - start:.0f}s)",
           flush=True)
 
-    # histograms: (entity, feature, neighbour type) -> count
+    # histograms: (entity, feature, neighbour type) -> count, over ranges of entities of about `chunk_edges`
+    # edges (their out- and in-edges from the CSR), so the peak is one range, not the whole graph (WatDiv:
+    # 436M edge ends). Ranges ascend, so the concatenation is sorted by (entity, feature, type) as a whole.
     n_types = len(type_ids)
-    role = np.concatenate([s * n_features + p, o * n_features + n_predicates + p])
-    neighbour_type = np.concatenate([entity_type[o], entity_type[s]]).astype(np.int64)
-    combined, counts = np.unique(role * n_types + neighbour_type, return_counts=True)
-    del role, neighbour_type
-    role, neighbour_type = combined // n_types, combined % n_types
-    hist_entity = role // n_features
+    del keys, entity, feature, signatures, type_ids, inverse, s, p, o
+    edge_ends = np.cumsum(np.diff(graph.out_ptr) + np.diff(graph.in_ptr))     # edges of entities 0..e
+    feature_parts, type_parts, count_parts = [], [], []
+    hist_counts = np.zeros(n, dtype=np.int64)
+    a = 0
+    while a < n:
+        done = edge_ends[a - 1] if a else 0
+        b = min(n, max(a + 1, int(np.searchsorted(edge_ends, done + chunk_edges, "right"))))
+        out_a, out_b, in_a, in_b = graph.out_ptr[a], graph.out_ptr[b], graph.in_ptr[a], graph.in_ptr[b]
+        s = np.repeat(np.arange(a, b, dtype=np.int64), np.diff(graph.out_ptr[a:b + 1]))
+        o = np.repeat(np.arange(a, b, dtype=np.int64), np.diff(graph.in_ptr[a:b + 1]))
+        role = np.concatenate([s * n_features + graph.out_p[out_a:out_b],
+                               o * n_features + n_predicates + graph.in_p[in_a:in_b]])
+        neighbour_type = np.concatenate([entity_type[graph.out_o[out_a:out_b]], entity_type[graph.in_s[in_a:in_b]]])
+        combined, counts = np.unique(role * n_types + neighbour_type, return_counts=True)
+        role = combined // n_types
+        hist_counts[a:b] = np.bincount(role // n_features - a, minlength=b - a)
+        feature_parts.append((role % n_features).astype(np.int16))
+        type_parts.append((combined % n_types).astype(np.int32))
+        count_parts.append(counts.astype(np.int32))
+        a = b
     ptr = np.zeros(n + 1, dtype=np.int64)
-    np.cumsum(np.bincount(hist_entity, minlength=n), out=ptr[1:])
+    np.cumsum(hist_counts, out=ptr[1:])
     out = Path(out_directory)
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / "types.npz", type_features=type_features, entity_type=entity_type)
-    np.savez(out / "histograms.npz", ptr=ptr, feature=(role % n_features).astype(np.int16),
-             type=neighbour_type.astype(np.int32), count=counts.astype(np.int32))
-    print(f"[profiles] {len(counts):,} histogram entries, max {np.diff(ptr).max():,} per entity "
+    np.savez(out / "histograms.npz", ptr=ptr, feature=np.concatenate(feature_parts),
+             type=np.concatenate(type_parts), count=np.concatenate(count_parts))
+    print(f"[profiles] {ptr[-1]:,} histogram entries, max {np.diff(ptr).max():,} per entity "
           f"({time.perf_counter() - start:.0f}s) -> {out}", flush=True)
 
 
@@ -91,7 +109,7 @@ class ProfileTable:
 @hydra.main(version_base=None, config_path="../../experiments/experiment_configs/contextual_embeddings",
             config_name="contextualizer_mixed_yago_v2.yaml")
 def main(cfg: DictConfig):
-    gen = OmegaConf.load(cfg.corpus.generation_config).generation
+    gen = load_generation_config(cfg.corpus.generation_config)
     build(load_graph(gen.ntriples, gen.cache_directory), cfg.profiles.directory)
 
 

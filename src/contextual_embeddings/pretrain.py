@@ -25,12 +25,17 @@ from sklearn.metrics import roc_auc_score
 from src.contextual_embeddings import vocabulary as vocab
 from src.contextual_embeddings.model import Contextualizer, collate
 from src.contextual_embeddings.profiles import ProfileTable
+from src.random_query_generation.statistics_based_generation.generate import load_generation_config
 
 
-def _token_maps(terms, predicates):
+def _token_maps(terms, predicates, graph_terms=None):
+    """{graph entity id: token}, token per graph predicate."""
     index = {t: i for i, t in enumerate(terms)}
-    prefix = len(vocab.entity_term(0)) - 1
-    entity_token = {int(t[prefix:]): i for t, i in index.items() if t != vocab.UNKNOWN and t[prefix:].isdigit()}
+    if graph_terms is None or graph_terms.entities is None:          # anonymised YAGO: the number in the IRI
+        prefix = len(vocab.entity_term(0)) - 1
+        entity_token = {int(t[prefix:]): i for t, i in index.items() if t != vocab.UNKNOWN and t[prefix:].isdigit()}
+    else:
+        entity_token = {e: index[t] for t, e in graph_terms.entity_ids(t for t in terms if t != vocab.UNKNOWN).items()}
     predicate_token = np.array([index.get(p, 0) for p in predicates], dtype=np.int64)
     return entity_token, predicate_token
 
@@ -77,8 +82,9 @@ def evaluate(model, instances, entity_token, predicate_token, device, batch_size
 
 def pretrain(cfg):
     torch.manual_seed(int(cfg.training.seed))
-    gen = OmegaConf.load(cfg.corpus.generation_config).generation
-    predicates = vocab.predicate_terms(Path(gen.cache_directory) / "graph.npz")
+    gen = load_generation_config(cfg.corpus.generation_config)
+    graph_terms = vocab.GraphTerms(gen.cache_directory)
+    predicates = graph_terms.predicate_terms()
     instances = vocab.load_corpus(cfg.corpus.output_directory)
     print(f"[pretrain] {len(instances):,} corpus instances", flush=True)
     vocab_dir = Path(cfg.vocabulary.directory)
@@ -86,8 +92,8 @@ def pretrain(cfg):
         terms, init = vocab.load(vocab_dir)
     else:
         terms, init = vocab.build(instances, predicates, cfg.vocabulary.queries, cfg.vocabulary.rdf2vec,
-                                  vocab_dir, int(cfg.vocabulary.min_count))
-    entity_token, predicate_token = _token_maps(terms, predicates)
+                                  vocab_dir, int(cfg.vocabulary.min_count), entity_name=graph_terms.entity)
+    entity_token, predicate_token = _token_maps(terms, predicates, graph_terms)
     train_ids, val_ids = _split(instances, float(cfg.training.heldout_constant_share), int(cfg.training.seed))
     val = [instances[i] for i in val_ids]
     print(f"[pretrain] train {len(train_ids):,}, validation (held-out constants) {len(val):,}", flush=True)
@@ -147,6 +153,7 @@ def pretrain(cfg):
                         "profiles_directory": None if profiles is None else str(cfg.profiles.directory),
                         "profile_hidden": int(cfg.model.get("profile_hidden", 64)),
                         "profile_attention": cfg.model.get("profile_attention", None), "predicate_terms": predicates,
+                        "graph_directory": str(gen.cache_directory),
                         "terms": terms, "metrics": metrics}, out_dir / "contextualizer.pt")
         else:
             since_best += 1
