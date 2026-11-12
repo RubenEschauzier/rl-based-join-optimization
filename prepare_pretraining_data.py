@@ -64,7 +64,10 @@ def _save(path, data):
 
 
 def term_count_query(term):
-    # the query of QLeverOptimizerClient.cardinality_term
+    # the query of QLeverOptimizerClient.cardinality_term; a literal can only be an object (a
+    # literal in predicate position is not valid SPARQL, and RDF data has no literal subjects)
+    if term.startswith('"'):
+        return f"SELECT (COUNT(*) AS ?count) WHERE {{ ?s ?p {term} }}"
     return (f"SELECT (COUNT(*) AS ?count) WHERE {{ {{ {term} ?p ?o }} UNION {{ ?s {term} ?o }} "
             f"UNION {{ ?s ?p {term} }} }}")
 
@@ -449,7 +452,8 @@ def main():
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--dimensions", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--w2v-workers", type=int, default=5)
+    parser.add_argument("--w2v-workers", type=int, default=8,
+                        help="Word2Vec threads; it reads walks.txt in C (corpus_file), so this scales with cores.")
     parser.add_argument("--steps", default="split,stats,embed,featurise,check,config",
                         help="Comma-separated subset of split,stats,minhash,embed,featurise,check,config.")
     parser.add_argument("--features", choices=["hll", "hll_minhash", "hll_contextual", "gnce"], default="hll",
