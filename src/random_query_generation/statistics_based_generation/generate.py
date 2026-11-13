@@ -475,7 +475,9 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         with counter.lock:
             counted, seconds, queued = counter.counted, counter.seconds, counter.pending
             escalated, escalated_ok = counter.escalated, counter.escalated_ok
+            reconnects = counter.reconnects
         lanes = f" | big lane {escalated_ok}/{escalated} retries ok" if counter.has_big_lane else ""
+        lanes += f" | {reconnects} counts requeued (endpoint down)" if reconnects else ""
         print(f"[{kind}] candidates {status['finished']:,} | kept {done:,}/{sum(wanted.values()):,} | "
               f"{elapsed:.0f}s | {status['finished'] / max(elapsed, 1e-9):.1f} candidates/s | "
               f"workers {100 * status['busy'] / max(elapsed * int(gen.workers), 1e-9):.0f}% busy | "

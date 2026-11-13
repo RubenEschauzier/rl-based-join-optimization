@@ -232,17 +232,28 @@ def final_count_task(candidate, timeout_s):
     return [("result", count_query(candidate["triple_patterns"], full), timeout_s)]
 
 
+SERVER_DIED_AFTER_S = 2.0
+
+
 def count_with_reason(session, endpoint, query, timeout_s):
     """(rows, None) or (None, why): QLever answers a timeout with HTTP 429 "Operation timed out" and a query
     over its memory limit with HTTP 500 "Tried to allocate ...". Why is timeout / memory / client_timeout /
-    connection / http_<status> / bad_reply."""
+    connection (the endpoint is down) / server_died (the connection broke while the query ran: the query
+    may have killed the instance) / http_<status> / bad_reply."""
+    start = time.perf_counter()
     try:
         response = session.post(endpoint, params={"timeout": f"{int(timeout_s)}s"}, data=query,
                                 headers={"Accept": "application/sparql-results+json",
                                          "Content-Type": "application/sparql-query"},
                                 timeout=timeout_s + 30)
+    except requests.ConnectTimeout:
+        return None, "connection"
     except requests.Timeout:
         return None, "client_timeout"
+    except requests.ConnectionError as error:
+        refused = "NewConnectionError" in repr(error) or "refused" in str(error).lower()
+        # a fast break is a stale connection to a restarted instance, not this query's doing
+        return None, "connection" if refused or time.perf_counter() - start < SERVER_DIED_AFTER_S else "server_died"
     except requests.RequestException:
         return None, "connection"
     if response.status_code != 200:
@@ -276,15 +287,23 @@ class BackgroundCounter:
 
     The big lane is slow (one count per instance, most retries are heavy), so at most `retries_per_thread`
     retries per big lane thread wait for it; a memory failure beyond that is final. Each retry is announced
-    on `done` as ("escalated", tag, candidate) when it is queued, before its final result."""
+    on `done` as ("escalated", tag, candidate) when it is queued, before its final result.
+
+    An endpoint that does not answer (a crashed or restarting instance) would otherwise fail every count
+    it takes at once and so swallow most of the queue: a count that fails to connect goes back to its
+    queue for another endpoint, and the thread rests REST_S before taking the next one. After
+    MAX_RECONNECTS failed connections a count is final (error "connection")."""
 
     POLL_S = 0.05
+    REST_S = 30.0
+    MAX_RECONNECTS = 10
 
     def __init__(self, endpoints, done, big_endpoints=(), retries_per_thread=4):
         self.done = done
         self.work, self.retry, self.lock = queue.Queue(), queue.Queue(), threading.Lock()
         self.pending, self.counted, self.seconds = 0, 0, 0.0
         self.escalated, self.escalated_ok = 0, 0
+        self.reconnects = 0
         self.stopping = threading.Event()
         big = list(dict.fromkeys(big_endpoints))
         small = [e for e in dict.fromkeys(endpoints) if e not in big]
@@ -309,6 +328,20 @@ class BackgroundCounter:
         start = time.perf_counter()
         value, error = count_with_reason(session, endpoint, query, timeout_s)
         seconds = time.perf_counter() - start
+        if error == "connection":
+            with self.lock:
+                tries = state.setdefault("reconnects", {})
+                tries[key] = tries.get(key, 0) + 1
+                requeue = tries[key] <= self.MAX_RECONNECTS
+                if requeue:
+                    self.reconnects += 1
+                    retried = key in state.get("escalated", ())
+                    if retried:
+                        self.retries_queued += 1
+            if requeue:
+                (self.retry if retried else self.work).put(item)
+                self.stopping.wait(self.REST_S)    # this endpoint is down: let the others take the work
+                return
         with self.lock:
             escalate = (error == "memory" and lane == "small" and self.has_big_lane
                         and self.retries_queued < self.max_retries)

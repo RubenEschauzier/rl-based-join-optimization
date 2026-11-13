@@ -609,3 +609,53 @@ def test_memory_failures_are_retried_in_the_big_lane(with_big_lane):
         # the big lane also takes small-lane work when it has no retries, so some heavy counts go there directly
         assert counter.escalated == counter.escalated_ok <= 10
         assert all(candidates[i]["count_log"]["result"]["lane"] == "big" for i in range(1, 20, 2))
+
+
+def _closed_port():
+    """A local port nothing listens on (connection refused)."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+@pytest.mark.parametrize("dead_in", ["small", "big"])
+def test_a_dead_endpoint_does_not_swallow_counts(dead_in):
+    """A count that cannot connect goes back to the queue for another endpoint; nothing is lost."""
+    import queue
+    from src.random_query_generation.statistics_based_generation.certificate import BackgroundCounter
+    live, live_url = _fake_qlever(fail_on_memory=False)
+    dead_url = _closed_port()
+    small, big = ([dead_url, live_url], []) if dead_in == "small" else ([live_url], [dead_url])
+    done = queue.Queue()
+    counter = BackgroundCounter(small, done, big)
+    counter.REST_S = 0.2
+    candidates = [{"name": i} for i in range(30)]
+    for c in candidates:
+        counter.submit(c, [("result", "SELECT (COUNT(*) AS ?count) WHERE { }", 5)], "final")
+    results, _ = _collect(done, len(candidates))
+    counter.close()
+    live.shutdown()
+    assert all(v == 7 for v in results.values())
+    assert counter.reconnects >= 1 and counter.pending == 0
+
+
+def test_a_server_dying_mid_query_is_final():
+    """A connection that breaks while the query runs is server_died (the query may have killed the
+    instance), not requeued like an endpoint that is down."""
+    import socket
+    import requests
+    from src.random_query_generation.statistics_based_generation import certificate
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    def accept_then_die():
+        conn, _ = server.accept()
+        conn.recv(65536)
+        time.sleep(certificate.SERVER_DIED_AFTER_S + 0.5)
+        conn.close()
+    threading.Thread(target=accept_then_die, daemon=True).start()
+    url = f"http://127.0.0.1:{server.getsockname()[1]}"
+    assert certificate.count_with_reason(requests.Session(), url, "SELECT * WHERE { }", 10) == (None, "server_died")
+    server.close()
+    assert certificate.count_with_reason(requests.Session(), _closed_port(), "SELECT * WHERE { }", 10) == (None, "connection")
