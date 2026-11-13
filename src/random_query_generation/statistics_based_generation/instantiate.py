@@ -14,6 +14,10 @@
                    (correlated: lift^gamma, anticorrelated: lift^-gamma; statistics.py)
        entities    uniform, or by degree^gamma for join variables (hub skew), and for nodes
                    that will be constants, by whether their frequency hits the planned stratum
+       selectivity (beta, per call; 0 = off) every candidate edge also by fanout^-beta, the mean
+                   number of neighbours its predicate gives in the walk's direction: candidates come
+                   per triple, so without it the big predicates dominate, and long paths, cycles and
+                   diamonds over them cannot be brought under the result budget
    Distinct nodes get distinct entities. A dead end restarts the search.
 """
 from __future__ import annotations
@@ -193,6 +197,10 @@ class Instantiator:
         # Predicates too large to appear between two variables (the guardrail against queries
         # that are hard only because a pattern matches a huge part of the data).
         self.small_predicate = statistics.counts <= max_pattern_matches
+        # mean neighbours per entity via a predicate: from a subject (its objects), from an object (its subjects)
+        counts = statistics.counts.astype(np.float64)
+        self.fanout_from_subject = counts / np.maximum(statistics.distinct_subjects, 1)
+        self.fanout_from_object = counts / np.maximum(statistics.distinct_objects, 1)
         self._seed_cdf = np.cumsum(statistics.degree.astype(np.float64))
 
     def _allowed(self, preds, big_left):
@@ -289,20 +297,27 @@ class Instantiator:
             assigned.add(best)
         return order
 
-    def embed(self, shape, plan, choke_point, rng):
-        """An Instance (all edges real triples, directions decided), or None."""
+    def _selective(self, preds, from_subject, selectivity):
+        """fanout^-selectivity of each candidate edge (1 when selectivity is 0)."""
+        if not selectivity:
+            return 1.0
+        fanout = np.where(from_subject, self.fanout_from_subject[preds], self.fanout_from_object[preds])
+        return np.maximum(fanout, 1.0) ** -selectivity
+
+    def embed(self, shape, plan, choke_point, rng, selectivity=0.0):
+        """An Instance (all edges real triples, directions decided), or None. selectivity: see the module."""
         adjacency = [[] for _ in range(shape.n_nodes)]
         for index, (u, v) in enumerate(shape.edges):
             adjacency[u].append(index)
             adjacency[v].append(index)
         order = self._order(shape, adjacency)
         for _ in range(self.max_restarts):
-            instance = self._attempt(shape, plan, choke_point, rng, adjacency, order)
+            instance = self._attempt(shape, plan, choke_point, rng, adjacency, order, selectivity)
             if instance is not None:
                 return instance
         return None
 
-    def _attempt(self, shape, plan, choke_point, rng, adjacency, order):
+    def _attempt(self, shape, plan, choke_point, rng, adjacency, order, selectivity=0.0):
         degree = shape.degree()
         entities = np.full(shape.n_nodes, -1, dtype=np.int64)
         predicates = np.full(shape.n_edges, -1, dtype=np.int64)
@@ -339,6 +354,7 @@ class Instantiator:
             weights = self._lift_weights(preds, u_subject, at_node(u), choke_point)
             preferred = u_subject == (shape.edges[parent_edge][0] == u)
             weights = weights * np.where(preferred, self.direction_preference, 1.0)
+            weights = weights * self._selective(preds, u_subject, selectivity)
             if node in plan.constants:
                 ok = np.array([self._stratum(int(p), int(c), not us) == plan.constants[node]
                                for p, c, us in zip(preds, ents, u_subject)])
@@ -365,6 +381,7 @@ class Instantiator:
                 if len(options) == 0:
                     return None
                 option_weights = self._lift_weights(options, w_subject, at_node(w), choke_point)
+                option_weights = option_weights * self._selective(options, w_subject, selectivity)
                 choice = int(rng.choice(len(options), p=option_weights / option_weights.sum()))
                 predicates[other_edge] = options[choice]
                 oriented[other_edge] = (w, node) if w_subject[choice] else (node, w)

@@ -97,6 +97,15 @@ generation:
     max_result: 1000000             # result size cap for non-zero queries (= the budget)
     max_candidate_factor: 10        # stop a shape after this many candidates per wanted query
 
+  # Adaptive generation (generate.py _run_shape; off here, on in statistics_based_watdiv_fast.yaml):
+  #   selectivity: per (size, choke point, hard zero) the walk's selectivity beta, raised while few of its
+  #     candidates pass the result budget and the work screen ({window, target_pass, high_pass, step, max})
+  #   max_attempts_per_query: a cell still short after this many candidates of its key per wanted query is
+  #     closed and hands its places on to the open cells (same hard-zero flag and spread class, same size first)
+  adaptive:
+    selectivity: null
+    max_attempts_per_query: null
+
   # Non-zero queries per spread class: < 2 (subtle), 2-10, >= 10 (the order is decisive).
   # null: no balancing on spread. measure: spread_with_scans = (scan rows + median C_out) /
   # (scan rows + cheapest C_out), the spread of the total work (scans are the same in every

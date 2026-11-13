@@ -1,4 +1,5 @@
-"""Generate a join-ordering-hard workload from data statistics.
+"""Generate a join-ordering-hard workload from data statistics. Queries are generated so ensure that
+scans don't dominate
 
     python -m src.random_query_generation.statistics_based_generation.generate                      # pilot
     python -m src.random_query_generation.statistics_based_generation.generate generation.mode=generate
@@ -91,15 +92,16 @@ def _choke_points(settings):
 
 
 def _make_candidate(job):
-    """Worker: one candidate (dict) or None. job = (shape, n, choke point, hard_zero, seed)."""
-    kind, n, choke_name, hard_zero, seed = job
+    """Worker: one candidate (dict) or None. job = (shape, n, choke point, hard_zero, seed[, selectivity])."""
+    kind, n, choke_name, hard_zero, seed, *rest = job
+    selectivity = float(rest[0]) if rest else 0.0
     graph, statistics = _STATE["graph"], _STATE["statistics"]
     instantiator = _STATE["instantiators"][kind]
     choke_point = _STATE["choke_points"][choke_name][0]
     rng = np.random.default_rng(seed)
     shape = build_shape(kind, n, rng)
     plan = binding_plan(shape, choke_point, rng)
-    instance = instantiator.embed(shape, plan, choke_point, rng)
+    instance = instantiator.embed(shape, plan, choke_point, rng, selectivity=selectivity)
     if instance is None:
         return None
     planned_constants = len(instance.plan.constants)
@@ -132,7 +134,7 @@ def _make_candidate(job):
         "template": f"{kind}|{n}|{choke_name}|{'zero' if hard_zero else 'nonzero'}|{'-'.join(strata)}",
         "entities": sorted({t.strip("<>") if t.startswith("<") else t
                             for p in patterns for t in pattern_terms(p) if not t.startswith("?")}),
-        "seed": int(seed),
+        "seed": int(seed), "selectivity": selectivity,
     }
     if estimated:
         # no counts here: the sampled plans are costed with the estimate (bucket, work screen); QLever's final
@@ -263,6 +265,23 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         for name in bases:
             wanted[(n, name, True, None)] += n_zero / (len(sizes) * len(bases))
     wanted = Counter({cell: int(math.ceil(v)) for cell, v in wanted.items()})
+    initial_wanted = Counter(wanted)
+
+    # Adaptive (generation.adaptive, not in pilot mode):
+    #   selectivity  per job key (size, choke point, hard zero) the walk's selectivity beta (Instantiator):
+    #                0 at the start (even generation); after every `window` candidates of a key, +step while
+    #                fewer than target_pass of them passed the result budget and the work screen, -step above
+    #                high_pass (at most max). Each query records its beta.
+    #   max_attempts_per_query  a cell that has had this many candidates of its key per wanted query and is
+    #                still short is closed: what it lacks is handed on to the open cells of the same hard-zero
+    #                flag and spread class (so the zero share and the spread mix hold), first those of the same
+    #                size (other choke points; else the sizes drift to the small ones, which never close), in
+    #                proportion to their initial size, so the shape still gets its total.
+    adaptive = (gen.get("adaptive") or {}) if not pilot else {}
+    tilt = adaptive.get("selectivity")
+    max_attempts = adaptive.get("max_attempts_per_query")
+    selectivity, window, passed, attempts = Counter(), Counter(), Counter(), Counter()
+    closed, handed_on = set(), Counter()
 
     # Continuous: a fixed number of jobs is in flight in the pool; each finished job is replaced
     # at once by a job for a (size, choke point, hard zero) drawn by what its cells still need,
@@ -335,7 +354,7 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         if slot is not None:
             started[slot] = 0
             in_flight[slot] = (key, job)
-        pool.apply_async(_timed_candidate, ((kind, *key, next(seed_counter)), slot),
+        pool.apply_async(_timed_candidate, ((kind, *key, next(seed_counter), float(selectivity[key])), slot),
                          callback=lambda result, key=key, slot=slot, job=job: events.put(("made", key, *result, slot, job)),
                          error_callback=lambda error: events.put(("error", error)))
         return True
@@ -366,6 +385,57 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
 
     def cell_of(c):
         return c["n_patterns"], c["choke_point"], c["hard_zero"], c["spread_class"]
+
+    def observe(key, ok):
+        """One candidate of a key passed (or not) the result budget and the work screen: adapt its beta."""
+        if not tilt:
+            return
+        window[key] += 1
+        passed[key] += ok
+        if window[key] >= int(tilt.get("window", 50)):
+            rate, step = passed[key] / window[key], float(tilt.get("step", 0.5))
+            if rate < float(tilt.get("target_pass", 0.3)):
+                selectivity[key] = min(selectivity[key] + step, float(tilt.get("max", 4.0)))
+            elif rate > float(tilt.get("high_pass", 0.6)):
+                selectivity[key] = max(selectivity[key] - step, 0.0)
+            window[key] = passed[key] = 0
+
+    def hand_on(cell, amount):
+        """Move `amount` wanted places from a closed cell to the open ones (see the adaptive comment)."""
+        if amount <= 0:
+            return
+        wanted[cell] -= amount
+        open_cells = [c for c in wanted if c not in closed]
+        for group in ([c for c in open_cells if c[0] == cell[0] and c[2:] == cell[2:]],      # same size first
+                      [c for c in open_cells if c[2:] == cell[2:]], [c for c in open_cells if c[2] == cell[2]],
+                      open_cells):
+            if group:
+                break
+        else:
+            return                                    # every cell closed: the shape ends short
+        weight = np.array([initial_wanted[c] for c in group], dtype=float)
+        share = amount * weight / weight.sum()
+        extra = np.floor(share).astype(int)
+        for i in np.argsort(extra - share)[:amount - extra.sum()]:     # largest remainders
+            extra[i] += 1
+        for c, e in zip(group, extra):
+            wanted[c] += int(e)
+        handed_on[cell] += amount
+
+    def close_exhausted(key):
+        """Close the cells of a key that are still short after max_attempts_per_query candidates per place."""
+        if max_attempts is None:
+            return
+        for cell in [c for c in wanted if c[:3] == key and c not in closed]:
+            have = len(accepted[cell]) + reserved[cell]
+            if have < wanted[cell] and attempts[key] >= float(max_attempts) * wanted[cell]:
+                closed.add(cell)
+                hand_on(cell, wanted[cell] - have)
+
+    def place_freed(cell):
+        """A place of a cell came free (its candidate failed after reserving it): a closed cell hands it on."""
+        if cell in closed:
+            hand_on(cell, 1)
 
     def resolve(c):
         spread = c["certificate"].get(measure)
@@ -449,6 +519,8 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             return
         reasons[reason] += 1
         constant_uses.subtract(constants_of(c))
+        if not late:
+            place_freed(cell)
 
     def finalise(c, counts):
         if estimated:
@@ -457,6 +529,8 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
         reserved[cell] -= 1
         outstanding[_job_key(c)] -= 1
         value, in_memory = counts.get("result"), c["certificate"]["result"]
+        if value is None or value != in_memory:
+            place_freed(cell)
         if value is None:
             reasons["final_count_failed"] += 1
             # the count is known, QLever's plan failed
@@ -478,6 +552,11 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             reconnects = counter.reconnects
         lanes = f" | big lane {escalated_ok}/{escalated} retries ok" if counter.has_big_lane else ""
         lanes += f" | {reconnects} counts requeued (endpoint down)" if reconnects else ""
+        if closed:
+            lanes += f" | {len(closed)} cells closed, {sum(handed_on.values())} places handed on"
+        if tilt:
+            tilted = [b for b in selectivity.values() if b > 0]
+            lanes += f" | beta>0 on {len(tilted)} keys (max {max(tilted, default=0):.1f})"
         print(f"[{kind}] candidates {status['finished']:,} | kept {done:,}/{sum(wanted.values()):,} | "
               f"{elapsed:.0f}s | {status['finished'] / max(elapsed, 1e-9):.1f} candidates/s | "
               f"workers {100 * status['busy'] / max(elapsed * int(gen.workers), 1e-9):.0f}% busy | "
@@ -507,7 +586,13 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
             status["in_pool"] -= 1
             status["finished"] += 1
             status["busy"] += seconds
-            if c is None or _canonical(c["triple_patterns"]) in seen:
+            attempts[key] += 1
+            duplicate = c is not None and _canonical(c["triple_patterns"]) in seen
+            if not duplicate:
+                observe(key, c is not None and not (estimated and not c["hard_zero"] and work_limit is not None
+                                                    and c["estimate"]["best_plan_work"] > work_limit))
+            close_exhausted(key)
+            if c is None or duplicate:
                 outstanding[key] -= 1
             else:
                 seen.add(_canonical(c["triple_patterns"]))
@@ -550,7 +635,16 @@ def _run_shape(kind, gen, endpoints, pool, rng, seed_counter, output_directory):
     if mismatches:
         print(f"[{kind}] {len(mismatches)} QLever / in-memory count mismatches -> "
               f"{output_directory / f'count_mismatches_{kind}.jsonl'}", flush=True)
-    return _summary(queries), {**_write_shape(kind, queries, output_directory, qlever_failed), "count_mismatches": len(mismatches)}
+    if closed:
+        print(f"[{kind}] {len(closed)} cells closed short, {sum(handed_on.values())} places handed on", flush=True)
+    adaptive_summary = {
+        "closed_cells": [{"cell": list(cell), "kept": len(accepted[cell]), "wanted_initially": initial_wanted[cell],
+                          "handed_on": handed_on[cell], "attempts_of_key": attempts[cell[:3]]}
+                         for cell in sorted(closed, key=str)],
+        "selectivity": {"|".join(map(str, key)): beta for key, beta in selectivity.items() if beta > 0},
+    }
+    return _summary(queries), {**_write_shape(kind, queries, output_directory, qlever_failed),
+                               "count_mismatches": len(mismatches), **adaptive_summary}
 
 
 def _record(c, kind):
@@ -564,7 +658,7 @@ def _record(c, kind):
         "type": f"statistics_based_{kind}",
         "generation": {k: c[k] for k in ("shape", "n_patterns", "choke_point", "hard_zero", "perturbation",
                                          "pattern_sizes", "n_constants", "constant_strata", "added_constants",
-                                         "spread_class", "template",
+                                         "spread_class", "template", "selectivity",
                                          "seed", "certificate", "estimate", "orders") if k in c},
     }
 

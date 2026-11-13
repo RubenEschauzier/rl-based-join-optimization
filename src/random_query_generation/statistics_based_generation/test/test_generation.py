@@ -659,3 +659,45 @@ def test_a_server_dying_mid_query_is_final():
     assert certificate.count_with_reason(requests.Session(), url, "SELECT * WHERE { }", 10) == (None, "server_died")
     server.close()
     assert certificate.count_with_reason(requests.Session(), _closed_port(), "SELECT * WHERE { }", 10) == (None, "connection")
+
+
+def _size_four_only_candidate(job):
+    """Stand-in for _make_candidate: a cheap candidate for size 4, never one for size 5."""
+    kind, n, choke_name, hard_zero, seed, selectivity = job
+    if n != 4:
+        return None
+    patterns = [f"?a <http://example.org/p{seed}> ?b", f"?b <http://example.org/q{seed}> ?c",
+                f"?c <http://example.org/r{seed}> ?d", f"?d <http://example.org/s{seed}> ?e"]
+    return {"shape": kind, "n_patterns": n, "choke_point": choke_name, "hard_zero": hard_zero,
+            "triple_patterns": patterns, "template": f"{kind}|{n}", "entities": [], "seed": seed,
+            "selectivity": selectivity, "pattern_sizes": [10, 10, 10, 10],
+            "estimate": {"best_plan_work": 1.0, "spread": 1.0}}
+
+
+def test_a_cell_that_cannot_fill_hands_its_places_on(tmp_path, monkeypatch):
+    import multiprocessing
+    from src.random_query_generation.statistics_based_generation import generate as G
+    monkeypatch.setattr(G, "_make_candidate", _size_four_only_candidate)
+    server, url = _fake_qlever(fail_on_memory=False)
+    gen = OmegaConf.create({
+        "mode": "generate", "method": "estimated", "sizes": [4, 5], "zero_share": 0.0, "spread_strata": None,
+        "workers": 2, "queries_per_shape": 40, "progress_every": 10 ** 6,
+        "hard_zero": {"base_choke_points": ["random"], "max_empty_pairs": 1},
+        "acceptance": {"max_candidate_factor": 50, "max_best_plan_work": None, "max_result": None},
+        "estimated": {"max_constant_share": 1.0},
+        "adaptive": {"selectivity": {"window": 5, "target_pass": 0.3, "step": 0.5, "max": 2.0},
+                     "max_attempts_per_query": 3},
+        "certificate": {"timeout_s": 5}, "final_count": {"timeout_s": 5}})
+    monkeypatch.setitem(G._STATE, "choke_points", {"random": (None, 1.0)})
+    context = multiprocessing.get_context("fork")
+    monkeypatch.setitem(G._STATE, "started", context.RawArray("q", 4))
+    with context.Pool(2) as pool:
+        _, written = G._run_shape("path", gen, ([url], []), pool, np.random.default_rng(0),
+                                  iter(range(10 ** 6)), tmp_path)
+    server.shutdown()
+    assert written["written"] == 40                       # the shape still gets its total, all of size 4
+    [closed] = written["closed_cells"]
+    assert closed["cell"][0] == 5 and closed["kept"] == 0 and closed["handed_on"] == 20
+    assert closed["attempts_of_key"] >= 3 * 20
+    assert written["selectivity"]["5|random|False"] == 2.0     # size 5 never passed: beta went to its max
+    assert "4|random|False" not in written["selectivity"]      # size 4 always passed: beta stayed 0

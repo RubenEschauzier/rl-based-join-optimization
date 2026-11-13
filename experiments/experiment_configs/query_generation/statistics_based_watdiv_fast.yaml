@@ -24,3 +24,10 @@ generation:
   acceptance:
     # candidates are cheap now; most extra ones only find their cell full
     max_candidate_factor: 100
+
+  # Long paths, cycles and diamonds over WatDiv's big predicates rarely fit the result budget (path 12-16:
+  # 1% of candidates); a selective walk lifts that ~6x (beta 2, levels off above 4) and widens the predicate
+  # mix ~3x, and cells that still cannot fill hand their places on (work_2026-11-13 sweep)
+  adaptive:
+    selectivity: {window: 50, target_pass: 0.3, high_pass: 0.6, step: 0.5, max: 4.0}
+    max_attempts_per_query: 100
