@@ -69,7 +69,6 @@ def check(paths, endpoints, per_file, timeout_s, seed=0):
         counts = count_subsets(tasks, endpoints, timeout_s)
         size_mismatch = [(i, k, sample[i]["pattern_sizes"][k], counts[(i, k)]) for (i, k) in counts
                          if counts[(i, k)] is not None and counts[(i, k)] != sample[i]["pattern_sizes"][k]]
-        # 3. forced join order
         runs = asyncio.run(_forced_runs(sample, endpoints, f"{int(timeout_s)}s"))
         aligned = cost_match = executed = 0
         for query, run in zip(sample, runs):

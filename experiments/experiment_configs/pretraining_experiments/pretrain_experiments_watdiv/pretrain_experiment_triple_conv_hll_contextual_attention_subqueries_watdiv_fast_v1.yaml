@@ -1,0 +1,33 @@
+# The WatDiv counterpart of pretrain_experiments_yago_mixed/pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_mixed_yago_v2.yaml:
+# every setting as there, on the statistics_based_watdiv_fast_v1 workload (train/val of splits.py, test kept apart).
+# rdf2vec: model_slim.json, the full model.json restricted to the workload's terms (identical vectors; the full
+# 11.7 GB file does not fit in memory as JSON). Sub-query labels counted with a 5 s timeout (YAGO: 30 s).
+#   python main.py --config pretrain_experiment_triple_conv_hll_contextual_attention_subqueries_watdiv_fast_v1.yaml \
+#       --config_dir experiments/experiment_configs/pretraining_experiments/pretrain_experiments_watdiv
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pretraining:
+  endpoint: "http://localhost:9000/"
+  dataset_train: "data/generated_queries/statistics_based_watdiv_fast_v1/hll_contextual_attention/dataset_train"
+  dataset_val: "data/generated_queries/statistics_based_watdiv_fast_v1/hll_contextual_attention/dataset_val"
+  embeddings: "data/rdf2vec_embeddings/statistics_based_watdiv_fast_v1/model_slim.json"
+  model_config: "experiments/model_configs/pretrain_model/t_cv_repr_exact_separate_head_own_embeddings_hll.yaml"
+  occurrences_location: "data/term_occurrences/statistics_based_watdiv_fast_v1/occurrences.json"
+  tp_cardinality_location: "data/term_occurrences/statistics_based_watdiv_fast_v1/tp_cardinalities.json"
+  multiplicity_location: "data/term_occurrences/statistics_based_watdiv_fast_v1/multiplicities.json"
+  hll_location: "data/term_occurrences/statistics_based_watdiv_fast_v1/hll_sketches.json"
+  contextualizer_location: "experiments/experiment_outputs/statistics_based_watdiv_fast_v1/contextualizer_profiles_attention_hard/contextualizer.pt"
+  feature_type: "predicate_edge_hll_contextual"
+  n_epoch: 50
+  subquery_labels_train: "data/generated_queries/statistics_based_watdiv_fast_v1/subquery_labels/subquery_labels_train.json"
+  subquery_labels_val: "data/generated_queries/statistics_based_watdiv_fast_v1/subquery_labels/subquery_labels_val.json"
+  censored_loss: true
+  subquery_fraction: 0.35
+  num_workers: 1
+  batch_size: 64
+  seed: 0
+  lr: 0.0001
+  experiment_root_directory: "experiments/experiment_outputs/statistics_based_watdiv_fast_v1/pretrained_models"

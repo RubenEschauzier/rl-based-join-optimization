@@ -318,6 +318,26 @@ def test_splits_keep_heldout_templates_out_of_training(tmp_path):
     assert sum(len(v) for v in parts.values()) == 300
 
 
+def test_failed_queries_are_split_apart(tmp_path):
+    import json as json_
+    from src.random_query_generation.statistics_based_generation.splits import split
+    counted = [{"query": f"q{i}", "y": 1, "generation": {"template": "star|4|random|nonzero|"}} for i in range(100)]
+    failed = [{"query": f"f{i}", "y": None, "generation": {"template": "star|9|random|nonzero|"}} for i in range(500)]
+    (tmp_path / "statistics_based_star.json").write_text(json_.dumps(counted))
+    (tmp_path / "statistics_based_star_qlever_failed.json").write_text(json_.dumps(failed))
+    split(tmp_path, tmp_path / "out", heldout_templates=0.0, val=0.1, test=0.1, seed=1)
+    out = tmp_path / "out"
+    assert not list(out.glob("dataset_*/raw/*qlever_failed*"))              # not a shape of its own
+    counted_parts = [json_.load(open(out / f"dataset_{n}" / "raw" / "statistics_based_star.json"))
+                     for n in ("train", "val", "test")]
+    assert all(q["y"] == 1 for part in counted_parts for q in part)
+    failed_parts = {n: json_.load(open(out / "failed" / f"dataset_{n}" / "raw" / "statistics_based_star.json"))
+                    for n in ("train", "val", "test")}
+    assert sum(len(v) for v in failed_parts.values()) == 500
+    assert all(q["y"] is None for part in failed_parts.values() for q in part)
+    assert 25 <= len(failed_parts["val"]) <= 75 and 25 <= len(failed_parts["test"]) <= 75
+
+
 def test_tightening_meets_the_budget_and_keeps_the_query_non_empty(data):
     from src.random_query_generation.statistics_based_generation.counting import AcyclicCounter, PredicateIndex
     from src.random_query_generation.statistics_based_generation.instantiate import (

@@ -9,6 +9,10 @@ ENTIRELY to dataset_test_heldout (CEB-style generalisation: those query template
 seen in training); the remaining queries are split at random into dataset_train / dataset_val /
 dataset_test. Each split is a directory with raw/<shape>.json, the layout the dataset loader
 (QueryCardinalityDataset) reads.
+
+Queries whose count failed (statistics_based_<shape>_qlever_failed.json in `failed_directory`,
+y null) have no cardinality label, so they stay out of these splits; they are split at random in
+the same val / test proportions into failed/dataset_{train,val,test}, for planner training.
 """
 from __future__ import annotations
 
@@ -21,10 +25,11 @@ from collections import Counter
 import numpy as np
 
 
-def split(input_directory, output_directory, heldout_templates=0.1, val=0.1, test=0.1, seed=0):
+def split(input_directory, output_directory, heldout_templates=0.1, val=0.1, test=0.1, seed=0,
+          failed_directory=None):
     rng = np.random.default_rng(seed)
     files = sorted(glob.glob(os.path.join(input_directory, "statistics_based_*.json")))
-    files = [f for f in files if not f.endswith("_summary.json")]
+    files = [f for f in files if not f.endswith(("_summary.json", "_qlever_failed.json"))]
     if not files:
         raise FileNotFoundError(f"no statistics_based_<shape>.json in {input_directory}")
     by_shape = {os.path.basename(f)[len("statistics_based_"):-len(".json")]: json.load(open(f)) for f in files}
@@ -45,12 +50,26 @@ def split(input_directory, output_directory, heldout_templates=0.1, val=0.1, tes
             with open(os.path.join(directory, f"statistics_based_{shape}.json"), "w") as f:
                 json.dump(items, f)
             counts[(name, shape)] = len(items)
+    failed_files = sorted(glob.glob(os.path.join(failed_directory or input_directory,
+                                                 "statistics_based_*_qlever_failed.json")))
+    for path in failed_files:
+        shape = os.path.basename(path)[len("statistics_based_"):-len("_qlever_failed.json")]
+        parts = {"train": [], "val": [], "test": []}
+        for query in json.load(open(path)):
+            r = rng.random()
+            parts["val" if r < val else "test" if r < val + test else "train"].append(query)
+        for name, items in parts.items():
+            directory = os.path.join(output_directory, "failed", f"dataset_{name}", "raw")
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, f"statistics_based_{shape}.json"), "w") as f:
+                json.dump(items, f)
+            counts[(f"failed_{name}", shape)] = len(items)
     summary = {"heldout_templates": sorted(held), "n_templates": len(templates),
                "counts": {f"{name}/{shape}": n for (name, shape), n in sorted(counts.items())}}
     with open(os.path.join(output_directory, "splits_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"{len(templates)} templates, {len(held)} held out -> {output_directory}")
-    for name in ("train", "val", "test", "test_heldout"):
+    for name in ("train", "val", "test", "test_heldout", "failed_train", "failed_val", "failed_test"):
         print(f"  {name:13s} {sum(n for (s, _), n in counts.items() if s == name):>8,}")
     return summary
 
@@ -63,8 +82,11 @@ def main():
     parser.add_argument("--val", type=float, default=0.1)
     parser.add_argument("--test", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--failed-directory", default=None,
+                        help="Where statistics_based_<shape>_qlever_failed.json are (default: input_directory).")
     args = parser.parse_args()
-    split(args.input_directory, args.out or args.input_directory, args.heldout_templates, args.val, args.test, args.seed)
+    split(args.input_directory, args.out or args.input_directory, args.heldout_templates, args.val, args.test, args.seed,
+          args.failed_directory)
 
 
 if __name__ == "__main__":

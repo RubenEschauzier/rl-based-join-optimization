@@ -10,9 +10,6 @@ The eight shapes of FICE / G-CARE, sized 4..16 patterns:
     cycle      a ring plus max(1, n // 4) stems
     diamond    two endpoints joined by parallel 2-paths (G-CARE "petal") plus max(1, n // 4) stems
     flower     a center with triangle petals through it plus max(1, n // 4) stems (G-CARE "flower")
-
-Cycle nodes never become constants (instantiate.binding_plan): a constant is no join variable,
-so binding a ring node would turn the cycle into a path. The stems are where constants go.
     path_star  a chain whose nodes carry small stars ("path+star" in FICE)
 
 Directions are random where the shape does not fix them, so joins mix subject-subject,
@@ -31,8 +28,9 @@ SHAPES = ("star", "path", "tree", "snowflake", "cycle", "diamond", "flower", "pa
 class QueryShape:
     kind: str
     n_nodes: int
-    edges: list = field(default_factory=list)     # (subject node, object node)
-    root: int = 0                                 # where instantiation starts
+    # (subject node, object node)
+    edges: list = field(default_factory=list)     
+    root: int = 0                                 
 
     @property
     def n_edges(self):

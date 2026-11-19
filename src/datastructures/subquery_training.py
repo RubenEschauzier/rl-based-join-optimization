@@ -28,6 +28,13 @@ def _key(query):
     return " ".join((query if isinstance(query, str) else query[0]).split())
 
 
+def _subject_object(pattern):
+    """Subject and object of a "s p o ." pattern string (ProcessQuery's N3 form). Subjects and predicates
+    never contain spaces, but a literal object can (WatDiv), so the object is everything after the predicate."""
+    subject, _, rest = pattern.split(" ", 2)
+    return subject, rest[:-2] if rest.endswith(" .") else rest
+
+
 class CardinalityExamples(torch.utils.data.Dataset):
     """Full queries (mask None) and sub-queries (mask = bitmask over the query's patterns) of a
     processed dataset, as minimal Data objects with y and a censoring flag."""
@@ -48,8 +55,7 @@ class CardinalityExamples(torch.utils.data.Dataset):
         for i in range(len(dataset)):
             query = dataset[i]
             index[_key(query.query)] = i
-            nodes = [(int(query.term_to_id[tp.split(" ")[0]]), int(query.term_to_id[tp.split(" ")[2]]))
-                     for tp in query.triple_patterns]
+            nodes = [tuple(int(query.term_to_id[t]) for t in _subject_object(tp)) for tp in query.triple_patterns]
             pattern_nodes.extend(nodes)
             self.offsets[i + 1] = self.offsets[i] + len(nodes)
         self.pattern_nodes = np.array(pattern_nodes, dtype=np.int64).reshape(-1, 2)

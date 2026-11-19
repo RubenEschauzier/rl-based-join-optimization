@@ -18,7 +18,7 @@ Steps, each skipping what is already done (rerun after an interruption to contin
   3. embed      data/rdf2vec_embeddings/<dataset>/model.json: streaming_pyrdf2vec.py in
                 .venv_rdf2vec, walking only the entities not yet walked (walked_entities.txt) and
                 not covered by a --reuse-walks corpus (whose walks join the Word2Vec corpus).
-  4. featurise  dataset_{train,val}/processed with QueryCardinalityDataset, after checking that
+  4. featurise  dataset_{train,val,test}/processed (test if present) with QueryCardinalityDataset, after checking that
                 every term, pattern and predicate has its statistic (no endpoint fallback).
   5. check      feature layout against --compare (mixed_yago_hll), and a pretraining config.
 """
@@ -43,10 +43,14 @@ from src.datastructures.minhash_sketches import make_sketch, pattern_key, set_qu
 
 from src.datastructures.prepare_feature_data import calculate_hll_sketches, extract_multiplicities, read_queries
 from src.supervised_value_estimation.amortized_dp.online.true_cardinalities import count_subsets
-from src.utils.training_utils.query_loading_utils import load_queries_into_dataset, split_raw_queries
+from src.datastructures.post_process_data import filter_failed_cardinality_queries
+from src.datastructures.query_cardinality_dataset import QueryCardinalityDataset
+from src.query_featurizers.featurize_rdf2vec import FeaturizeQueriesRdf2Vec
+from src.utils.training_utils.query_loading_utils import load_featurizer, split_raw_queries
 
 ROOT = Path(__file__).resolve().parent
 BATCH = 20_000                  # counts between checkpoints of a statistics file
+SPLITS = ("dataset_train", "dataset_val", "dataset_test")     # featurised when <dataset>/<split>/raw exists
 
 
 def _load(path):
@@ -337,17 +341,21 @@ def feature_root(dataset_dir, features, root_name=None):
     if features == "hll" and root_name is None:
         return dataset_dir
     root = dataset_dir / (root_name or features)
-    for name in ("dataset_train", "dataset_val"):
+    for name in SPLITS:
+        if not (dataset_dir / name / "raw").is_dir():
+            continue
         (root / name).mkdir(parents=True, exist_ok=True)
         if not (root / name / "raw").exists():
             os.symlink(dataset_dir / name / "raw", root / name / "raw")
     return root
 
 
-def featurise(queries, dataset_dir, stats_dir, embedding_dir, features="hll", contextualizer=None, root_name=None):
+def featurise(queries, dataset_dir, stats_dir, embedding_dir, features="hll", contextualizer=None, root_name=None,
+              rdf2vec_file="model.json"):
     root = feature_root(dataset_dir, features, root_name)
-    splits = [root / "dataset_train", root / "dataset_val"]
-    if all((s / "processed" / "processed_queries.pt").exists() for s in splits):
+    splits = [root / name for name in SPLITS if (dataset_dir / name / "raw").is_dir()]
+    todo = [s for s in splits if not (s / "processed" / "processed_queries.pt").exists()]
+    if not todo:
         print(f"[featurise] done: {[str(s / 'processed') for s in splits]}")
         return
     occurrences, patterns = _load(stats_dir / "occurrences.json"), _load(stats_dir / "tp_cardinalities.json")
@@ -376,15 +384,19 @@ def featurise(queries, dataset_dir, stats_dir, embedding_dir, features="hll", co
         raise SystemExit(f"[featurise] statistics missing: { {k: len(v) for k, v in missing.items()} }")
     # gnce: the GNCE-style features (rdf2vec + term occurrences + predicate multiplicities), no HLL.
     feature_type = "predicate_edge" if features == "gnce" else f"predicate_edge_{features}"
-    load_queries_into_dataset(str(splits[0]), str(splits[1]), None, str(embedding_dir / "model.json"),
-                              _NoFallback(), feature_type, load_mappings=False,
-                              minhash_location=minhash_location,
-                              contextualizer_location=contextualizer if features == "hll_contextual" else None,
-                              occurrences_location=str(stats_dir / "occurrences.json"),
-                              tp_cardinality_location=str(stats_dir / "tp_cardinalities.json"),
-                              multiplicity_location=str(stats_dir / "multiplicities.json"),
-                              hll_location=None if features == "gnce" else str(stats_dir / "hll_sketches.json"),
-                              shuffle_train=False)
+    # as load_queries_into_dataset, for every split present: the featuriser (and rdf2vec) loaded once
+    featurizer = load_featurizer(feature_type, FeaturizeQueriesRdf2Vec.load_vectors(str(embedding_dir / rdf2vec_file)),
+                                 _NoFallback(),
+                                 str(stats_dir / "occurrences.json"), str(stats_dir / "tp_cardinalities.json"),
+                                 str(stats_dir / "multiplicities.json"),
+                                 hll_location=None if features == "gnce" else str(stats_dir / "hll_sketches.json"),
+                                 minhash_location=minhash_location,
+                                 contextualizer_location=contextualizer if features == "hll_contextual" else None)
+    for split_dir in todo:
+        print(f"[featurise] {split_dir}", flush=True)
+        QueryCardinalityDataset(root=str(split_dir), featurizer=featurizer,
+                                post_processor=filter_failed_cardinality_queries,
+                                load_mappings=split_dir.name != "dataset_train")
 
 
 # --- 5. check and config ----------------------------------------------------------------------
@@ -421,7 +433,7 @@ def write_config(args, dataset_dir, stats_dir, embedding_dir):
         return
     text = template.read_text()
     for old, new in [(f"{os.path.relpath(ROOT / args.compare, ROOT)}/", f"{os.path.relpath(dataset_dir, ROOT)}/"),
-                     ("data/rdf2vec_embeddings/mixed_yago/model.json", os.path.relpath(embedding_dir / "model.json", ROOT)),
+                     ("data/rdf2vec_embeddings/mixed_yago/model.json", os.path.relpath(embedding_dir / args.rdf2vec_file, ROOT)),
                      ("data/term_occurrences/mixed_yago/", f"{os.path.relpath(stats_dir, ROOT)}/"),
                      ("experiments/experiment_outputs/mixed_yago/", f"experiments/experiment_outputs/{args.dataset}/")]:
         if old not in text:
@@ -452,6 +464,9 @@ def main():
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--dimensions", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--rdf2vec-file", default="model.json",
+                        help="File in the embedding directory the featuriser reads (e.g. a model.json restricted "
+                             "to the workload's terms, when the full one does not fit in memory).")
     parser.add_argument("--w2v-workers", type=int, default=8,
                         help="Word2Vec threads; it reads walks.txt in C (corpus_file), so this scales with cores.")
     parser.add_argument("--steps", default="split,stats,embed,featurise,check,config",
@@ -492,7 +507,8 @@ def main():
     if "featurise" in steps:
         if args.features == "hll_contextual" and not args.contextualizer:
             raise SystemExit("--features hll_contextual needs --contextualizer")
-        featurise(queries, dataset_dir, stats_dir, embedding_dir, args.features, args.contextualizer, args.feature_root)
+        featurise(queries, dataset_dir, stats_dir, embedding_dir, args.features, args.contextualizer, args.feature_root,
+                  args.rdf2vec_file)
     if "check" in steps and args.features != "gnce":    # gnce has other dimensions than the reference
         n_multiplicities = len(next(iter(_load(stats_dir / "multiplicities.json").values())))
         check(feature_root(dataset_dir, args.features, args.feature_root), ROOT / args.compare, 2 + n_multiplicities + 1 + 2,
